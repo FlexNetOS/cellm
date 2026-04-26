@@ -26,8 +26,8 @@ use serde_json::Value;
 
 use crate::{CellmFile, ModelConfig};
 
-/// Maximum weight cache entries before LRU eviction (approx 120MB with typical layer sizes)
-const MAX_CACHE_ENTRIES: usize = 32;
+/// Maximum weight cache entries before LRU eviction (approx 500MB with typical layer sizes)
+const MAX_CACHE_ENTRIES: usize = 128;
 
 pub struct LfmRunner {
     file: CellmFile,
@@ -990,7 +990,18 @@ impl LfmRunner {
         in_dim: usize,
         out: &mut [f32],
     ) -> Result<(), CoreError> {
-        // Check cache first
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if let Some(ops) = &self.metal_ops {
+            let base_name = weight_name.trim_end_matches(".weight");
+            let w_u8 = self.file.tensor_bytes(weight_name)?;
+            let s_f16: &[u16] = bytemuck::cast_slice(self.file.tensor_bytes(&format!("{}.scales", base_name))?);
+            // LFM int4 weights use group_size=64
+            ops.logits_i4(input, w_u8, s_f16, out_dim, in_dim, 64, weight_name, out)
+                .map_err(|e| CoreError::Backend(e.to_string()))?;
+            return Ok(());
+        }
+
+        // Check cache first (CPU fallback path)
         let cache_key = (weight_name.to_string(), out_dim, in_dim);
         
         if !self.weight_cache.contains_key(&cache_key) {
