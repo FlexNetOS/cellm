@@ -31,6 +31,13 @@ struct ChatView: View {
         let imageData: Data?
         let audioFileName: String?
     }
+    private struct LocalModelInfo: Identifiable {
+        let id = UUID()
+        let name: String
+        let modelURL: URL
+        let tokenizerURL: URL?
+    }
+    @State private var localModels: [LocalModelInfo] = []
 
     @State private var messages: [ChatMessage] = []
     @State private var inputText: String = ""
@@ -118,6 +125,7 @@ struct ChatView: View {
         }
         .onAppear {
             restoreDefaults()
+            scanLocalModels()
             initializeEngine()
         }
         .onChange(of: llmModelURL) { _ in 
@@ -207,10 +215,20 @@ struct ChatView: View {
             // Model Selector Pill
             Menu {
                 Section("Smart Presets") {
-                    Button("Gemma 3 (Stable)") { selectGemmaPreset() }
-                    Button("Qwen 3.5 (Stable)") { selectQwenPreset() }
-                    Button("SmolLM 2 (Fast)") { selectSmolPreset() }
-                    Button("Bonsai 1.7B (1-Bit)") { selectBonsaiPreset() }
+                    Button(statusLabel("Gemma 3 (Stable)", file: DemoAssetLinks.gemma4E2BFileName)) { selectGemmaPreset() }
+                    Button(statusLabel("Qwen 3.5 (Stable)", file: DemoAssetLinks.qwen35FileName)) { selectQwenPreset() }
+                    Button(statusLabel("LFM 2.5 (Liquid)", file: DemoAssetLinks.lfm25FileName)) { selectLFMPreset() }
+                    Button(statusLabel("SmolLM 2 (Fast)", file: DemoAssetLinks.smollm2FileName)) { selectSmolPreset() }
+                    Button(statusLabel("Bonsai 1.7B (1-Bit)", file: DemoAssetLinks.bonsai1B1BitFileName)) { selectBonsaiPreset() }
+                }
+                if !localModels.isEmpty {
+                    Section("Downloaded on Device") {
+                        ForEach(localModels) { model in
+                            Button(model.name) {
+                                selectLocalModel(model)
+                            }
+                        }
+                    }
                 }
                 Section("Advanced Overrides") {
                     Button("Pick Custom LLM...") { pickerTarget = .llmModel }
@@ -218,10 +236,12 @@ struct ChatView: View {
                 }
             } label: {
                 HStack(spacing: 4) {
-                    Image(systemName: "arrow.down.circle.fill")
+                    Image(systemName: isCurrentModelReady ? "checkmark.circle.fill" : "arrow.down.circle.fill")
                         .font(.caption)
+                        .foregroundStyle(isCurrentModelReady ? .green : .primary)
                     Text(selectedSampleLabel.isEmpty ? "Select Model" : selectedSampleLabel)
                         .font(.subheadline.bold())
+                        .foregroundStyle(isCurrentModelReady ? .primary : .secondary)
                     Image(systemName: "chevron.down")
                         .font(.caption2)
                 }
@@ -803,6 +823,52 @@ struct ChatView: View {
         infoText = "Text uses LLM model/tokenizer. Image uses VLM."
     }
 
+    private func scanLocalModels() {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let samplesDir = docs.appendingPathComponent("samples")
+        
+        var found: [LocalModelInfo] = []
+        let enumerator = FileManager.default.enumerator(at: samplesDir, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles])
+        
+        while let fileURL = enumerator?.nextObject() as? URL {
+            let ext = fileURL.pathExtension.lowercased()
+            if ext == "cellm" || ext == "cellmd" {
+                let name = fileURL.deletingPathExtension().lastPathComponent
+                let dir = fileURL.deletingLastPathComponent()
+                let tokURL = dir.appendingPathComponent("tokenizer.json")
+                let hasTok = FileManager.default.fileExists(atPath: tokURL.path)
+                
+                found.append(LocalModelInfo(
+                    name: name,
+                    modelURL: fileURL,
+                    tokenizerURL: hasTok ? tokURL : nil
+                ))
+            }
+        }
+        
+        self.localModels = found
+    }
+
+    private func selectLocalModel(_ info: LocalModelInfo) {
+        llmModelURL = info.modelURL
+        llmTokenizerURL = info.tokenizerURL
+        selectedSampleLabel = info.name
+        errorText = nil
+        if info.tokenizerURL == nil {
+            errorText = "Warning: No tokenizer.json found in same directory as \(info.name). Select one manually via Advanced Overrides."
+        }
+    }
+
+    private var isCurrentModelReady: Bool {
+        guard let url = llmModelURL else { return false }
+        return FileManager.default.fileExists(atPath: url.path)
+    }
+
+    private func statusLabel(_ label: String, file: String) -> String {
+        let exists = RemoteAssets.existingDocumentsFile(fileName: file) != nil
+        return exists ? "\(label) (Ready)" : label
+    }
+
     private func persistSharedSelection() {
         if let model = llmModelURL?.path {
             UserDefaults.standard.set(model, forKey: SharedSelection.llmModelPath)
@@ -845,6 +911,21 @@ struct ChatView: View {
             errorText = nil
         } else if !silentOnMissing {
             errorText = "Qwen files not found in Documents/samples."
+        }
+    }
+
+    private func selectLFMPreset(silentOnMissing: Bool = false) {
+        let model = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.lfm25FileName)
+            ?? RemoteAssets.existingDocumentsFile(fileName: "lfm2.5-350m-v1.cellm")
+        let tok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.lfm25TokenizerFileName)
+            ?? RemoteAssets.existingDocumentsFile(fileName: "tokenizer.json")
+        if let model, let tok {
+            llmModelURL = model
+            llmTokenizerURL = tok
+            selectedSampleLabel = "LFM-2.5-350M (Liquid)"
+            errorText = nil
+        } else if !silentOnMissing {
+            errorText = "LFM files not found in Documents/samples."
         }
     }
 

@@ -4,7 +4,7 @@ This document explains, in simple terms, what we built to support a paged KV cac
 
 ## What problem are we solving?
 
-During text generation, a transformer needs to remember “attention history” for every token you have already processed. That history is the **KV cache** (Keys and Values).
+During text generation, a transformer needs to remember "attention history" for every token you have already processed. That history is the **KV cache** (Keys and Values).
 
 On a phone, the KV cache can become the biggest memory cost. We cannot assume we can store it as one huge, contiguous tensor forever. We need a way to:
 
@@ -12,19 +12,19 @@ On a phone, the KV cache can become the biggest memory cost. We cannot assume we
 - Keep multiple conversations (sessions) alive at once
 - Grow and free cache memory incrementally
 
-That is what “paged KV cache” means here.
+That is what "paged KV cache" means here.
 
 ## The basic idea
 
 We split KV cache storage into equally-sized **blocks**:
 
 - A block holds KV for `tokens_per_block` token positions.
-- Each session has a “map” from token positions (0, 1, 2, …) to the block ids that contain their KV.
+- Each session has a "map" from token positions (0, 1, 2, …) to the block ids that contain their KV.
 
-So instead of “KV for token 137 is at index 137 in one big tensor”, we do:
+So instead of "KV for token 137 is at index 137 in one big tensor", we do:
 
-- “Token 137 lives in block X”
-- “Inside block X it is offset Y”
+- "Token 137 lives in block X"
+- "Inside block X it is offset Y"
 
 ## What we implemented
 
@@ -45,7 +45,7 @@ Important point: this allocator does **not** own the KV bytes. It only hands out
 
 File: `crates/cellm-cache/src/pagetable.rs`
 
-The `PageTable` is the session’s “address book”:
+The `PageTable` is the session’s "address book":
 
 - `append_token()` grows the session by one token position.
   - If we crossed a block boundary, it asks the allocator for a new block id.
@@ -91,7 +91,7 @@ cargo test -p cellm-cache
 
 ## Why this means we are ready for Phase 2
 
-With the allocator and page table validated, we have stable “plumbing” for:
+With the allocator and page table validated, we have stable "plumbing" for:
 
 - Growing a session token-by-token without reallocating giant tensors
 - Knowing exactly where each token’s KV should live

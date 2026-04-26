@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use cellm_cache::{KVCache, KvEncodingKind, KvStorageKind, PageTable};
 use cellm_core::KvCacheLayout;
-use cellm_model::{gemma::GemmaRunner, llama::LlamaRunner, qwen::QwenRunner, CellmFile, ModelConfig};
+use cellm_model::{gemma::GemmaRunner, llama::LlamaRunner, qwen::QwenRunner, lfm::LfmRunner, CellmFile, ModelConfig};
 use cellm_scheduler::{RoundRobinScheduler, Session as SchedSession, SessionState, ThermalLevel, ThermalPolicy};
 use serde_json::Value;
 
@@ -71,6 +71,7 @@ enum Runner {
     Llama(LlamaRunner),
     Gemma(GemmaRunner),
     Qwen(QwenRunner),
+    Lfm(LfmRunner),
 }
 
 impl Runner {
@@ -85,6 +86,9 @@ impl Runner {
                 Ok(())
             }
             Runner::Qwen(r) => {
+                r.prefill(tokens, start_pos, pt, kv).map_err(|e| anyhow::anyhow!(e))
+            }
+            Runner::Lfm(r) => {
                 r.prefill(tokens, start_pos, pt, kv).map_err(|e| anyhow::anyhow!(e))
             }
         }
@@ -127,6 +131,7 @@ impl Engine {
             "llama" | "smollm3" => Runner::Llama(LlamaRunner::load(model_path)?),
             t if t.starts_with("gemma") => Runner::Gemma(GemmaRunner::load(model_path)?),
             t if t.starts_with("qwen") => Runner::Qwen(QwenRunner::load(model_path)?),
+            t if t.starts_with("lfm") => Runner::Lfm(LfmRunner::load(model_path)?),
             other => anyhow::bail!(
                 "unsupported model_type for Engine: model_type={} effective_text_model_type={other}",
                 header.model_type
@@ -149,6 +154,11 @@ impl Engine {
                         anyhow::bail!("Llama full-metal backend requested but unavailable");
                     }
                 }
+                Runner::Lfm(r) => {
+                    if !r.enable_metal_full_backend() {
+                        anyhow::bail!("LFM full-metal backend requested but unavailable");
+                    }
+                }
             }
         }
 
@@ -156,12 +166,14 @@ impl Engine {
             Runner::Llama(r) => r.config().clone(),
             Runner::Gemma(r) => r.config().clone(),
             Runner::Qwen(r) => r.config().clone(),
+            Runner::Lfm(r) => r.config().clone(),
         };
 
         let head_dim = match &runner {
             Runner::Llama(_) => cfg.hidden_size / cfg.num_attention_heads,
             Runner::Gemma(_) => infer_gemma_kv_head_dim(&file)?,
             Runner::Qwen(_) => infer_qwen_kv_head_dim(&file)?,
+            Runner::Lfm(_) => cfg.hidden_size / cfg.num_attention_heads,
         };
 
         let layout = KvCacheLayout {
@@ -339,6 +351,9 @@ impl Engine {
                 r.step_topk(tok, pos, &mut s.page_table, &mut self.kv_cache, top_k)?
             }
             Runner::Qwen(r) => {
+                r.step_topk(tok, pos, &mut s.page_table, &mut self.kv_cache, self.top_k)?
+            }
+            Runner::Lfm(r) => {
                 r.step_topk(tok, pos, &mut s.page_table, &mut self.kv_cache, self.top_k)?
             }
         };
@@ -653,6 +668,7 @@ impl Engine {
                     r.step_topk(cur, pos, &mut s.page_table, &mut self.kv_cache, top_k)?
                 }
                 Runner::Qwen(r) => r.step_topk(cur, pos, &mut s.page_table, &mut self.kv_cache, top_k)?,
+                Runner::Lfm(r) => r.step_topk(cur, pos, &mut s.page_table, &mut self.kv_cache, top_k)?,
             };
             if let Runner::Gemma(r) = &self.runner {
                 if r.is_gemma3_text() {

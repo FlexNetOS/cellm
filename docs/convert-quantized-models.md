@@ -42,7 +42,7 @@ cargo run --release --bin convert -- \
 
 Dequantizing 4-bit weights to f16 can make the `.cellm` file **much larger** (often ~4x vs int4).
 
-Long term, the “right” solution is:
+Long term, the "right" solution is:
 
 - Keep int4 weights in `.cellm` with explicit metadata
 - Implement int4 matmul kernels (CPU/Metal)

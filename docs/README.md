@@ -111,7 +111,7 @@ cargo run --release --bin infer -- \
 ```
 
 Notes:
-- `--chat` auto-detects ChatML-style tokens (for SmolLM2 this uses `<|im_start|>` / `<|im_end|>`). Without chat formatting, many base models behave like “text completion” and may not answer directly.
+- `--chat` auto-detects ChatML-style tokens (for SmolLM2 this uses `<|im_start|>` / `<|im_end|>`). Without chat formatting, many base models behave like "text completion" and may not answer directly.
 - Use `--chat-format plain` to force the simpler `User:/Assistant:` style. `--chat-format auto` (default) only uses ChatML when the tokenizer advertises a chat template in `tokenizer_config.json`.
 - `--max-layers` is only for debugging; using fewer layers will significantly degrade quality.
 - Backend selection is strict in this build: `--backend cpu` runs CPU only, and `--backend metal` runs Metal only (no automatic fallback).
@@ -451,7 +451,7 @@ cargo build --release -p cellm-vlm-onnx-infer
   --max-new-tokens 128
 ```
 
-Recommended “works now” test command:
+Recommended "works now" test command:
 
 ```bash
 ./target/release/vlm-infer \

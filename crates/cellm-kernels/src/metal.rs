@@ -616,6 +616,8 @@ kernel void mv_i4(
         acc += v0 * x[i] * s0 + v1 * x[i + 1] * s1;
     }
     o[gid] = acc;
+}
+
 kernel void mv_f32(
     device const float* w [[buffer(0)]],
     device const float* x [[buffer(1)]],

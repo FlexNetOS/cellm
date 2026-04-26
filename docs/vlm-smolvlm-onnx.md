@@ -2,7 +2,7 @@
 
 This repo’s long-term goal is to run **VLMs natively inside `cellm`** (same runtime as LLMs, plus Metal later).
 
-Right now, the fastest way to validate “can we run a VLM end-to-end on this machine?” is to use the **official ONNX exports** that ship with the SmolVLM repo and drive them from Rust.
+Right now, the fastest way to validate "can we run a VLM end-to-end on this machine?" is to use the **official ONNX exports** that ship with the SmolVLM repo and drive them from Rust.
 
 This document explains what was implemented and how to run it.
 
@@ -149,7 +149,7 @@ Native `.cellm` vision + decoder (experimental, slower):
 - Native `.cellm` vision now uses SIMD-optimized BLAS matmuls on macOS (`Accelerate` SGEMM) and is dramatically faster than the previous scalar path.
 - ONNX Runtime is still faster for vision in current builds.
 - `--backend metal` runs a Metal smoke check; in sandboxed/restricted shells Metal discovery may fail and fall back to CPU.
-- The next “real” step toward native VLM inside `cellm` is to:
+- The next "real" step toward native VLM inside `cellm` is to:
   - Move native vision/decode math into optimized backend kernels (SIMD + Metal)
   - Keep processor behavior aligned with HF templates across model variants
 

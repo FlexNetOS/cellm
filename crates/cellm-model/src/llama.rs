@@ -1104,7 +1104,7 @@ fn detect_llama_prefix(file: &CellmFile) -> Result<String, CoreError> {
         .is_some()
         && file.tensor_index("model.text_model.norm.weight").is_some()
     {
-        // The checkpoint uses the “model.text_model” namespace.
+        // The checkpoint uses the "model.text_model" namespace.
         // Returning an empty prefix lets the weight‑lookup fallback prepend the correct name.
         return Ok(String::new());
     }

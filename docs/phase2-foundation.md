@@ -9,7 +9,7 @@ The system is now a stable foundation for Phase 2: Paged KV Cache implementation
 
 ## What I implemented (in plain English)
 
-Phase 2 needs a way to store “the model’s memory” (KV cache) without growing RAM forever as conversations get longer. The key idea is to store the KV cache in fixed-size chunks (“blocks”) and keep a small lookup table that says which block holds which token.
+Phase 2 needs a way to store "the model’s memory" (KV cache) without growing RAM forever as conversations get longer. The key idea is to store the KV cache in fixed-size chunks ("blocks") and keep a small lookup table that says which block holds which token.
 
 To make that possible, I added two core pieces:
 
@@ -37,7 +37,7 @@ File: `crates/cellm-cache/src/pagetable.rs`
 
 File: `crates/cellm-cache/src/error.rs`
 
-- When blocks run out, you get a clear “out of blocks” error instead of silent corruption.
+- When blocks run out, you get a clear "out of blocks" error instead of silent corruption.
 - Bad inputs (like asking for token 999 when you only have 10 tokens) return a clear error.
 
 ## How to run the checks
@@ -57,14 +57,14 @@ cargo test -p cellm-cache
 
 ## Update: Physical KV cache + forward integration
 
-After validating `BlockAllocator` and `PageTable`, the next step is to connect “block ids” to real memory.
+After validating `BlockAllocator` and `PageTable`, the next step is to connect "block ids" to real memory.
 
 ### Physical cache storage: `KVCache`
 
 File: `crates/cellm-cache/src/kvcache.rs`
 
 - `KVCache` owns the actual `k` and `v` buffers (now stored as `f16` to match real KV-cache memory goals).
-- It also owns the `BlockAllocator`, so the cache is a single “thing” that can both allocate ids and store bytes.
+- It also owns the `BlockAllocator`, so the cache is a single "thing" that can both allocate ids and store bytes.
 - The memory layout is a big slab broken into:
   - block id
   - layer
@@ -97,8 +97,8 @@ File: `crates/cellm-model/src/lib.rs`
 File: `crates/cellm-model/src/lib.rs`
 
 - Added a unit test that:
-  - pre-fills a “turn 1” prompt
-  - appends more tokens for “turn 2”
+  - pre-fills a "turn 1" prompt
+  - appends more tokens for "turn 2"
   - reads back every token’s K/V across all layers and checks it matches the expected values
 
 ## Update: Minimal attention uses paged KV
@@ -106,14 +106,14 @@ File: `crates/cellm-model/src/lib.rs`
 File: `crates/cellm-model/src/lib.rs`
 
 - `forward(...)` now also reads historical K/V through the `PageTable` and `KVCache` to run a small attention step (f32, naive loops).
-- This proves “paged memory” is not just stored, but can be traversed and consumed to produce a next-token decision.
+- This proves "paged memory" is not just stored, but can be traversed and consumed to produce a next-token decision.
 
 ## CPU kernels (slice-based)
 
 File: `crates/cellm-kernels/src/cpu_kernels.rs`
 
 - Added small, testable CPU implementations for: RMSNorm, matmul, RoPE, softmax, and single-token GQA attention.
-- The “tiny” forward path uses these kernels to compute Q/K/V and attention, then writes K/V into the paged cache.
+- The "tiny" forward path uses these kernels to compute Q/K/V and attention, then writes K/V into the paged cache.
 
 ## Engine wiring (early)
 
