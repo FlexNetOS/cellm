@@ -821,7 +821,7 @@ struct LLMView: View {
                     repeatPenalty: runtimeRepeatPenalty,
                     repeatWindow: runtimeRepeatWindow
                 )
-                let (runtime, created) = try {
+                let (runtime, created) = try await {
                     let cacheKey = runtimeKey
                     var isNew = false
                     let (eng, tok) = try await GlobalEngineCache.shared.getOrCreateLLM(key: cacheKey) {
