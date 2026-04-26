@@ -33,7 +33,7 @@ pub struct LfmRunner {
     file: CellmFile,
     cfg: ModelConfig,
     max_layers: usize,
-    eos_token_id: Option<u32>,
+    pub eos_token_id: Option<u32>,
     /// Layer types: "conv" or "full_attention"
     layer_types: Vec<String>,
     /// Conv kernel size (L_cache)

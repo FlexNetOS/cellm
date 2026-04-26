@@ -21,7 +21,7 @@ pub struct GemmaRunner {
     file: CellmFile,
     cfg: ModelConfig,
     max_layers: usize,
-    eos_token_id: Option<u32>,
+    pub eos_token_id: Option<u32>,
     tensor_prefix: String,
     layer_attn: Vec<GemmaLayerAttnSpec>,
     max_q_dim: usize,

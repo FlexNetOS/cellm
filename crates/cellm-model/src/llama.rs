@@ -17,7 +17,7 @@ pub struct LlamaRunner {
     file: CellmFile,
     cfg: ModelConfig,
     max_layers: usize,
-    eos_token_id: Option<u32>,
+    pub eos_token_id: Option<u32>,
     tensor_prefix: String,
     linear_backend: LlamaLinearBackend,
     metal_ops: Option<MetalOps>,

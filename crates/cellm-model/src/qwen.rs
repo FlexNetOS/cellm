@@ -23,7 +23,7 @@ pub struct QwenRunner {
     file: CellmFile,
     cfg: ModelConfig,
     max_layers: usize,
-    eos_token_id: Option<u32>,
+    pub eos_token_id: Option<u32>,
     layer_kinds: Vec<LayerKind>,
     linear_spec: Option<LinearAttnSpec>,
     partial_rotary_factor: f32,

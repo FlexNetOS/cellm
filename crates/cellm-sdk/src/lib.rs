@@ -93,6 +93,15 @@ impl Runner {
             }
         }
     }
+
+    pub fn is_stop_token(&self, token: u32) -> bool {
+        match self {
+            Runner::Llama(r) => Some(token) == r.eos_token_id,
+            Runner::Gemma(r) => Some(token) == r.eos_token_id,
+            Runner::Qwen(r) => Some(token) == r.eos_token_id,
+            Runner::Lfm(r) => Some(token) == r.eos_token_id,
+        }
+    }
 }
 
 
@@ -687,6 +696,11 @@ impl Engine {
             s.last_token = Some(next);
             s.next_pos += 1;
             meta.add_generated_token();
+
+            if self.runner.is_stop_token(next) {
+                let _ = meta.transition(SessionState::Terminal);
+            }
+
             Ok(Some(next))
         })();
 

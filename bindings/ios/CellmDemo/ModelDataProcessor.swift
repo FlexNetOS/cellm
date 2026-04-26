@@ -45,6 +45,9 @@ enum ModelDataProcessorFactory {
         if tokenizerName.contains("smollm") || modelName.contains("smollm") {
             return SmolChatProcessor()
         }
+        if tokenizerName.contains("lfm") || modelName.contains("lfm") {
+            return ChatMLProcessor(includeThinkPrefill: false)
+        }
         return PlainProcessor()
     }
 }
