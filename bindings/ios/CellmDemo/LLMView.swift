@@ -28,37 +28,7 @@ struct LLMView: View {
         }
     }
 
-    private final class RuntimeCache {
-        static let shared = RuntimeCache()
-        private let lock = NSLock()
-        private var loaded: LoadedRuntime?
-        private init() {}
-
-        func clear() {
-            lock.lock()
-            loaded = nil
-            lock.unlock()
-        }
-
-        func getOrCreate(
-            key: String,
-            build: () throws -> LoadedRuntime
-        ) throws -> (runtime: LoadedRuntime, created: Bool) {
-            lock.lock()
-            if let loaded, loaded.key == key {
-                lock.unlock()
-                return (loaded, false)
-            }
-            lock.unlock()
-
-            let newRuntime = try build()
-
-            lock.lock()
-            loaded = newRuntime
-            lock.unlock()
-            return (newRuntime, true)
-        }
-    }
+    // RuntimeCache is replaced by GlobalEngineCache.shared
 
     private final class StreamTelemetry {
         struct Snapshot {
@@ -851,61 +821,45 @@ struct LLMView: View {
                     repeatPenalty: runtimeRepeatPenalty,
                     repeatWindow: runtimeRepeatWindow
                 )
-                let runtimeResult = try RuntimeCache.shared.getOrCreate(key: runtimeKey) {
-                    let initStart = Date()
-                    var lines: [String] = []
-
-                    let afterPreflight = Date()
-                    lines.append(
-                        String(
-                            format: "init_preflight=%.1fms",
-                            afterPreflight.timeIntervalSince(initStart) * 1000.0
+                let (runtime, created) = try {
+                    let cacheKey = runtimeKey
+                    var isNew = false
+                    let (eng, tok) = try GlobalEngineCache.shared.getOrCreateLLM(key: cacheKey) {
+                        isNew = true
+                        let initStart = Date()
+                        var lines: [String] = []
+                        let tokStart = Date()
+                        let tok = try CellmTokenizer(tokenizerURL: effectiveTokenizerURL)
+                        let tokEnd = Date()
+                        lines.append(String(format: "init_tokenizer=%.1fms", tokEnd.timeIntervalSince(tokStart) * 1000.0))
+                        
+                        let engineStart = Date()
+                        let eng = try CellmEngine(
+                            modelURL: effectiveModelURL,
+                            tokenizer: tok,
+                            tokensPerBlock: tokensPerBlock,
+                            totalBlocks: totalBlocks,
+                            topK: runtimeTopK,
+                            temperature: runtimeTemperature,
+                            repeatPenalty: runtimeRepeatPenalty,
+                            repeatWindow: runtimeRepeatWindow,
+                            seed: UInt64(Date().timeIntervalSince1970 * 1000.0),
+                            backend: backend
                         )
-                    )
+                        let engineEnd = Date()
+                        lines.append(String(format: "init_engine=%.1fms", engineEnd.timeIntervalSince(engineStart) * 1000.0))
+                        lines.append(String(format: "init_total=%.1fms", engineEnd.timeIntervalSince(initStart) * 1000.0))
+                        lines.append("requested_backend=\(backend.label.lowercased()) active_backend=\(eng.activeBackend)")
+                        return (eng, tok)
+                    }
+                    // Since GlobalEngineCache doesn't store the diagnostic lines, we'll recreate them or just note it's reused.
+                    let lines = isNew ? ["init_runtime=fresh"] : ["init_runtime=reused"]
+                    return (LoadedRuntime(key: cacheKey, tokenizer: tok, engine: eng, initLines: lines), isNew)
+                }()
 
-                    let tokStart = Date()
-                    let tok = try CellmTokenizer(tokenizerURL: effectiveTokenizerURL)
-                    let tokEnd = Date()
-                    lines.append(
-                        String(
-                            format: "init_tokenizer=%.1fms",
-                            tokEnd.timeIntervalSince(tokStart) * 1000.0
-                        )
-                    )
-
-                    let engineStart = Date()
-                    let eng = try CellmEngine(
-                        modelURL: effectiveModelURL,
-                        tokenizer: tok,
-                        tokensPerBlock: tokensPerBlock,
-                        totalBlocks: totalBlocks,
-                        topK: runtimeTopK,
-                        temperature: runtimeTemperature,
-                        repeatPenalty: runtimeRepeatPenalty,
-                        repeatWindow: runtimeRepeatWindow,
-                        seed: UInt64(Date().timeIntervalSince1970 * 1000.0),
-                        backend: backend
-                    )
-                    let engineEnd = Date()
-                    lines.append(
-                        String(
-                            format: "init_engine=%.1fms",
-                            engineEnd.timeIntervalSince(engineStart) * 1000.0
-                        )
-                    )
-                    lines.append(
-                        String(
-                            format: "init_total=%.1fms",
-                            engineEnd.timeIntervalSince(initStart) * 1000.0
-                        )
-                    )
-                    lines.append("requested_backend=\(backend.label.lowercased()) active_backend=\(eng.activeBackend)")
-                    return LoadedRuntime(key: runtimeKey, tokenizer: tok, engine: eng, initLines: lines)
-                }
-
-                let eng = runtimeResult.runtime.engine
-                if runtimeResult.created {
-                    initLogLines.append(contentsOf: runtimeResult.runtime.initLines)
+                let eng = runtime.engine
+                if created {
+                    initLogLines.append(contentsOf: runtime.initLines)
                     print("[CellmDebug] runtime cache: created key=\(runtimeKey)")
                 } else {
                     initLogLines.append("init_runtime=reused")
@@ -1011,7 +965,7 @@ struct LLMView: View {
     }
 
     private func unloadRuntime() {
-        RuntimeCache.shared.clear()
+        GlobalEngineCache.shared.clear()
         runtimeStatus = "Runtime: unloaded"
     }
 

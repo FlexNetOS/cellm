@@ -26,8 +26,8 @@ use serde_json::Value;
 
 use crate::{CellmFile, ModelConfig};
 
-/// Maximum weight cache entries before LRU eviction (approx 500MB with typical layer sizes)
-const MAX_CACHE_ENTRIES: usize = 128;
+/// Maximum weight cache entries before LRU eviction (approx 120MB with typical layer sizes)
+const MAX_CACHE_ENTRIES: usize = 32;
 
 pub struct LfmRunner {
     file: CellmFile,

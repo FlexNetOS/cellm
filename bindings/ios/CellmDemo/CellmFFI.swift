@@ -314,6 +314,10 @@ final class CellmEngine {
         }
 
         for i in 0..<(maxNewTokens - 1) {
+            if Task.isCancelled {
+                stopReason = "task_cancelled"
+                break
+            }
             if stopReason == "uppercase_constraint_satisfied" {
                 break
             }
