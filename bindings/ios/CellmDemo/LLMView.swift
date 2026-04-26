@@ -920,7 +920,7 @@ struct LLMView: View {
                     }
                     warnings.append("Mobile KV cache tuned for latency (block=\(tokensPerBlock), total=\(totalBlocks)).")
                     self.backendWarning = warnings.isEmpty ? nil : warnings.joined(separator: " ")
-                    self.runtimeStatus = runtimeResult.created
+                    self.runtimeStatus = created
                         ? "Runtime: loaded and ready (\(eng.activeBackend))"
                         : "Runtime: reused (\(eng.activeBackend))"
                     self.isRunning = false
