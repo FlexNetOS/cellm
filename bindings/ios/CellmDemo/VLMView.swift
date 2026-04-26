@@ -313,7 +313,7 @@ struct VLMView: View {
                 }
 
                 let cacheKey = "\(modelURL.path)|\(backend.rawValue)"
-                let eng = try GlobalEngineCache.shared.getOrCreateVLM(key: cacheKey) {
+                let eng = try await GlobalEngineCache.shared.getOrCreateVLM(key: cacheKey) {
                     try CellmVLMEngine(
                         modelURL: modelURL,
                         topK: 20,

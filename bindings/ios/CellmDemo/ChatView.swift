@@ -522,7 +522,7 @@ struct ChatView: View {
                 }
 
                 let cacheKey = "\(llmModelURL.path)|\(backend.rawValue)"
-                let (eng, tok) = try GlobalEngineCache.shared.getOrCreateLLM(key: cacheKey) {
+                let (eng, tok) = try await GlobalEngineCache.shared.getOrCreateLLM(key: cacheKey) {
                     await MainActor.run { isInitializing = true }
                     let tok = try CellmTokenizer(tokenizerURL: llmTokenizerURL)
                     let capturedTemp = await MainActor.run { temperature }
@@ -940,7 +940,7 @@ struct ChatView: View {
             do {
                 let backend = await MainActor.run { scenePhase == .active ? selectedBackend : .cpu }
                 let cacheKey = "\(modelURL.path)|\(backend.rawValue)"
-                _ = try GlobalEngineCache.shared.getOrCreateLLM(key: cacheKey) {
+                _ = try await GlobalEngineCache.shared.getOrCreateLLM(key: cacheKey) {
                     let tok = try CellmTokenizer(tokenizerURL: tokURL)
                     let eng = try CellmEngine(
                         modelURL: modelURL,
@@ -967,7 +967,9 @@ struct ChatView: View {
     }
 
     private func invalidateCachedEngine() {
-        GlobalEngineCache.shared.clear()
+        Task {
+            await GlobalEngineCache.shared.clear()
+        }
         cachedEngineModelURL = nil
         cachedEngineBackend = nil
     }

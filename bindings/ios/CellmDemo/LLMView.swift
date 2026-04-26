@@ -824,7 +824,7 @@ struct LLMView: View {
                 let (runtime, created) = try {
                     let cacheKey = runtimeKey
                     var isNew = false
-                    let (eng, tok) = try GlobalEngineCache.shared.getOrCreateLLM(key: cacheKey) {
+                    let (eng, tok) = try await GlobalEngineCache.shared.getOrCreateLLM(key: cacheKey) {
                         isNew = true
                         let initStart = Date()
                         var lines: [String] = []
@@ -965,7 +965,9 @@ struct LLMView: View {
     }
 
     private func unloadRuntime() {
-        GlobalEngineCache.shared.clear()
+        Task {
+            await GlobalEngineCache.shared.clear()
+        }
         runtimeStatus = "Runtime: unloaded"
     }
 
