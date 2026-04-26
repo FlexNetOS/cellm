@@ -96,6 +96,7 @@ impl Session {
 fn can_transition(from: SessionState, to: SessionState) -> bool {
     use SessionState::*;
     match (from, to) {
+        (_, Queued) => true,
         (Terminal, Terminal) => true,
         (Terminal, _) => false,
         (Queued, Prefill | Suspended | Terminal) => true,
@@ -122,16 +123,10 @@ mod tests {
     }
 
     #[test]
-    fn terminal_is_sticky() {
+    fn terminal_can_be_queued() {
         let mut s = Session::new(9);
         s.transition(SessionState::Terminal).unwrap();
-        let err = s.transition(SessionState::Queued).unwrap_err();
-        assert_eq!(
-            err,
-            SessionError::InvalidTransition {
-                from: SessionState::Terminal,
-                to: SessionState::Queued
-            }
-        );
+        s.transition(SessionState::Queued).unwrap();
+        assert_eq!(s.state(), SessionState::Queued);
     }
 }
