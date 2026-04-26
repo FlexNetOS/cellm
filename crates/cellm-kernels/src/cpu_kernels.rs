@@ -142,7 +142,7 @@ pub fn matmul_f16_f32(
     debug_assert_eq!(a_f16.len(), m * k);
     debug_assert_eq!(out.len(), m);
 
-    out.par_iter_mut().enumerate().for_each(|(i, o)| {
+    out.par_iter_mut().with_min_len(32).enumerate().for_each(|(i, o)| {
         let row = &a_f16[i * k..(i + 1) * k];
         
         #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]

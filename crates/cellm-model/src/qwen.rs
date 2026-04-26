@@ -524,33 +524,119 @@ impl QwenRunner {
                 }
             }
 
-            // Post-attn norm
-            if use_metal_norm {
-                let name = format!("{prefix}layers.{layer}.post_attention_layernorm.weight");
-                let w = self.tensor_f16(&name)?.to_vec();
-                let add_one = self.rmsnorm_weight_is_offset;
-                self.metal_ops.as_ref().unwrap()
-                    .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, add_one, &name, &mut mlp_in)
-                    .map_err(|e| CoreError::Backend(e.to_string()))?;
-            } else {
-                let mut post_norm_w = vec![0.0f32; hidden];
-                self.rmsnorm_weight(&format!("{prefix}layers.{layer}.post_attention_layernorm.weight"), &mut post_norm_w)?;
-                if self.rmsnorm_weight_is_offset { add_one_inplace(&mut post_norm_w); }
-                rms_norm_f32(&x, &post_norm_w, cfg.rms_norm_eps, &mut mlp_in);
+            let ffn_norm_name = format!("{prefix}layers.{layer}.post_attention_layernorm.weight");
+            let gate_name = format!("{prefix}layers.{layer}.mlp.gate_proj.weight");
+            let up_name = format!("{prefix}layers.{layer}.mlp.up_proj.weight");
+            let down_name = format!("{prefix}layers.{layer}.mlp.down_proj.weight");
+            let add_one = self.rmsnorm_weight_is_offset;
+
+            let mut ffn_done = false;
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            {
+                let has_metal = self.metal_ops.is_some();
+                if has_metal {
+                    // Check if all weights are f16
+                    let mut all_f16 = false;
+                    let gate_res = self.resolve_tensor_name(&gate_name);
+                    if let Some(meta) = self.file.tensor_index(&gate_res) {
+                        if meta.dtype == "f16" {
+                            all_f16 = true;
+                        }
+                    }
+
+                    if all_f16 {
+                        let inter = cfg.intermediate_size;
+                        let eps = cfg.rms_norm_eps;
+
+                        let norm_w_data: Vec<u16>;
+                        let w1b_data: Vec<u16>;
+                        let w3b_data: Vec<u16>;
+                        let w2b_data: Vec<u16>;
+
+                        if let (Ok(nw), Ok(w1), Ok(w3), Ok(w2)) = (
+                            self.tensor_f16(&ffn_norm_name),
+                            self.tensor_f16(&gate_name),
+                            self.tensor_f16(&up_name),
+                            self.tensor_f16(&down_name),
+                        ) {
+                            norm_w_data = nw.to_vec();
+                            w1b_data = w1.to_vec();
+                            w3b_data = w3.to_vec();
+                            w2b_data = w2.to_vec();
+
+                            let ops = self.metal_ops.as_ref().unwrap();
+
+                            if ops.ensure_named_buf("ffn_x", hidden).is_ok()
+                                && ops.ensure_named_buf("ffn_norm_out", hidden).is_ok()
+                                && ops.ensure_named_buf("ffn_gate", inter).is_ok()
+                                && ops.ensure_named_buf("ffn_up", inter).is_ok()
+                                && ops.ensure_named_buf("ffn_down", hidden).is_ok()
+                            {
+                                if let (Ok(norm_wb), Ok(w1b), Ok(w3b), Ok(w2b)) = (
+                                    ops.ensure_tensor_cached(&ffn_norm_name, &norm_w_data),
+                                    ops.ensure_tensor_cached(&gate_name, &w1b_data),
+                                    ops.ensure_tensor_cached(&up_name, &w3b_data),
+                                    ops.ensure_tensor_cached(&down_name, &w2b_data),
+                                ) {
+                                    if ops.write_named_buf("ffn_x", &x).is_ok() {
+                                        if let (Ok(xb), Ok(nb), Ok(gb), Ok(ub), Ok(db)) = (
+                                            ops.get_named_buf("ffn_x"),
+                                            ops.get_named_buf("ffn_norm_out"),
+                                            ops.get_named_buf("ffn_gate"),
+                                            ops.get_named_buf("ffn_up"),
+                                            ops.get_named_buf("ffn_down"),
+                                        ) {
+                                            let batch_res = ops.run_batch(|enc| {
+                                                ops.encode_rms_norm_f16w(enc, &xb, &norm_wb, &nb, hidden, eps, add_one);
+                                                ops.encode_mv_f16_bias(enc, &w1b, &nb, None, &gb, inter, hidden);
+                                                ops.encode_mv_f16_bias(enc, &w3b, &nb, None, &ub, inter, hidden);
+                                                ops.encode_silu_mul_f32_inplace(enc, &gb, &ub, inter);
+                                                ops.encode_mv_f16_bias(enc, &w2b, &gb, None, &db, hidden, inter);
+                                                ops.encode_add_f32_inplace(enc, &xb, &db, hidden);
+                                                Ok(())
+                                            });
+
+                                            if batch_res.is_ok() {
+                                                if ops.read_named_buf("ffn_x", &mut x).is_ok() {
+                                                    ffn_done = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
-            // MLP
-            self.linear_f16_out_in(&mlp_in, &format!("{prefix}layers.{layer}.mlp.gate_proj.weight"), cfg.intermediate_size, hidden, &mut gate)?;
-            self.linear_f16_out_in(&mlp_in, &format!("{prefix}layers.{layer}.mlp.up_proj.weight"), cfg.intermediate_size, hidden, &mut up)?;
+            if !ffn_done {
+                // Post-attn norm
+                if use_metal_norm {
+                    let w = self.tensor_f16(&ffn_norm_name)?.to_vec();
+                    self.metal_ops.as_ref().unwrap()
+                        .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, add_one, &ffn_norm_name, &mut mlp_in)
+                        .map_err(|e| CoreError::Backend(e.to_string()))?;
+                } else {
+                    let mut post_norm_w = vec![0.0f32; hidden];
+                    self.rmsnorm_weight(&ffn_norm_name, &mut post_norm_w)?;
+                    if add_one { add_one_inplace(&mut post_norm_w); }
+                    rms_norm_f32(&x, &post_norm_w, cfg.rms_norm_eps, &mut mlp_in);
+                }
 
-            use rayon::prelude::*;
-            gate.par_iter_mut().enumerate().for_each(|(i, g)| {
-                let s = 1.0 / (1.0 + (-*g).exp());
-                *g = (*g * s) * up[i];
-            });
+                // MLP
+                self.linear_f16_out_in(&mlp_in, &gate_name, cfg.intermediate_size, hidden, &mut gate)?;
+                self.linear_f16_out_in(&mlp_in, &up_name, cfg.intermediate_size, hidden, &mut up)?;
 
-            self.linear_f16_out_in(&gate, &format!("{prefix}layers.{layer}.mlp.down_proj.weight"), hidden, cfg.intermediate_size, &mut down)?;
-            for i in 0..hidden { x[i] += down[i]; }
+                use rayon::prelude::*;
+                gate.par_iter_mut().enumerate().for_each(|(i, g)| {
+                    let s = 1.0 / (1.0 + (-*g).exp());
+                    *g = (*g * s) * up[i];
+                });
+
+                self.linear_f16_out_in(&gate, &down_name, hidden, cfg.intermediate_size, &mut down)?;
+                for i in 0..hidden { x[i] += down[i]; }
+            }
 
         }
 
@@ -623,7 +709,7 @@ impl QwenRunner {
                 if let Some(ops) = &mut self.metal_ops {
                     ops.logits_q1(&x_final, &w, vocab, hidden, weight_name, &mut logits).map_err(|e| CoreError::Backend(e.to_string()))?;
                 } else {
-                    for vid in 0..vocab { logits[vid] = self.dot_row(weight_name, vid, hidden, &x_final)?; }
+                    dot_q1_0_g128(&w, hidden, &mut logits, &x_final);
                 }
             }
             _ => return Err(CoreError::Backend(format!("unsupported lm_head dtype: {dtype}").into())),
@@ -1085,9 +1171,8 @@ impl QwenRunner {
                 }
             }
             "q1_0_g128" => {
-                for r in 0..out_dim {
-                    out[r] = self.dot_row(weight_name, r, in_dim, x)?;
-                }
+                let w = self.file.tensor_bytes(&resolved)?;
+                dot_q1_0_g128(w, in_dim, out, x);
             }
             "i2" => {
                 let w = self.tensor_u8(weight_name)?;
@@ -1624,3 +1709,25 @@ struct LinearAttnSpec { num_k_heads: usize, num_v_heads: usize, head_k_dim: usiz
 struct LinearLayerState { conv: Vec<f32>, recurrent: Vec<f32> }
 
 struct QwenSessionState { linear: Vec<Option<LinearLayerState>> }
+
+fn dot_q1_0_g128(bytes: &[u8], in_dim: usize, out: &mut [f32], x: &[f32]) {
+    use rayon::prelude::*;
+    let row_stride = (in_dim / 128) * 18;
+    out.par_iter_mut().with_min_len(32).enumerate().for_each(|(r, o)| {
+        let row = &bytes[r * row_stride..(r + 1) * row_stride];
+        let mut acc = 0.0f32;
+        for i in 0..(in_dim / 128) {
+            let block = &row[i * 18..(i + 1) * 18];
+            let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+            let bits = &block[2..18];
+            for b in 0..16 {
+                let bb = bits[b];
+                for j in 0..8 {
+                    let bit_val = if (bb & (1 << j)) != 0 { d } else { -d };
+                    acc += bit_val * x[i * 128 + b * 8 + j];
+                }
+            }
+        }
+        *o = acc;
+    });
+}
