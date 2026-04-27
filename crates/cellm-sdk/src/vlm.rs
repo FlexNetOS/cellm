@@ -21,6 +21,26 @@ use serde_json::Value;
 use tokenizers::Tokenizer;
 use crate::BackendKind;
 
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[link(name = "Accelerate", kind = "framework")]
+extern "C" {
+    fn cblas_sgemm(
+        Order: i32,
+        TransA: i32,
+        TransB: i32,
+        M: i32,
+        N: i32,
+        K: i32,
+        alpha: f32,
+        A: *const f32,
+        lda: i32,
+        B: *const f32,
+        ldb: i32,
+        beta: f32,
+        C: *mut f32,
+        ldc: i32,
+    );
+}
 #[derive(Debug, Clone, Copy)]
 pub struct VlmRunConfig {
     pub backend: BackendKind,
@@ -1112,16 +1132,17 @@ fn run_vision_cellm(
     }
 
     let mut out = Array2::<f32>::zeros((nimg * out_tokens_per_image, text_hidden));
-    let mut tokens = vec![0.0f32; num_tokens * hidden];
-    let mut norm1 = vec![0.0f32; num_tokens * hidden];
-    let mut q = vec![0.0f32; num_tokens * hidden];
-    let mut k = vec![0.0f32; num_tokens * hidden];
-    let mut v = vec![0.0f32; num_tokens * hidden];
-    let mut attn = vec![0.0f32; num_tokens * hidden];
-    let mut proj_out = vec![0.0f32; num_tokens * hidden];
-    let mut norm2 = vec![0.0f32; num_tokens * hidden];
-    let mut mlp_up = vec![0.0f32; num_tokens * intermediate];
-    let mut mlp_out = vec![0.0f32; num_tokens * hidden];
+    let batched_tokens = nimg * num_tokens;
+    let mut tokens = vec![0.0f32; batched_tokens * hidden];
+    let mut norm1 = vec![0.0f32; batched_tokens * hidden];
+    let mut q = vec![0.0f32; batched_tokens * hidden];
+    let mut k = vec![0.0f32; batched_tokens * hidden];
+    let mut v = vec![0.0f32; batched_tokens * hidden];
+    let mut attn = vec![0.0f32; batched_tokens * hidden];
+    let mut proj_out = vec![0.0f32; batched_tokens * hidden];
+    let mut norm2 = vec![0.0f32; batched_tokens * hidden];
+    let mut mlp_up = vec![0.0f32; batched_tokens * intermediate];
+    let mut mlp_out = vec![0.0f32; batched_tokens * hidden];
     let mut score_buf = vec![0.0f32; num_tokens];
     let mut prob_buf = vec![0.0f32; num_tokens];
 
@@ -1152,8 +1173,10 @@ fn run_vision_cellm(
     let mut encoder_ms = 0.0f64;
     let mut encoder_layer_ms = vec![0.0f64; num_layers];
 
+    let patch_start = Instant::now();
     for img in 0..nimg {
-        let patch_start = Instant::now();
+        let offset = img * num_tokens * hidden;
+        let mut img_tokens = vec![0.0f32; num_tokens * hidden];
         patch_embed_rows(
             &pixel_values,
             img,
@@ -1163,136 +1186,168 @@ fn run_vision_cellm(
             &patch_w,
             &patch_b,
             &pos,
-            &mut tokens,
+            &mut img_tokens,
             &mut linear_backend,
         );
-        patch_ms += patch_start.elapsed().as_secs_f64() * 1000.0;
+        tokens[offset..offset + num_tokens * hidden].copy_from_slice(&img_tokens);
+    }
+    patch_ms += patch_start.elapsed().as_secs_f64() * 1000.0;
 
-        let encoder_start = Instant::now();
-        for (layer_idx, layer) in layers.iter().enumerate() {
-            let layer_start = Instant::now();
-            layer_norm_rows(
-                &tokens, num_tokens, hidden, &layer.ln1_w, &layer.ln1_b, eps, &mut norm1,
-            );
-            linear_rows(
-                &norm1,
-                num_tokens,
-                hidden,
-                &layer.q_w,
-                hidden,
-                Some(&layer.q_b),
-                &mut q,
-                &mut linear_backend,
-            );
-            linear_rows(
-                &norm1,
-                num_tokens,
-                hidden,
-                &layer.k_w,
-                hidden,
-                Some(&layer.k_b),
-                &mut k,
-                &mut linear_backend,
-            );
-            linear_rows(
-                &norm1,
-                num_tokens,
-                hidden,
-                &layer.v_w,
-                hidden,
-                Some(&layer.v_b),
-                &mut v,
-                &mut linear_backend,
-            );
+    let encoder_start = Instant::now();
+    for (layer_idx, layer) in layers.iter().enumerate() {
+        let layer_start = Instant::now();
+        layer_norm_rows(
+            &tokens, batched_tokens, hidden, &layer.ln1_w, &layer.ln1_b, eps, &mut norm1,
+        );
+        linear_rows(
+            &norm1,
+            batched_tokens,
+            hidden,
+            &layer.q_w,
+            hidden,
+            Some(&layer.q_b),
+            &mut q,
+            &mut linear_backend,
+        );
+        linear_rows(
+            &norm1,
+            batched_tokens,
+            hidden,
+            &layer.k_w,
+            hidden,
+            Some(&layer.k_b),
+            &mut k,
+            &mut linear_backend,
+        );
+        linear_rows(
+            &norm1,
+            batched_tokens,
+            hidden,
+            &layer.v_w,
+            hidden,
+            Some(&layer.v_b),
+            &mut v,
+            &mut linear_backend,
+        );
+        
+        for img in 0..nimg {
+            let offset = img * num_tokens * hidden;
             self_attention_full(
-                &q,
-                &k,
-                &v,
+                &q[offset..offset + num_tokens * hidden],
+                &k[offset..offset + num_tokens * hidden],
+                &v[offset..offset + num_tokens * hidden],
                 num_tokens,
                 num_heads,
                 head_dim,
                 None,
                 &mut score_buf,
                 &mut prob_buf,
-                &mut attn,
+                &mut attn[offset..offset + num_tokens * hidden],
                 None,
                 &mut linear_backend,
             );
-            linear_rows(
-                &attn,
-                num_tokens,
-                hidden,
-                &layer.o_w,
-                hidden,
-                Some(&layer.o_b),
-                &mut proj_out,
-                &mut linear_backend,
-            );
-            add_inplace(&mut tokens, &proj_out);
-
-            layer_norm_rows(
-                &tokens, num_tokens, hidden, &layer.ln2_w, &layer.ln2_b, eps, &mut norm2,
-            );
-            linear_rows(
-                &norm2,
-                num_tokens,
-                hidden,
-                &layer.fc1_w,
-                intermediate,
-                Some(&layer.fc1_b),
-                &mut mlp_up,
-                &mut linear_backend,
-            );
-            gelu_pytorch_tanh_inplace(&mut mlp_up);
-            linear_rows(
-                &mlp_up,
-                num_tokens,
-                intermediate,
-                &layer.fc2_w,
-                hidden,
-                Some(&layer.fc2_b),
-                &mut mlp_out,
-                &mut linear_backend,
-            );
-            add_inplace(&mut tokens, &mlp_out);
-            encoder_layer_ms[layer_idx] += layer_start.elapsed().as_secs_f64() * 1000.0;
         }
 
-        layer_norm_rows(
-            &tokens,
-            num_tokens,
+        linear_rows(
+            &attn,
+            batched_tokens,
             hidden,
-            &post_ln_w,
-            &post_ln_b,
-            eps,
-            &mut norm1,
+            &layer.o_w,
+            hidden,
+            Some(&layer.o_b),
+            &mut proj_out,
+            &mut linear_backend,
         );
-        tokens.copy_from_slice(&norm1);
+        add_inplace(&mut tokens, &proj_out);
 
+        layer_norm_rows(
+            &tokens, batched_tokens, hidden, &layer.ln2_w, &layer.ln2_b, eps, &mut norm2,
+        );
+        linear_rows(
+            &norm2,
+            batched_tokens,
+            hidden,
+            &layer.fc1_w,
+            intermediate,
+            Some(&layer.fc1_b),
+            &mut mlp_up,
+            &mut linear_backend,
+        );
+        gelu_pytorch_tanh_inplace(&mut mlp_up);
+        linear_rows(
+            &mlp_up,
+            batched_tokens,
+            intermediate,
+            &layer.fc2_w,
+            hidden,
+            Some(&layer.fc2_b),
+            &mut mlp_out,
+            &mut linear_backend,
+        );
+        add_inplace(&mut tokens, &mlp_out);
+        encoder_layer_ms[layer_idx] += layer_start.elapsed().as_secs_f64() * 1000.0;
+    }
+
+    layer_norm_rows(
+        &tokens,
+        batched_tokens,
+        hidden,
+        &post_ln_w,
+        &post_ln_b,
+        eps,
+        &mut norm1,
+    );
+    tokens.copy_from_slice(&norm1);
+
+    let total_out_rows = nimg * out_tokens_per_image;
+    let mut packed_tokens = vec![0.0f32; total_out_rows * projector_in];
+    
+    for img in 0..nimg {
+        let img_offset = img * num_tokens * hidden;
+        let img_tokens = &tokens[img_offset..img_offset + num_tokens * hidden];
         for gy in 0..groups_per_side {
             for gx in 0..groups_per_side {
                 let out_tok = gy * groups_per_side + gx;
-                for o in 0..text_hidden {
-                    let mut acc = 0.0f32;
-                    let proj_row = &proj[o * projector_in..(o + 1) * projector_in];
-                    let mut proj_i = 0usize;
-                    for dy in 0..group_side {
-                        for dx in 0..group_side {
-                            let ty = gy * group_side + dy;
-                            let tx = gx * group_side + dx;
-                            let token_idx = ty * grid + tx;
-                            let src = &tokens[token_idx * hidden..(token_idx + 1) * hidden];
-                            for &val in src {
-                                acc += val * proj_row[proj_i];
-                                proj_i += 1;
-                            }
-                        }
+                let dst_row = &mut packed_tokens[(img * out_tokens_per_image + out_tok) * projector_in..];
+                let mut proj_i = 0;
+                for dy in 0..group_side {
+                    for dx in 0..group_side {
+                        let ty = gy * group_side + dy;
+                        let tx = gx * group_side + dx;
+                        let token_idx = ty * grid + tx;
+                        let src = &img_tokens[token_idx * hidden..(token_idx + 1) * hidden];
+                        dst_row[proj_i..proj_i + hidden].copy_from_slice(src);
+                        proj_i += hidden;
                     }
-                    out[[img * out_tokens_per_image + out_tok, o]] = acc;
                 }
             }
         }
-        encoder_ms += encoder_start.elapsed().as_secs_f64() * 1000.0;
+    }
+
+    let mut flat_out = vec![0.0f32; total_out_rows * text_hidden];
+    linear_rows(
+        &packed_tokens,
+        total_out_rows,
+        projector_in,
+        &proj,
+        text_hidden,
+        None,
+        &mut flat_out,
+        &mut linear_backend,
+    );
+    
+    for r in 0..total_out_rows {
+        for c in 0..text_hidden {
+            out[[r, c]] = flat_out[r * text_hidden + c];
+        }
+    }
+    encoder_ms += encoder_start.elapsed().as_secs_f64() * 1000.0;
+    
+    if std::env::var("CELLM_STEP_TIMING").is_ok() {
+        eprintln!("VISION_ENCODER patch={:.1}ms total_encoder={:.1}ms", patch_ms, encoder_ms);
+        let sum_layers: f64 = encoder_layer_ms.iter().sum();
+        eprintln!("VISION_ENCODER layers_sum={:.1}ms proj={:.1}ms", sum_layers, encoder_ms - sum_layers);
+        eprintln!("VISION_ENCODER layer 0 = {:.1}ms", encoder_layer_ms.first().unwrap_or(&0.0));
     }
 
     Ok((out, out_tokens_per_image, patch_ms, encoder_ms, encoder_layer_ms))
@@ -2648,7 +2703,7 @@ fn tensor_f16_to_f32(file: &CellmFile, name: &str) -> Result<Vec<f32>> {
         anyhow::bail!("tensor {name} bytes not even");
     }
     let u16s: &[u16] = cast_slice(bytes);
-    Ok(u16s.iter().map(|&b| f16::from_bits(b).to_f32()).collect())
+    Ok(u16s.par_iter().map(|&b| f16::from_bits(b).to_f32()).collect())
 }
 
 fn tensor_to_f32(file: &CellmFile, name: &str) -> Result<Vec<f32>> {
@@ -2763,24 +2818,44 @@ fn layer_norm_rows(
     eps: f32,
     out: &mut [f32],
 ) {
-    for r in 0..rows {
-        let x = &input[r * cols..(r + 1) * cols];
-        let y = &mut out[r * cols..(r + 1) * cols];
-        let mut mean = 0.0f32;
-        for &val in x {
-            mean += val;
+    if rows * cols < 2048 {
+        for r in 0..rows {
+            let x = &input[r * cols..(r + 1) * cols];
+            let y = &mut out[r * cols..(r + 1) * cols];
+            let mut mean = 0.0f32;
+            for &val in x {
+                mean += val;
+            }
+            mean /= cols as f32;
+            let mut var = 0.0f32;
+            for &val in x {
+                let d = val - mean;
+                var += d * d;
+            }
+            var /= cols as f32;
+            let inv = 1.0f32 / (var + eps).sqrt();
+            for i in 0..cols {
+                y[i] = ((x[i] - mean) * inv) * weight[i] + bias[i];
+            }
         }
-        mean /= cols as f32;
-        let mut var = 0.0f32;
-        for &val in x {
-            let d = val - mean;
-            var += d * d;
-        }
-        var /= cols as f32;
-        let inv = 1.0f32 / (var + eps).sqrt();
-        for i in 0..cols {
-            y[i] = ((x[i] - mean) * inv) * weight[i] + bias[i];
-        }
+    } else {
+        input.par_chunks_exact(cols).zip(out.par_chunks_exact_mut(cols)).for_each(|(x, y)| {
+            let mut mean = 0.0f32;
+            for &val in x {
+                mean += val;
+            }
+            mean /= cols as f32;
+            let mut var = 0.0f32;
+            for &val in x {
+                let d = val - mean;
+                var += d * d;
+            }
+            var /= cols as f32;
+            let inv = 1.0f32 / (var + eps).sqrt();
+            for i in 0..cols {
+                y[i] = ((x[i] - mean) * inv) * weight[i] + bias[i];
+            }
+        });
     }
 }
 
@@ -2792,18 +2867,32 @@ fn rms_norm_rows(
     eps: f32,
     out: &mut [f32],
 ) {
-    for r in 0..rows {
-        let x = &input[r * cols..(r + 1) * cols];
-        let y = &mut out[r * cols..(r + 1) * cols];
-        let mut ms = 0.0f32;
-        for &val in x {
-            ms += val * val;
+    if rows * cols < 2048 {
+        for r in 0..rows {
+            let x = &input[r * cols..(r + 1) * cols];
+            let y = &mut out[r * cols..(r + 1) * cols];
+            let mut ms = 0.0f32;
+            for &val in x {
+                ms += val * val;
+            }
+            ms /= cols as f32;
+            let inv = 1.0f32 / (ms + eps).sqrt();
+            for i in 0..cols {
+                y[i] = x[i] * inv * weight[i];
+            }
         }
-        ms /= cols as f32;
-        let inv = 1.0f32 / (ms + eps).sqrt();
-        for i in 0..cols {
-            y[i] = x[i] * inv * weight[i];
-        }
+    } else {
+        input.par_chunks_exact(cols).zip(out.par_chunks_exact_mut(cols)).for_each(|(x, y)| {
+            let mut ms = 0.0f32;
+            for &val in x {
+                ms += val * val;
+            }
+            ms /= cols as f32;
+            let inv = 1.0f32 / (ms + eps).sqrt();
+            for i in 0..cols {
+                y[i] = x[i] * inv * weight[i];
+            }
+        });
     }
 }
 
@@ -3008,26 +3097,42 @@ fn linear_rows(
     // the tiny projections used during token-by-token decode.
     let total_ops = rows * in_dim * out_dim;
     if total_ops >= 1 << 20 {
-        let out_slice = &mut out[..rows * out_dim];
-        let inp_slice = &input[..rows * in_dim];
-        out_slice
-            .par_chunks_mut(out_dim)
-            .zip(inp_slice.par_chunks(in_dim))
-            .for_each(|(y, x)| {
-                if let Some(b) = bias {
-                    y.copy_from_slice(b);
-                } else {
-                    y.fill(0.0);
-                }
-                for o in 0..out_dim {
-                    let wrow = &weight[o * in_dim..(o + 1) * in_dim];
-                    let mut acc = y[o];
-                    for i in 0..in_dim {
-                        acc += x[i] * wrow[i];
-                    }
-                    y[o] = acc;
+        unsafe {
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            cblas_sgemm(
+                101, // CblasRowMajor
+                111, // CblasNoTrans
+                112, // CblasTrans
+                rows as i32,
+                out_dim as i32,
+                in_dim as i32,
+                1.0,
+                input.as_ptr(),
+                in_dim as i32,
+                weight.as_ptr(),
+                in_dim as i32,
+                0.0,
+                out.as_mut_ptr(),
+                out_dim as i32,
+            );
+
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            matrixmultiply::sgemm(
+                rows, in_dim, out_dim,
+                1.0,
+                input.as_ptr(), in_dim as isize, 1,
+                weight.as_ptr(), 1, in_dim as isize,
+                0.0,
+                out.as_mut_ptr(), out_dim as isize, 1
+            );
+        }
+        if let Some(b) = bias {
+            out[..rows * out_dim].chunks_mut(out_dim).for_each(|row| {
+                for c in 0..out_dim {
+                    row[c] += b[c];
                 }
             });
+        }
     } else {
         for r in 0..rows {
             let x = &input[r * in_dim..(r + 1) * in_dim];
@@ -3120,6 +3225,102 @@ fn self_attention_full(
         {
             return;
         }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        let mut score = vec![0.0f32; seq * seq];
+        for h in 0..num_heads {
+            let offset = h * head_dim;
+            let q_ptr = unsafe { q.as_ptr().add(offset) };
+            let k_ptr = unsafe { k.as_ptr().add(offset) };
+            let v_ptr = unsafe { v.as_ptr().add(offset) };
+            let out_ptr = unsafe { out.as_mut_ptr().add(offset) };
+
+            unsafe {
+                cblas_sgemm(
+                    101, // CblasRowMajor
+                    111, // CblasNoTrans
+                    112, // CblasTrans
+                    seq as i32,
+                    seq as i32,
+                    head_dim as i32,
+                    scale,
+                    q_ptr,
+                    hidden as i32,
+                    k_ptr,
+                    hidden as i32,
+                    0.0,
+                    score.as_mut_ptr(),
+                    seq as i32,
+                );
+            }
+
+            for i in 0..seq {
+                if let Some(mask) = valid_mask {
+                    if !mask[i] {
+                        for j in 0..seq {
+                            score[i * seq + j] = 0.0;
+                        }
+                        continue;
+                    }
+                }
+                
+                let mut mx = f32::NEG_INFINITY;
+                for j in 0..seq {
+                    if let Some(mask) = valid_mask {
+                        if !mask[j] {
+                            score[i * seq + j] = -1.0e30;
+                        }
+                    }
+                    if score[i * seq + j] > mx {
+                        mx = score[i * seq + j];
+                    }
+                }
+                
+                let mut sum = 0.0f32;
+                for j in 0..seq {
+                    let p = (score[i * seq + j] - mx).exp();
+                    score[i * seq + j] = p;
+                    sum += p;
+                }
+                
+                let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+                for j in 0..seq {
+                    score[i * seq + j] *= inv;
+                }
+            }
+
+            unsafe {
+                cblas_sgemm(
+                    101, // CblasRowMajor
+                    111, // CblasNoTrans
+                    111, // CblasNoTrans
+                    seq as i32,
+                    head_dim as i32,
+                    seq as i32,
+                    1.0,
+                    score.as_ptr(),
+                    seq as i32,
+                    v_ptr,
+                    hidden as i32,
+                    0.0,
+                    out_ptr,
+                    hidden as i32,
+                );
+            }
+            
+            if let Some(mask) = valid_mask {
+                for i in 0..seq {
+                    if !mask[i] {
+                        for d in 0..head_dim {
+                            out[i * hidden + offset + d] = 0.0;
+                        }
+                    }
+                }
+            }
+        }
+        return;
     }
 
     // CPU fallback
@@ -3306,10 +3507,10 @@ fn self_attention_full_metal(
 fn gelu_pytorch_tanh_inplace(x: &mut [f32]) {
     const A: f32 = 0.797_884_6;
     const B: f32 = 0.044_715;
-    for v in x.iter_mut() {
+    x.par_iter_mut().for_each(|v| {
         let t = A * (*v + B * *v * *v * *v);
         *v = 0.5 * *v * (1.0 + t.tanh());
-    }
+    });
 }
 
 fn silu_inplace(x: &mut [f32]) {
@@ -3319,14 +3520,26 @@ fn silu_inplace(x: &mut [f32]) {
 }
 
 fn mul_inplace(dst: &mut [f32], rhs: &[f32]) {
-    for (d, r) in dst.iter_mut().zip(rhs.iter()) {
-        *d *= *r;
+    if dst.len() < 2048 {
+        for (d, r) in dst.iter_mut().zip(rhs.iter()) {
+            *d *= *r;
+        }
+    } else {
+        dst.par_iter_mut().zip(rhs.par_iter()).for_each(|(d, r)| {
+            *d *= *r;
+        });
     }
 }
 
 fn add_inplace(dst: &mut [f32], src: &[f32]) {
-    for (d, s) in dst.iter_mut().zip(src.iter()) {
-        *d += *s;
+    if dst.len() < 2048 {
+        for (d, s) in dst.iter_mut().zip(src.iter()) {
+            *d += *s;
+        }
+    } else {
+        dst.par_iter_mut().zip(src.par_iter()).for_each(|(d, s)| {
+            *d += *s;
+        });
     }
 }
 

@@ -548,7 +548,7 @@ kernel void mv_q1_0_g128(
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= rows) return;
-    device const uchar* row_ptr = w + (uint64_t)gid * (cols / 128 * 18);
+    device const uchar* row_ptr = w + (ulong)gid * (cols / 128 * 18);
     float acc = 0.0f;
     for (uint i = 0; i < cols; i += 128) {
         uchar d_low = row_ptr[0];
@@ -611,8 +611,15 @@ kernel void mv_i4(
         uchar packed = row_ptr[i / 2];
         float v0 = float(int(packed & 0x0F) - 8);
         float v1 = float(int(packed >> 4) - 8);
-        float s0 = (gs > 0 && gs < cols) ? float(rs[i / gs]) : float(rs[0]);
-        float s1 = (gs > 0 && gs < cols) ? float(rs[(i + 1) / gs]) : float(rs[0]);
+        float s0 = 1.0f;
+        float s1 = 1.0f;
+        if (gs > 0 && gs < cols) {
+            s0 = float(rs[i / gs]);
+            s1 = float(rs[(i + 1) / gs]);
+        } else {
+            s0 = float(rs[0]);
+            s1 = float(rs[0]);
+        }
         acc += v0 * x[i] * s0 + v1 * x[i + 1] * s1;
     }
     o[gid] = acc;
@@ -660,6 +667,8 @@ pub struct MetalOps {
     x_buf: Mutex<Option<Buffer>>,
     out_buf: Mutex<Option<Buffer>>,
     tensor_cache: Mutex<HashMap<String, Buffer>>,
+    /// Named scratch buffers for batched execution (kept on GPU between ops)
+    named_bufs: Mutex<HashMap<String, Buffer>>,
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -688,6 +697,7 @@ impl Clone for MetalOps {
             x_buf: Mutex::new(None),
             out_buf: Mutex::new(None),
             tensor_cache: Mutex::new(HashMap::new()),
+            named_bufs: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -744,6 +754,80 @@ impl MetalOps {
             pso_add_f32, pso_silu_mul_f32, pso_gelu_mul_f32, pso_mv_q1, pso_lfm_conv, pso_mv_f32,
             x_buf: Mutex::new(None), out_buf: Mutex::new(None),
             tensor_cache: Mutex::new(HashMap::new()),
+            named_bufs: Mutex::new(HashMap::new()),
+        })
+    }
+
+    // Named GPU buffer management
+    // These let the LFM runner keep data on GPU between operations,
+    // eliminating per-op CPU↔GPU copies.
+
+    /// Ensure a named GPU buffer exists with at least `elems` f32 capacity.
+    pub fn ensure_named_buf(&self, name: &str, elems: usize) -> anyhow::Result<()> {
+        let need = (elems * 4) as u64;
+        let mut bufs = self.named_bufs.lock().unwrap();
+        if bufs.get(name).map(|b| b.length() >= need).unwrap_or(false) {
+            return Ok(());
+        }
+        let b = self.device.new_buffer(need, MTLResourceOptions::StorageModeShared);
+        if b.contents().is_null() { anyhow::bail!("named buf alloc failed: {name}"); }
+        bufs.insert(name.to_string(), b);
+        Ok(())
+    }
+
+    /// Write f32 data from CPU into a named GPU buffer.
+    pub fn write_named_buf(&self, name: &str, src: &[f32]) -> anyhow::Result<()> {
+        let bufs = self.named_bufs.lock().unwrap();
+        let buf = bufs.get(name).ok_or_else(|| anyhow::anyhow!("no named buf: {name}"))?;
+        write_f32(buf, src)
+    }
+
+    /// Read f32 data from a named GPU buffer back to CPU.
+    pub fn read_named_buf(&self, name: &str, dst: &mut [f32]) -> anyhow::Result<()> {
+        let bufs = self.named_bufs.lock().unwrap();
+        let buf = bufs.get(name).ok_or_else(|| anyhow::anyhow!("no named buf: {name}"))?;
+        read_f32(buf, dst)
+    }
+
+    /// Get a clone of a named buffer reference for use in encoding.
+    pub fn get_named_buf(&self, name: &str) -> anyhow::Result<Buffer> {
+        let bufs = self.named_bufs.lock().unwrap();
+        bufs.get(name).cloned().ok_or_else(|| anyhow::anyhow!("no named buf: {name}"))
+    }
+
+    /// Cache a tensor (f16 weights) if not already cached, return the buffer.
+    pub fn ensure_tensor_cached(&self, key: &str, data_f16: &[u16]) -> anyhow::Result<Buffer> {
+        let mut cache = self.tensor_cache.lock().unwrap();
+        if !cache.contains_key(key) {
+            cache.insert(key.to_string(), upload_u16(&self.device, data_f16)?);
+        }
+        Ok(cache.get(key).unwrap().clone())
+    }
+
+    /// Cache an f32 tensor if not already cached, return the buffer.
+    pub fn ensure_tensor_cached_f32(&self, key: &str, data: &[f32]) -> anyhow::Result<Buffer> {
+        let mut cache = self.tensor_cache.lock().unwrap();
+        if !cache.contains_key(key) {
+            cache.insert(key.to_string(), upload_f32(&self.device, data)?);
+        }
+        Ok(cache.get(key).unwrap().clone())
+    }
+
+    /// Run a batch of pre-encoded operations in a single command buffer.
+    /// `encode_fn` receives the command encoder and encodes all operations.
+    /// This is the key to eliminating per-op GPU sync overhead.
+    pub fn run_batch<F>(&self, encode_fn: F) -> anyhow::Result<()>
+    where
+        F: FnOnce(&metal::ComputeCommandEncoderRef) -> anyhow::Result<()>,
+    {
+        autoreleasepool(|| {
+            let cb = self.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            encode_fn(enc)?;
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            Ok(())
         })
     }
 

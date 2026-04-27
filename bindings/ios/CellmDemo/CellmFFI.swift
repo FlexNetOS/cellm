@@ -314,10 +314,6 @@ final class CellmEngine {
         }
 
         for i in 0..<(maxNewTokens - 1) {
-            if Task.isCancelled {
-                stopReason = "task_cancelled"
-                break
-            }
             if stopReason == "uppercase_constraint_satisfied" {
                 break
             }
@@ -752,60 +748,5 @@ enum CellmFFI {
             }
         }
         return out
-    }
-}
-
-/// A thread-safe global cache that ensures only one heavy model engine is active in memory at a time.
-/// This prevents OOM crashes on iOS when switching between different views or models.
-actor GlobalEngineCache {
-    static let shared = GlobalEngineCache()
-    
-    private var cachedLLMEngine: (key: String, engine: CellmEngine, tokenizer: CellmTokenizer)?
-    private var cachedVLMEngine: (key: String, engine: CellmVLMEngine)?
-    
-    private init() {}
-    
-    /// Clears all cached engines to free up memory.
-    func clear() {
-        cachedLLMEngine = nil
-        cachedVLMEngine = nil
-    }
-    
-    /// Gets or creates a cached LLM engine.
-    func getOrCreateLLM(
-        key: String,
-        factory: () async throws -> (CellmEngine, CellmTokenizer)
-    ) async throws -> (CellmEngine, CellmTokenizer) {
-        // If we have the exact same engine, reuse it.
-        if let cached = cachedLLMEngine, cached.key == key {
-            return (cached.engine, cached.tokenizer)
-        }
-        
-        // Otherwise, clear EVERYTHING to make room for the new heavy model.
-        cachedLLMEngine = nil
-        cachedVLMEngine = nil
-        
-        let (newEngine, newTokenizer) = try await factory()
-        cachedLLMEngine = (key, newEngine, newTokenizer)
-        
-        return (newEngine, newTokenizer)
-    }
-    
-    /// Gets or creates a cached VLM engine.
-    func getOrCreateVLM(
-        key: String,
-        factory: () async throws -> CellmVLMEngine
-    ) async throws -> CellmVLMEngine {
-        if let cached = cachedVLMEngine, cached.key == key {
-            return cached.engine
-        }
-        
-        cachedLLMEngine = nil
-        cachedVLMEngine = nil
-        
-        let newEngine = try await factory()
-        cachedVLMEngine = (key, newEngine)
-        
-        return newEngine
     }
 }

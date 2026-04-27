@@ -19,18 +19,22 @@ pub fn rms_norm_f32(x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
     debug_assert_eq!(x.len(), out.len());
 
     let mut mean_sq = 0.0f32;
-    // Use parallel reduction for large vectors if needed, but usually hidden_size is 4k-8k.
-    // Scalar is fine for reduction, but let's at least ensure autovectorization.
     for &v in x {
         mean_sq += v * v;
     }
     mean_sq /= x.len() as f32;
     let inv_rms = 1.0f32 / (mean_sq + eps).sqrt();
 
-    // Parallelize the output application if len is large.
-    out.par_iter_mut().zip(x.par_iter()).zip(weight.par_iter()).for_each(|((o, &xi), &wi)| {
-        *o = xi * inv_rms * wi;
-    });
+    // Skip Rayon for small vectors where dispatch overhead dominates.
+    if x.len() < 2048 {
+        for i in 0..x.len() {
+            out[i] = x[i] * inv_rms * weight[i];
+        }
+    } else {
+        out.par_iter_mut().zip(x.par_iter()).zip(weight.par_iter()).for_each(|((o, &xi), &wi)| {
+            *o = xi * inv_rms * wi;
+        });
+    }
 }
 
 pub fn matmul_f32(a: &[f32], m: usize, k: usize, b: &[f32], n: usize, out: &mut [f32]) {
@@ -263,17 +267,32 @@ pub fn softmax_f32_inplace(x: &mut [f32]) {
 
 pub fn rope_non_interleaved_inplace_f32(x: &mut [f32], _n_heads: usize, head_dim: usize, rotary_dim: usize, pos: usize, theta: f32) {
     let half = rotary_dim / 2;
-    x.par_chunks_exact_mut(head_dim).for_each(|head| {
-        for i in 0..half {
-            let inv_freq = theta.powf(-(2.0 * i as f32) / rotary_dim as f32);
-            let angle = pos as f32 * inv_freq;
-            let (sin, cos) = angle.sin_cos();
-            let x0 = head[i];
-            let x1 = head[half + i];
-            head[i] = x0 * cos - x1 * sin;
-            head[half + i] = x1 * cos + x0 * sin;
+    // Skip Rayon for small head counts where dispatch overhead dominates.
+    if x.len() < 2048 {
+        for head in x.chunks_exact_mut(head_dim) {
+            for i in 0..half {
+                let inv_freq = theta.powf(-(2.0 * i as f32) / rotary_dim as f32);
+                let angle = pos as f32 * inv_freq;
+                let (sin, cos) = angle.sin_cos();
+                let x0 = head[i];
+                let x1 = head[half + i];
+                head[i] = x0 * cos - x1 * sin;
+                head[half + i] = x1 * cos + x0 * sin;
+            }
         }
-    });
+    } else {
+        x.par_chunks_exact_mut(head_dim).for_each(|head| {
+            for i in 0..half {
+                let inv_freq = theta.powf(-(2.0 * i as f32) / rotary_dim as f32);
+                let angle = pos as f32 * inv_freq;
+                let (sin, cos) = angle.sin_cos();
+                let x0 = head[i];
+                let x1 = head[half + i];
+                head[i] = x0 * cos - x1 * sin;
+                head[half + i] = x1 * cos + x0 * sin;
+            }
+        });
+    }
 }
 
 pub fn rope_interleaved_inplace_f32(x: &mut [f32], _n_heads: usize, head_dim: usize, pos: usize, theta: f32) {

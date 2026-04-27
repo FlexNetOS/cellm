@@ -312,17 +312,14 @@ struct VLMView: View {
                     return
                 }
 
-                let cacheKey = "\(modelURL.path)|\(backend.rawValue)"
-                let eng = try await GlobalEngineCache.shared.getOrCreateVLM(key: cacheKey) {
-                    try CellmVLMEngine(
-                        modelURL: modelURL,
-                        topK: 20,
-                        temperature: 0.2,
-                        repeatPenalty: 1.15,
-                        repeatWindow: 64,
-                        backend: backend
-                    )
-                }
+                let eng = try CellmVLMEngine(
+                    modelURL: modelURL,
+                    topK: 20,
+                    temperature: 0.2,
+                    repeatPenalty: 1.15,
+                    repeatWindow: 64,
+                    backend: backend
+                )
                 let text = try eng.describe(imageBytes: imageBytes, prompt: promptText)
                 await MainActor.run {
                     self.output = prettyOutput(text)

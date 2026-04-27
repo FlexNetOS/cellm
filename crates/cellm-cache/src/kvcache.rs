@@ -763,9 +763,40 @@ impl DeviceKvStorage for CpuKvStorage {
                 let kt_base = base + kv_h * head_dim;
                 let kt = &self.k[kt_base..kt_base + head_dim];
                 let mut dot = 0.0f32;
-                for i in 0..head_dim {
-                    dot += qh[i] * kt[i].to_f32();
+
+                #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+                unsafe {
+                    use std::arch::aarch64::*;
+                    let mut sum0 = vdupq_n_f32(0.0);
+                    let mut i = 0;
+                    while i + 4 <= head_dim {
+                        let h_raw = vld1_u16(kt.as_ptr().add(i) as *const u16);
+                        let w = vmovl_u16(h_raw);
+                        let sign = vandq_u32(vshlq_n_u32(w, 16), vdupq_n_u32(0x80000000u32));
+                        let normal = vshlq_n_u32(
+                            vaddq_u32(vandq_u32(w, vdupq_n_u32(0x7fff)), vdupq_n_u32(0x1c000u32)),
+                            13,
+                        );
+                        let not_zero = vtstq_u32(w, vdupq_n_u32(0x7c00));
+                        let kf = vreinterpretq_f32_u32(vorrq_u32(sign, vandq_u32(normal, not_zero)));
+                        let qf = vld1q_f32(qh.as_ptr().add(i));
+                        sum0 = vfmaq_f32(sum0, kf, qf);
+                        i += 4;
+                    }
+                    dot = vaddvq_f32(sum0);
+                    while i < head_dim {
+                        dot += qh[i] * kt[i].to_f32();
+                        i += 1;
+                    }
                 }
+
+                #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+                {
+                    for i in 0..head_dim {
+                        dot += qh[i] * kt[i].to_f32();
+                    }
+                }
+
                 let mut s = dot * scale;
                 if let Some(cap) = soft_cap {
                     s = (s / cap).tanh() * cap;
@@ -780,8 +811,37 @@ impl DeviceKvStorage for CpuKvStorage {
                 let vt_base = base + kv_h * head_dim;
                 let vt = &self.v[vt_base..vt_base + head_dim];
                 let w = scores[t];
-                for i in 0..head_dim {
-                    out_h[i] += w * vt[i].to_f32();
+
+                #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+                unsafe {
+                    use std::arch::aarch64::*;
+                    let wv = vdupq_n_f32(w);
+                    let mut i = 0;
+                    while i + 4 <= head_dim {
+                        let h_raw = vld1_u16(vt.as_ptr().add(i) as *const u16);
+                        let ww = vmovl_u16(h_raw);
+                        let sign = vandq_u32(vshlq_n_u32(ww, 16), vdupq_n_u32(0x80000000u32));
+                        let normal = vshlq_n_u32(
+                            vaddq_u32(vandq_u32(ww, vdupq_n_u32(0x7fff)), vdupq_n_u32(0x1c000u32)),
+                            13,
+                        );
+                        let not_zero = vtstq_u32(ww, vdupq_n_u32(0x7c00));
+                        let vf = vreinterpretq_f32_u32(vorrq_u32(sign, vandq_u32(normal, not_zero)));
+                        let ov = vld1q_f32(out_h.as_ptr().add(i));
+                        vst1q_f32(out_h.as_mut_ptr().add(i), vfmaq_f32(ov, wv, vf));
+                        i += 4;
+                    }
+                    while i < head_dim {
+                        out_h[i] += w * vt[i].to_f32();
+                        i += 1;
+                    }
+                }
+
+                #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+                {
+                    for i in 0..head_dim {
+                        out_h[i] += w * vt[i].to_f32();
+                    }
                 }
             }
         }

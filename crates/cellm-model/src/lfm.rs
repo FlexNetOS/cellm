@@ -13,7 +13,7 @@
 
 use std::path::Path;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use rayon::prelude::*;use std::sync::Mutex;
 
 use rayon::prelude::*;
 use cellm_cache::{KVCache, PageTable};
@@ -611,59 +611,163 @@ impl LfmRunner {
                 x[i] += attn_proj[i];
             }
 
-            // FFN norm
+            // ── Batched FFN block ──────────────────────────────────────
+            // On Metal: batch ffn_norm + gate + up + silu_mul + down into ONE
+            // command buffer, eliminating 5 GPU round-trips → 1 per layer.
             let ffn_norm_name = format!("model.layers.{layer}.ffn_norm.weight");
+            let w1_name = format!("model.layers.{layer}.feed_forward.w1.weight");
+            let w3_name = format!("model.layers.{layer}.feed_forward.w3.weight");
+            let w2_name = format!("model.layers.{layer}.feed_forward.w2.weight");
+
+            let mut ffn_done = false;
             #[cfg(any(target_os = "macos", target_os = "ios"))]
-            if let Some(ops) = &self.metal_ops {
-                let w = self.tensor_f16(&ffn_norm_name)?;
-                ops.rms_norm_f16w(&x, w, cfg.rms_norm_eps, false, &ffn_norm_name, &mut mlp_in)
-                    .map_err(|e| CoreError::Backend(e.to_string()))?;
-            } else {
-                self.rmsnorm_weight(&ffn_norm_name, &mut ffn_norm_w)?;
-                rms_norm_f32(&x, &ffn_norm_w, cfg.rms_norm_eps, &mut mlp_in);
-            }
-            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             {
-                self.rmsnorm_weight(&ffn_norm_name, &mut ffn_norm_w)?;
-                rms_norm_f32(&x, &ffn_norm_w, cfg.rms_norm_eps, &mut mlp_in);
+                let has_metal = self.metal_ops.is_some();
+                if has_metal {
+                    let dtype_w1 = self.tensor_dtype(&w1_name).unwrap_or_else(|| "f16".to_string());
+                    let inter = cfg.intermediate_size;
+                    let eps = cfg.rms_norm_eps;
+
+                    // Pre-fetch all tensor data before borrowing metal_ops
+                    let norm_w_data: Vec<u16>;
+                    let mut w1b_data: Option<Vec<u16>> = None;
+                    let mut w3b_data: Option<Vec<u16>> = None;
+                    let mut w2b_data: Option<Vec<u16>> = None;
+
+                    {
+                        let nw = self.tensor_f16(&ffn_norm_name)?;
+                        norm_w_data = nw.to_vec();
+                    }
+
+                    if dtype_w1 == "f16" {
+                        let w1 = self.tensor_f16(&w1_name)?.to_vec();
+                        let w3 = self.tensor_f16(&w3_name)?.to_vec();
+                        let w2 = self.tensor_f16(&w2_name)?.to_vec();
+                        w1b_data = Some(w1);
+                        w3b_data = Some(w3);
+                        w2b_data = Some(w2);
+                    } else if dtype_w1 == "u32" {
+                        // Pre-populate the dequant cache (mutably borrows self)
+                        let w1_key = (w1_name.clone(), inter, hidden);
+                        let w3_key = (w3_name.clone(), inter, hidden);
+                        let w2_key = (w2_name.clone(), hidden, inter);
+                        if !self.weight_cache.contains_key(&w1_key) {
+                            let mut dummy = vec![0.0f32; inter];
+                            let zero_in = vec![0.0f32; hidden];
+                            let _ = self.linear_i4_out_in(&zero_in, &w1_name, inter, hidden, &mut dummy);
+                        }
+                        if !self.weight_cache.contains_key(&w3_key) {
+                            let mut dummy = vec![0.0f32; inter];
+                            let zero_in = vec![0.0f32; hidden];
+                            let _ = self.linear_i4_out_in(&zero_in, &w3_name, inter, hidden, &mut dummy);
+                        }
+                        if !self.weight_cache.contains_key(&w2_key) {
+                            let mut dummy = vec![0.0f32; hidden];
+                            let zero_in = vec![0.0f32; inter];
+                            let _ = self.linear_i4_out_in(&zero_in, &w2_name, hidden, inter, &mut dummy);
+                        }
+                    }
+
+                    // Now borrow metal_ops immutably — all mut borrows are done
+                    let ops = self.metal_ops.as_ref().unwrap();
+
+                    ops.ensure_named_buf("ffn_x", hidden).map_err(|e| CoreError::Backend(e.to_string()))?;
+                    ops.ensure_named_buf("ffn_norm_out", hidden).map_err(|e| CoreError::Backend(e.to_string()))?;
+                    ops.ensure_named_buf("ffn_gate", inter).map_err(|e| CoreError::Backend(e.to_string()))?;
+                    ops.ensure_named_buf("ffn_up", inter).map_err(|e| CoreError::Backend(e.to_string()))?;
+                    ops.ensure_named_buf("ffn_down", hidden).map_err(|e| CoreError::Backend(e.to_string()))?;
+
+                    let norm_wb = ops.ensure_tensor_cached(&ffn_norm_name, &norm_w_data).map_err(|e| CoreError::Backend(e.to_string()))?;
+
+                    if dtype_w1 == "f16" {
+                        let w1b = ops.ensure_tensor_cached(&w1_name, w1b_data.as_ref().unwrap()).map_err(|e| CoreError::Backend(e.to_string()))?;
+                        let w3b = ops.ensure_tensor_cached(&w3_name, w3b_data.as_ref().unwrap()).map_err(|e| CoreError::Backend(e.to_string()))?;
+                        let w2b = ops.ensure_tensor_cached(&w2_name, w2b_data.as_ref().unwrap()).map_err(|e| CoreError::Backend(e.to_string()))?;
+
+                        ops.write_named_buf("ffn_x", &x).map_err(|e| CoreError::Backend(e.to_string()))?;
+                        let xb = ops.get_named_buf("ffn_x").map_err(|e| CoreError::Backend(e.to_string()))?;
+                        let nb = ops.get_named_buf("ffn_norm_out").map_err(|e| CoreError::Backend(e.to_string()))?;
+                        let gb = ops.get_named_buf("ffn_gate").map_err(|e| CoreError::Backend(e.to_string()))?;
+                        let ub = ops.get_named_buf("ffn_up").map_err(|e| CoreError::Backend(e.to_string()))?;
+                        let db = ops.get_named_buf("ffn_down").map_err(|e| CoreError::Backend(e.to_string()))?;
+
+                        ops.run_batch(|enc| {
+                            ops.encode_rms_norm_f16w(enc, &xb, &norm_wb, &nb, hidden, eps, false);
+                            ops.encode_mv_f16_bias(enc, &w1b, &nb, None, &gb, inter, hidden);
+                            ops.encode_mv_f16_bias(enc, &w3b, &nb, None, &ub, inter, hidden);
+                            ops.encode_silu_mul_f32_inplace(enc, &gb, &ub, inter);
+                            ops.encode_mv_f16_bias(enc, &w2b, &gb, None, &db, hidden, inter);
+                            ops.encode_add_f32_inplace(enc, &xb, &db, hidden);
+                            Ok(())
+                        }).map_err(|e| CoreError::Backend(e.to_string()))?;
+
+                        ops.read_named_buf("ffn_x", &mut x).map_err(|e| CoreError::Backend(e.to_string()))?;
+                        ffn_done = true;
+                    } else if dtype_w1 == "u32" {
+                        let w1_key = (w1_name.clone(), inter, hidden);
+                        let w3_key = (w3_name.clone(), inter, hidden);
+                        let w2_key = (w2_name.clone(), hidden, inter);
+
+                        let w1b = ops.ensure_tensor_cached_f32(&w1_name, self.weight_cache.get(&w1_key).unwrap()).map_err(|e| CoreError::Backend(e.to_string()))?;
+                        let w3b = ops.ensure_tensor_cached_f32(&w3_name, self.weight_cache.get(&w3_key).unwrap()).map_err(|e| CoreError::Backend(e.to_string()))?;
+                        let w2b = ops.ensure_tensor_cached_f32(&w2_name, self.weight_cache.get(&w2_key).unwrap()).map_err(|e| CoreError::Backend(e.to_string()))?;
+
+                        ops.write_named_buf("ffn_x", &x).map_err(|e| CoreError::Backend(e.to_string()))?;
+                        let xb = ops.get_named_buf("ffn_x").map_err(|e| CoreError::Backend(e.to_string()))?;
+                        let nb = ops.get_named_buf("ffn_norm_out").map_err(|e| CoreError::Backend(e.to_string()))?;
+                        let gb = ops.get_named_buf("ffn_gate").map_err(|e| CoreError::Backend(e.to_string()))?;
+                        let ub = ops.get_named_buf("ffn_up").map_err(|e| CoreError::Backend(e.to_string()))?;
+                        let db = ops.get_named_buf("ffn_down").map_err(|e| CoreError::Backend(e.to_string()))?;
+
+                        ops.run_batch(|enc| {
+                            ops.encode_rms_norm_f16w(enc, &xb, &norm_wb, &nb, hidden, eps, false);
+                            ops.encode_mv_f32(enc, &w1b, &nb, &gb, inter, hidden);
+                            ops.encode_mv_f32(enc, &w3b, &nb, &ub, inter, hidden);
+                            ops.encode_silu_mul_f32_inplace(enc, &gb, &ub, inter);
+                            ops.encode_mv_f32(enc, &w2b, &gb, &db, hidden, inter);
+                            ops.encode_add_f32_inplace(enc, &xb, &db, hidden);
+                            Ok(())
+                        }).map_err(|e| CoreError::Backend(e.to_string()))?;
+
+                        ops.read_named_buf("ffn_x", &mut x).map_err(|e| CoreError::Backend(e.to_string()))?;
+                        ffn_done = true;
+                    }
+                }
             }
 
-            // SwiGLU MLP: w1=gate, w3=up, w2=down
-            self.linear_f16_out_in(
-                &mlp_in,
-                &format!("model.layers.{layer}.feed_forward.w1.weight"),
-                cfg.intermediate_size,
-                hidden,
-                &mut gate,
-            )?;
-            self.linear_f16_out_in(
-                &mlp_in,
-                &format!("model.layers.{layer}.feed_forward.w3.weight"),
-                cfg.intermediate_size,
-                hidden,
-                &mut up,
-            )?;
+            if !ffn_done {
+                // CPU fallback
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
+                if let Some(ops) = &self.metal_ops {
+                    let w = self.tensor_f16(&ffn_norm_name)?;
+                    ops.rms_norm_f16w(&x, w, cfg.rms_norm_eps, false, &ffn_norm_name, &mut mlp_in)
+                        .map_err(|e| CoreError::Backend(e.to_string()))?;
+                } else {
+                    self.rmsnorm_weight(&ffn_norm_name, &mut ffn_norm_w)?;
+                    rms_norm_f32(&x, &ffn_norm_w, cfg.rms_norm_eps, &mut mlp_in);
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+                {
+                    self.rmsnorm_weight(&ffn_norm_name, &mut ffn_norm_w)?;
+                    rms_norm_f32(&x, &ffn_norm_w, cfg.rms_norm_eps, &mut mlp_in);
+                }
 
-            // Swish activation: silu(gate) = gate * sigmoid(gate)
-            for g in gate.iter_mut() {
-                let s = 1.0 / (1.0 + (-*g).exp());
-                *g = *g * s;
-            }
-            for i in 0..gate.len() {
-                gate[i] *= up[i];
-            }
+                self.linear_f16_out_in(&mlp_in, &w1_name, cfg.intermediate_size, hidden, &mut gate)?;
+                self.linear_f16_out_in(&mlp_in, &w3_name, cfg.intermediate_size, hidden, &mut up)?;
 
-            self.linear_f16_out_in(
-                &gate,
-                &format!("model.layers.{layer}.feed_forward.w2.weight"),
-                hidden,
-                cfg.intermediate_size,
-                &mut down,
-            )?;
+                for g in gate.iter_mut() {
+                    let s = 1.0 / (1.0 + (-*g).exp());
+                    *g = *g * s;
+                }
+                for i in 0..gate.len() {
+                    gate[i] *= up[i];
+                }
 
-            // Residual connection
-            for i in 0..hidden {
-                x[i] += down[i];
+                self.linear_f16_out_in(&gate, &w2_name, hidden, cfg.intermediate_size, &mut down)?;
+
+                for i in 0..hidden {
+                    x[i] += down[i];
+                }
             }
         }
 
@@ -967,15 +1071,18 @@ impl LfmRunner {
 
         // matmul: out[i] = sum_j weight[i,j] * input[j]
         // w is already &[u16] from tensor_f16
-        for i in 0..out_dim {
-            let mut acc = 0.0f32;
-            let row_start = i * in_dim;
-            for j in 0..in_dim {
-                let w_f32 = f16::from_bits(w[row_start + j]).to_f32();
-                acc += w_f32 * input[j];
+        out.par_chunks_mut(64).enumerate().for_each(|(chunk_idx, chunk)| {
+            for (local_i, out_val) in chunk.iter_mut().enumerate() {
+                let i = chunk_idx * 64 + local_i;
+                let mut acc = 0.0f32;
+                let row_start = i * in_dim;
+                for j in 0..in_dim {
+                    let w_f32 = f16::from_bits(w[row_start + j]).to_f32();
+                    acc += w_f32 * input[j];
+                }
+                *out_val = acc;
             }
-            out[i] = acc;
-        }
+        });
 
         Ok(())
     }
@@ -990,18 +1097,7 @@ impl LfmRunner {
         in_dim: usize,
         out: &mut [f32],
     ) -> Result<(), CoreError> {
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        if let Some(ops) = &self.metal_ops {
-            let base_name = weight_name.trim_end_matches(".weight");
-            let w_u8 = self.file.tensor_bytes(weight_name)?;
-            let s_f16: &[u16] = bytemuck::cast_slice(self.file.tensor_bytes(&format!("{}.scales", base_name))?);
-            // LFM int4 weights use group_size=64
-            ops.logits_i4(input, w_u8, s_f16, out_dim, in_dim, 64, weight_name, out)
-                .map_err(|e| CoreError::Backend(e.to_string()))?;
-            return Ok(());
-        }
-
-        // Check cache first (CPU fallback path)
+        // Check cache first
         let cache_key = (weight_name.to_string(), out_dim, in_dim);
         
         if !self.weight_cache.contains_key(&cache_key) {

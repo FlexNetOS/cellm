@@ -1,4 +1,5 @@
 // Author: Jeffrey Asante (https://jeffasante.github.io/)
+use std::collections::HashMap;
 use std::path::Path;
 
 use bytemuck::cast_slice;
@@ -10,6 +11,18 @@ use cellm_kernels::{MetalKernels, MetalOps};
 use half::f16;
 
 use crate::{CellmFile, ModelConfig};
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[link(name = "Accelerate", kind = "framework")]
+extern "C" {
+    fn cblas_sgemm(
+        Order: i32, TransA: i32, TransB: i32,
+        M: i32, N: i32, K: i32,
+        alpha: f32, A: *const f32, lda: i32,
+        B: *const f32, ldb: i32,
+        beta: f32, C: *mut f32, ldc: i32,
+    );
+}
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use crate::llama_graph::LlamaGraphState;
 
@@ -28,6 +41,9 @@ pub struct LlamaRunner {
     rope_interleaved: bool,
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     graph_state: Option<LlamaGraphState>,
+    /// Cached dequantized f32 weights for cblas_sgemm on macOS/iOS
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    f32_weight_cache: HashMap<String, Vec<f32>>,
 }
 
 enum LlamaLinearBackend {
@@ -82,6 +98,8 @@ impl LlamaRunner {
                 .unwrap_or(false),
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             graph_state: None,
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            f32_weight_cache: HashMap::new(),
         })
     }
 
@@ -321,6 +339,13 @@ impl LlamaRunner {
         let mut x = x0.to_vec();
 
         // Per-layer scratch.
+        let debug_timing = std::env::var("CELLM_STEP_TIMING").is_ok();
+        let mut t_linear_ns = 0u64;
+        let mut t_attn_ns = 0u64;
+        let mut t_norm_ns = 0u64;
+        let mut t_rope_ns = 0u64;
+        let mut t_other_ns = 0u64;
+        let t_step_start = std::time::Instant::now();
         let mut attn_norm_w = vec![0.0f32; hidden];
         let mut x_norm = vec![0.0f32; hidden];
         let mut q = vec![0.0f32; hidden];
@@ -337,13 +362,41 @@ impl LlamaRunner {
 
         let mut gather_bases: Vec<usize> = Vec::new();
 
+        // Precompute all per-layer tensor names to avoid format!/resolve_name per step.
+        struct LayerNames {
+            attn_norm: String,
+            q_proj: String,
+            k_proj: String,
+            v_proj: String,
+            o_proj: String,
+            ffn_norm: String,
+            gate_proj: String,
+            up_proj: String,
+            down_proj: String,
+        }
+        let layer_names: Vec<LayerNames> = (0..self.max_layers).map(|l| {
+            LayerNames {
+                attn_norm: format!("model.layers.{l}.input_layernorm.weight"),
+                q_proj: format!("model.layers.{l}.self_attn.q_proj.weight"),
+                k_proj: format!("model.layers.{l}.self_attn.k_proj.weight"),
+                v_proj: format!("model.layers.{l}.self_attn.v_proj.weight"),
+                o_proj: format!("model.layers.{l}.self_attn.o_proj.weight"),
+                ffn_norm: format!("model.layers.{l}.post_attention_layernorm.weight"),
+                gate_proj: format!("model.layers.{l}.mlp.gate_proj.weight"),
+                up_proj: format!("model.layers.{l}.mlp.up_proj.weight"),
+                down_proj: format!("model.layers.{l}.mlp.down_proj.weight"),
+            }
+        }).collect();
+
         for layer in 0..self.max_layers {
             let use_metal_norm = self.metal_ops.is_some() && self.use_metal_norm;
             let use_metal_rope = self.metal_ops.is_some() && self.use_metal_rope && self.rope_interleaved;
 
             // Attention input norm.
+            let t0 = std::time::Instant::now();
+            let ln = &layer_names[layer];
             if use_metal_norm {
-                let w = self.tensor_f16(&format!("model.layers.{layer}.input_layernorm.weight"))?;
+                let w = self.tensor_f16(&ln.attn_norm)?;
                 let w_ptr = w.as_ptr();
                 let w_len = w.len();
                 let w = unsafe { std::slice::from_raw_parts(w_ptr, w_len) };
@@ -353,23 +406,22 @@ impl LlamaRunner {
                     .map_err(|e| CoreError::Backend(e.to_string()))?;
             } else {
                 self.rmsnorm_weight(
-                    &format!("model.layers.{layer}.input_layernorm.weight"),
+                    &ln.attn_norm,
                     &mut attn_norm_w,
                 )?;
                 rms_norm_f32(&x, &attn_norm_w, cfg.rms_norm_eps, &mut x_norm);
             }
+            t_norm_ns += t0.elapsed().as_nanos() as u64;
 
             // QKV projections (HF weights are [out, in]).
-            let q_name = format!("model.layers.{layer}.self_attn.q_proj.weight");
-            let k_name = format!("model.layers.{layer}.self_attn.k_proj.weight");
-            let v_name = format!("model.layers.{layer}.self_attn.v_proj.weight");
+            let t0 = std::time::Instant::now();
             let fused_qkv = self.linear_qkv_f16_out_in(
                 &x_norm,
-                &q_name,
+                &ln.q_proj,
                 hidden,
-                &k_name,
+                &ln.k_proj,
                 kv_dim,
-                &v_name,
+                &ln.v_proj,
                 kv_dim,
                 hidden,
                 &mut q,
@@ -377,11 +429,13 @@ impl LlamaRunner {
                 &mut v,
             )?;
             if !fused_qkv {
-                self.linear_f16_out_in(&x_norm, &q_name, hidden, hidden, &mut q)?;
-                self.linear_f16_out_in(&x_norm, &k_name, kv_dim, hidden, &mut k)?;
-                self.linear_f16_out_in(&x_norm, &v_name, kv_dim, hidden, &mut v)?;
+                self.linear_f16_out_in(&x_norm, &ln.q_proj, hidden, hidden, &mut q)?;
+                self.linear_f16_out_in(&x_norm, &ln.k_proj, kv_dim, hidden, &mut k)?;
+                self.linear_f16_out_in(&x_norm, &ln.v_proj, kv_dim, hidden, &mut v)?;
             }
+            t_linear_ns += t0.elapsed().as_nanos() as u64;
 
+            let t0 = std::time::Instant::now();
             if use_metal_rope {
                 let ops = self.metal_ops.as_ref().unwrap();
                 ops.rope_adj_f32(&mut q, n_heads, head_dim, pos, cfg.rope_theta)
@@ -395,6 +449,7 @@ impl LlamaRunner {
                 rope_non_interleaved_inplace_f32(&mut q, n_heads, head_dim, head_dim, pos, cfg.rope_theta);
                 rope_non_interleaved_inplace_f32(&mut k, n_kv_heads, head_dim, head_dim, pos, cfg.rope_theta);
             }
+            t_rope_ns += t0.elapsed().as_nanos() as u64;
 
             // Write new token K/V into paged cache.
             {
@@ -403,6 +458,7 @@ impl LlamaRunner {
             }
 
             // Gather historical K/V and run attention for this token.
+            let t0 = std::time::Instant::now();
             let seq = page_table.token_count();
             let cr = kv_cache.view();
             gather_bases.clear();
@@ -426,73 +482,163 @@ impl LlamaRunner {
                 None, // soft_cap
                 &mut attn_out,
             )?;
+            t_attn_ns += t0.elapsed().as_nanos() as u64;
 
             // o_proj: hidden <- hidden
+            let t0 = std::time::Instant::now();
             self.linear_f16_out_in(
                 &attn_out,
-                &format!("model.layers.{layer}.self_attn.o_proj.weight"),
+                &ln.o_proj,
                 hidden,
                 hidden,
                 &mut attn_proj,
             )?;
+            t_linear_ns += t0.elapsed().as_nanos() as u64;
 
             for i in 0..hidden {
                 x[i] += attn_proj[i];
             }
 
-            // Post-attn norm.
-            if use_metal_norm {
-                let w = self.tensor_f16(&format!("model.layers.{layer}.post_attention_layernorm.weight"))?;
-                let w_ptr = w.as_ptr();
-                let w_len = w.len();
-                let w = unsafe { std::slice::from_raw_parts(w_ptr, w_len) };
-                let ck = format!("llama.layer.{layer}.mlp_norm");
-                self.metal_ops.as_ref().unwrap()
-                    .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, false, &ck, &mut mlp_in)
-                    .map_err(|e| CoreError::Backend(e.to_string()))?;
-            } else {
-                self.rmsnorm_weight(
-                    &format!("model.layers.{layer}.post_attention_layernorm.weight"),
-                    &mut post_norm_w,
-                )?;
-                rms_norm_f32(&x, &post_norm_w, cfg.rms_norm_eps, &mut mlp_in);
+            let ffn_norm_name = &ln.ffn_norm;
+            let gate_name = &ln.gate_proj;
+            let up_name = &ln.up_proj;
+            let down_name = &ln.down_proj;
+
+            let mut ffn_done = false;
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            {
+                let has_metal = self.metal_ops.is_some();
+                if has_metal {
+                    // Check if all weights are f16
+                    let mut all_f16 = false;
+                    let gate_res = self.resolve_name(gate_name);
+                    if let Ok(res_name) = gate_res {
+                        if let Some(meta) = self.tensor_meta_by_exact_name(&res_name) {
+                            if meta.dtype == "f16" {
+                                all_f16 = true;
+                            }
+                        }
+                    }
+
+                    if all_f16 {
+                        let inter = cfg.intermediate_size;
+                        let eps = cfg.rms_norm_eps;
+
+                        let norm_w_data: Vec<u16>;
+                        let w1b_data: Vec<u16>;
+                        let w3b_data: Vec<u16>;
+                        let w2b_data: Vec<u16>;
+
+                        if let (Ok(nw), Ok(w1), Ok(w3), Ok(w2)) = (
+                            self.tensor_f16(&ffn_norm_name),
+                            self.tensor_f16(&gate_name),
+                            self.tensor_f16(&up_name),
+                            self.tensor_f16(&down_name),
+                        ) {
+                            norm_w_data = nw.to_vec();
+                            w1b_data = w1.to_vec();
+                            w3b_data = w3.to_vec();
+                            w2b_data = w2.to_vec();
+
+                            let ops = self.metal_ops.as_ref().unwrap();
+
+                            if ops.ensure_named_buf("ffn_x", hidden).is_ok()
+                                && ops.ensure_named_buf("ffn_norm_out", hidden).is_ok()
+                                && ops.ensure_named_buf("ffn_gate", inter).is_ok()
+                                && ops.ensure_named_buf("ffn_up", inter).is_ok()
+                                && ops.ensure_named_buf("ffn_down", hidden).is_ok()
+                            {
+                                if let (Ok(norm_wb), Ok(w1b), Ok(w3b), Ok(w2b)) = (
+                                    ops.ensure_tensor_cached(&ffn_norm_name, &norm_w_data),
+                                    ops.ensure_tensor_cached(&gate_name, &w1b_data),
+                                    ops.ensure_tensor_cached(&up_name, &w3b_data),
+                                    ops.ensure_tensor_cached(&down_name, &w2b_data),
+                                ) {
+                                    if ops.write_named_buf("ffn_x", &x).is_ok() {
+                                        if let (Ok(xb), Ok(nb), Ok(gb), Ok(ub), Ok(db)) = (
+                                            ops.get_named_buf("ffn_x"),
+                                            ops.get_named_buf("ffn_norm_out"),
+                                            ops.get_named_buf("ffn_gate"),
+                                            ops.get_named_buf("ffn_up"),
+                                            ops.get_named_buf("ffn_down"),
+                                        ) {
+                                            let batch_res = ops.run_batch(|enc| {
+                                                ops.encode_rms_norm_f16w(enc, &xb, &norm_wb, &nb, hidden, eps, false);
+                                                ops.encode_mv_f16_bias(enc, &w1b, &nb, None, &gb, inter, hidden);
+                                                ops.encode_mv_f16_bias(enc, &w3b, &nb, None, &ub, inter, hidden);
+                                                ops.encode_silu_mul_f32_inplace(enc, &gb, &ub, inter);
+                                                ops.encode_mv_f16_bias(enc, &w2b, &gb, None, &db, hidden, inter);
+                                                ops.encode_add_f32_inplace(enc, &xb, &db, hidden);
+                                                Ok(())
+                                            });
+
+                                            if batch_res.is_ok() {
+                                                if ops.read_named_buf("ffn_x", &mut x).is_ok() {
+                                                    ffn_done = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
-            // MLP: gate_proj + up_proj -> silu(gate)*up -> down_proj
-            self.linear_f16_out_in(
-                &mlp_in,
-                &format!("model.layers.{layer}.mlp.gate_proj.weight"),
-                cfg.intermediate_size,
-                hidden,
-                &mut gate,
-            )?;
-            self.linear_f16_out_in(
-                &mlp_in,
-                &format!("model.layers.{layer}.mlp.up_proj.weight"),
-                cfg.intermediate_size,
-                hidden,
-                &mut up,
-            )?;
+            if !ffn_done {
+                // CPU fallback or non-f16 path
+                // Post-attn norm.
+                let t0 = std::time::Instant::now();
+                if use_metal_norm {
+                    let w = self.tensor_f16(&ffn_norm_name)?;
+                    let w_ptr = w.as_ptr();
+                    let w_len = w.len();
+                    let w = unsafe { std::slice::from_raw_parts(w_ptr, w_len) };
+                    let ck = format!("llama.layer.{layer}.mlp_norm");
+                    self.metal_ops.as_ref().unwrap()
+                        .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, false, &ck, &mut mlp_in)
+                        .map_err(|e| CoreError::Backend(e.to_string()))?;
+                } else {
+                    self.rmsnorm_weight(&ffn_norm_name, &mut post_norm_w)?;
+                    rms_norm_f32(&x, &post_norm_w, cfg.rms_norm_eps, &mut mlp_in);
+                }
+                t_norm_ns += t0.elapsed().as_nanos() as u64;
 
-            // silu(gate) in-place: x * sigmoid(x)
-            for g in gate.iter_mut() {
-                let s = 1.0 / (1.0 + (-*g).exp());
-                *g = *g * s;
-            }
-            for i in 0..gate.len() {
-                gate[i] *= up[i];
-            }
+                // MLP: gate_proj + up_proj -> silu(gate)*up -> down_proj
+                let t0 = std::time::Instant::now();
+                self.linear_f16_out_in(&mlp_in, &gate_name, cfg.intermediate_size, hidden, &mut gate)?;
+                self.linear_f16_out_in(&mlp_in, &up_name, cfg.intermediate_size, hidden, &mut up)?;
 
-            self.linear_f16_out_in(
-                &gate,
-                &format!("model.layers.{layer}.mlp.down_proj.weight"),
-                hidden,
-                cfg.intermediate_size,
-                &mut down,
-            )?;
-            for i in 0..hidden {
-                x[i] += down[i];
+                // silu(gate) in-place: x * sigmoid(x)
+                for g in gate.iter_mut() {
+                    let s = 1.0 / (1.0 + (-*g).exp());
+                    *g = *g * s;
+                }
+                for i in 0..gate.len() {
+                    gate[i] *= up[i];
+                }
+
+                self.linear_f16_out_in(&gate, &down_name, hidden, cfg.intermediate_size, &mut down)?;
+                t_linear_ns += t0.elapsed().as_nanos() as u64;
+                for i in 0..hidden {
+                    x[i] += down[i];
+                }
             }
+        }
+
+        if debug_timing {
+            let total = t_step_start.elapsed().as_nanos() as u64;
+            eprintln!(
+                "STEP_TIMING pos={} linear={:.2}ms attn={:.2}ms norm={:.2}ms rope={:.2}ms other={:.2}ms total={:.2}ms",
+                pos,
+                t_linear_ns as f64 / 1e6,
+                t_attn_ns as f64 / 1e6,
+                t_norm_ns as f64 / 1e6,
+                t_rope_ns as f64 / 1e6,
+                (total.saturating_sub(t_linear_ns + t_attn_ns + t_norm_ns + t_rope_ns)) as f64 / 1e6,
+                total as f64 / 1e6,
+            );
         }
 
         // Final norm.
@@ -904,6 +1050,43 @@ impl LlamaRunner {
                         out_dim * in_dim
                     )));
                 }
+                // On macOS/iOS, use cblas_sgemm with cached f32 weights for optimal throughput
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
+                {
+                    let cache_key = resolved.clone();
+                    if !self.f32_weight_cache.contains_key(&cache_key) {
+                        let mut w_f32 = vec![0.0f32; out_dim * in_dim];
+                        for i in 0..w.len() {
+                            w_f32[i] = f16::from_bits(w[i]).to_f32();
+                        }
+                        self.f32_weight_cache.insert(cache_key.clone(), w_f32);
+                    }
+                    let w_f32 = self.f32_weight_cache.get(&cache_key).unwrap();
+                    // out = x (1 x in_dim) * W^T (in_dim x out_dim)
+                    // cblas_sgemm: C = alpha * A * B + beta * C
+                    // A = x [1 x in_dim], B = W^T [in_dim x out_dim] (= W [out_dim x in_dim] transposed)
+                    // We use CblasTrans on B: B is stored row-major as [out_dim, in_dim]
+                    unsafe {
+                        cblas_sgemm(
+                            101, // CblasRowMajor
+                            111, // CblasNoTrans  (A = x, 1 x K)
+                            112, // CblasTrans    (B = W, N x K -> K x N after transpose)
+                            1,                    // M = 1 (single token)
+                            out_dim as i32,       // N = out_dim
+                            in_dim as i32,        // K = in_dim
+                            1.0,                  // alpha
+                            x.as_ptr(),           // A
+                            in_dim as i32,        // lda
+                            w_f32.as_ptr(),       // B (stored as [out_dim, in_dim])
+                            in_dim as i32,        // ldb
+                            0.0,                  // beta
+                            out.as_mut_ptr(),     // C
+                            out_dim as i32,       // ldc
+                        );
+                    }
+                    // skip the non-macOS fallback
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "ios")))]
                 cellm_kernels::cpu_kernels::matmul_f16_f32(w, out_dim, in_dim, x, out);
             }
             "i8" => {

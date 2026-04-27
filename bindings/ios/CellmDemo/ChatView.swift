@@ -58,7 +58,6 @@ struct ChatView: View {
     @State private var isRunning = false
     @State private var errorText: String?
     @State private var infoText: String = ""
-    @State private var showClearConfirmation = false
     @State private var selectedSampleLabel: String = ""
     @State private var runDiagnostics: String = ""
     @State private var showSettings = false
@@ -71,6 +70,9 @@ struct ChatView: View {
     @State private var generationTask: Task<Void, Never>?
     @State private var initTask: Task<Void, Never>?
 
+    // Persistent engine + tokenizer to avoid reloading model weights on every message.
+    @State private var cachedEngine: CellmEngine?
+    @State private var cachedTokenizer: CellmTokenizer?
     @State private var cachedEngineModelURL: URL?
     @State private var cachedEngineBackend: CellmBackend?
 
@@ -128,16 +130,10 @@ struct ChatView: View {
         }
         .onChange(of: llmModelURL) { _ in 
             persistSharedSelection()
-            generationTask?.cancel()
-            generationTask = nil
-            isRunning = false
             invalidateCachedEngine()
             initializeEngine()
         }
         .onChange(of: selectedBackend) { _ in
-            generationTask?.cancel()
-            generationTask = nil
-            isRunning = false
             invalidateCachedEngine()
         }
         .onChange(of: llmTokenizerURL) { _ in persistSharedSelection() }
@@ -155,7 +151,15 @@ struct ChatView: View {
         }
     }
 
-
+    private var diagnosticsBar: some View {
+        Text(runDiagnostics)
+            .font(.footnote)
+            .foregroundStyle(.secondary)
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 12)
+            .padding(.bottom, 10)
+    }
 
     private var premiumHeader: some View {
         VStack(spacing: 12) {
@@ -197,20 +201,7 @@ struct ChatView: View {
                         )
                     }
                     Button {
-                        showClearConfirmation = true
-                    } label: {
-                        Image(systemName: "trash")
-                            .font(.title3)
-                            .foregroundStyle(.secondary)
-                    }
-                    .confirmationDialog("Clear Chat?", isPresented: $showClearConfirmation, titleVisibility: .visible) {
-                        Button("Clear All Messages", role: .destructive) {
-                            clearChat()
-                        }
-                    }
-                    
-                    Button {
-                        clearChat()
+                        // New Chat action
                     } label: {
                         Image(systemName: "plus.circle")
                             .font(.title3)
@@ -359,15 +350,9 @@ struct ChatView: View {
             
             // Input Area
             HStack(alignment: .bottom, spacing: 12) {
-                Menu {
-                    PhotosPicker(selection: $selectedImageItem, matching: .images) {
-                        Label("Photo Library", systemImage: "photo")
-                    }
-                    Button {
-                        pickerTarget = .audioFile
-                    } label: {
-                        Label("Audio File", systemImage: "waveform")
-                    }
+                Button {
+                    // Logic for adding attachments
+                    pickerTarget = .audioFile
                 } label: {
                     Image(systemName: "plus")
                         .font(.title3.bold())
@@ -375,7 +360,6 @@ struct ChatView: View {
                         .background(Color(.secondarySystemGroupedBackground))
                         .foregroundStyle(.primary)
                         .clipShape(Circle())
-                        .shadow(color: Color.black.opacity(0.05), radius: 2, x: 0, y: 1)
                 }
                 
                 ZStack(alignment: .leading) {
@@ -395,14 +379,11 @@ struct ChatView: View {
                         .focused($isComposerFocused)
                 }
                 .background(Color(.secondarySystemGroupedBackground))
-                .clipShape(RoundedRectangle(cornerRadius: 22))
-                .overlay(RoundedRectangle(cornerRadius: 22).stroke(isComposerFocused ? Color.accentColor.opacity(0.5) : Color(.separator).opacity(0.35), lineWidth: 1.5))
-                .shadow(color: Color.black.opacity(0.03), radius: 3, x: 0, y: 2)
+                .clipShape(RoundedRectangle(cornerRadius: 24))
+                .overlay(RoundedRectangle(cornerRadius: 24).stroke(Color(.separator).opacity(0.35), lineWidth: 1))
                 
                 Button {
-                    withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
-                        sendMessage()
-                    }
+                    sendMessage()
                 } label: {
                     Image(systemName: "paperplane.fill")
                         .font(.title3)
@@ -410,7 +391,6 @@ struct ChatView: View {
                         .background(inputText.isEmpty || isRunning ? Color(.secondarySystemGroupedBackground) : Color.accentColor)
                         .foregroundStyle(inputText.isEmpty || isRunning ? Color.secondary : Color.white)
                         .clipShape(Circle())
-                        .scaleEffect(inputText.isEmpty || isRunning ? 0.9 : 1.0)
                 }
                 .disabled(inputText.isEmpty || isRunning)
             }
@@ -440,7 +420,80 @@ struct ChatView: View {
         }
     }
 
+    private var composer: some View {
+        VStack(spacing: 10) {
+            if let imagePreview = pendingImage {
+                HStack(spacing: 10) {
+                    imagePreview
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 84, height: 84)
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                    Text("Image attached")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Remove") {
+                        pendingImage = nil
+                        pendingImageData = nil
+                        selectedImageItem = nil
+                    }
+                    .buttonStyle(.bordered)
+                }
+                .padding(10)
+                .background(Color(.secondarySystemGroupedBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+            }
+            if let audioURL = pendingAudioURL {
+                HStack(spacing: 10) {
+                    Image(systemName: "waveform")
+                        .foregroundStyle(.blue)
+                    Text("Audio attached: \(audioURL.lastPathComponent)")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Remove") {
+                        pendingAudioURL = nil
+                    }
+                    .buttonStyle(.bordered)
+                }
+                .padding(10)
+                .background(Color(.secondarySystemGroupedBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+            }
 
+            HStack(alignment: .bottom, spacing: 8) {
+                PhotosPicker(selection: $selectedImageItem, matching: .images) {
+                    Image(systemName: "photo")
+                        .font(.title3)
+                        .padding(10)
+                        .background(Color(.secondarySystemGroupedBackground))
+                        .clipShape(Circle())
+                }
+                Button {
+                    pickerTarget = .audioFile
+                } label: {
+                    Image(systemName: "waveform")
+                        .font(.title3)
+                        .padding(10)
+                        .background(Color(.secondarySystemGroupedBackground))
+                        .clipShape(Circle())
+                }
+                .buttonStyle(.plain)
+                TextField("Message", text: $inputText, axis: .vertical)
+                    .textFieldStyle(.roundedBorder)
+                    .lineLimit(1...5)
+                    .focused($isComposerFocused)
+                Button(isRunning ? "..." : "Send") {
+                    sendMessage()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(isRunning || inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(12)
+        .background(Color(.systemBackground))
+    }
 
     private func messageBubble(_ msg: ChatMessage) -> some View {
         VStack(alignment: msg.role == "User" ? .trailing : .leading, spacing: 6) {
@@ -521,8 +574,17 @@ struct ChatView: View {
                     throw CellmError.message("Pick LLM model + tokenizer for chat.")
                 }
 
-                let cacheKey = "\(llmModelURL.path)|\(backend.rawValue)"
-                let (eng, tok) = try await GlobalEngineCache.shared.getOrCreateLLM(key: cacheKey) {
+                // Reuse cached engine if model and backend haven't changed.
+                let eng: CellmEngine
+                let engineWasCached: Bool
+                if let cached = await MainActor.run(body: { cachedEngine }),
+                   await MainActor.run(body: { cachedEngineModelURL }) == llmModelURL,
+                   await MainActor.run(body: { cachedEngineBackend }) == backend {
+                    eng = cached
+                    engineWasCached = true
+                    try eng.resetSession()
+                    diag.append("engine=cached (reused)")
+                } else {
                     await MainActor.run { isInitializing = true }
                     let tok = try CellmTokenizer(tokenizerURL: llmTokenizerURL)
                     let capturedTemp = await MainActor.run { temperature }
@@ -536,29 +598,17 @@ struct ChatView: View {
                         repeatWindow: 96,
                         backend: backend
                     )
+                    eng = newEng
+                    engineWasCached = false
                     await MainActor.run {
+                        cachedEngine = newEng
+                        cachedTokenizer = tok
                         cachedEngineModelURL = llmModelURL
                         cachedEngineBackend = backend
                         isInitializing = false
                     }
-                    return (newEng, tok)
-                }
-
-                let currentCachedURL = await MainActor.run { cachedEngineModelURL }
-                let currentCachedBackend = await MainActor.run { cachedEngineBackend }
-                let engineWasCached: Bool
-                if currentCachedURL == llmModelURL && currentCachedBackend == backend {
-                    engineWasCached = true
-                    try eng.resetSession()
-                    diag.append("engine=cached (reused)")
-                } else {
-                    engineWasCached = false
                     let initMs = Date().timeIntervalSince(initStart) * 1000.0
                     diag.append(String(format: "engine=fresh init=%.1fms", initMs))
-                    await MainActor.run {
-                        cachedEngineModelURL = llmModelURL
-                        cachedEngineBackend = backend
-                    }
                 }
                 let capturedMaxToks = await MainActor.run { maxNewTokens }
                 diag.append("requested_backend=\(backend.label.lowercased()) active_backend=\(eng.activeBackend) cached=\(engineWasCached)")
@@ -929,7 +979,8 @@ struct ChatView: View {
         guard let modelURL = llmModelURL, let tokURL = llmTokenizerURL else { return }
 
         // Skip if we already have a cached engine for this model + backend.
-        if cachedEngineModelURL == modelURL,
+        if cachedEngine != nil,
+           cachedEngineModelURL == modelURL,
            cachedEngineBackend == selectedBackend {
             return
         }
@@ -939,17 +990,15 @@ struct ChatView: View {
             await MainActor.run { isInitializing = true }
             do {
                 let backend = await MainActor.run { scenePhase == .active ? selectedBackend : .cpu }
-                let cacheKey = "\(modelURL.path)|\(backend.rawValue)"
-                _ = try await GlobalEngineCache.shared.getOrCreateLLM(key: cacheKey) {
-                    let tok = try CellmTokenizer(tokenizerURL: tokURL)
-                    let eng = try CellmEngine(
-                        modelURL: modelURL,
-                        tokenizer: tok,
-                        backend: backend
-                    )
-                    return (eng, tok)
-                }
+                let tok = try CellmTokenizer(tokenizerURL: tokURL)
+                let eng = try CellmEngine(
+                    modelURL: modelURL,
+                    tokenizer: tok,
+                    backend: backend
+                )
                 await MainActor.run {
+                    cachedEngine = eng
+                    cachedTokenizer = tok
                     cachedEngineModelURL = modelURL
                     cachedEngineBackend = backend
                     errorText = nil
@@ -967,21 +1016,10 @@ struct ChatView: View {
     }
 
     private func invalidateCachedEngine() {
-        Task {
-            await GlobalEngineCache.shared.clear()
-        }
+        cachedEngine = nil
+        cachedTokenizer = nil
         cachedEngineModelURL = nil
         cachedEngineBackend = nil
-    }
-
-    private func clearChat() {
-        withAnimation {
-            messages.removeAll()
-            pendingImage = nil
-            pendingImageData = nil
-            pendingAudioURL = nil
-            inputText = ""
-        }
     }
 }
 

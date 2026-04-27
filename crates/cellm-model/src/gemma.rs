@@ -810,54 +810,127 @@ impl GemmaRunner {
                 for i in 0..hidden { x[i] = x_norm[i] + x_residual[i]; }
             }
 
-            // ── Pre-FFN norm ───────
-            if use_metal_norm {
-                let w = self.tensor_f16(
-                    &format!("model.layers.{layer}.pre_feedforward_layernorm.weight"))?.to_vec();
-                let add_one = self.rmsnorm_weight_is_offset;
-                let ck = format!("gemma.layer.{layer}.attn_norm");
-                self.metal_ops.as_ref().unwrap()
-                    .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, add_one, &ck, &mut mlp_in)
-                    .map_err(|e| CoreError::Backend(e.to_string()))?;
-            } else {
-                self.rmsnorm_weight(
-                    &format!("model.layers.{layer}.pre_feedforward_layernorm.weight"),
-                    &mut pre_ffn_norm_w,
-                )?;
-                rms_norm_f32(&x, &pre_ffn_norm_w, cfg.rms_norm_eps, &mut mlp_in);
+            let ffn_norm_name = format!("model.layers.{layer}.pre_feedforward_layernorm.weight");
+            let gate_name = format!("model.layers.{layer}.mlp.gate_proj.weight");
+            let up_name = format!("model.layers.{layer}.mlp.up_proj.weight");
+            let down_name = format!("model.layers.{layer}.mlp.down_proj.weight");
+            let add_one = self.rmsnorm_weight_is_offset;
+
+            let mut ffn_done = false;
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            {
+                let has_metal = self.metal_ops.is_some();
+                if has_metal {
+                    // Check if all weights are f16
+                    let mut all_f16 = false;
+                    let gate_res = self.resolve_name(&gate_name);
+                    if let Ok(res_name) = gate_res {
+                        if let Some(meta) = self.tensor_meta_by_exact_name(&res_name) {
+                            if meta.dtype == "f16" {
+                                all_f16 = true;
+                            }
+                        }
+                    }
+
+                    if all_f16 {
+                        let inter = ffn_dim;
+                        let eps = cfg.rms_norm_eps;
+
+                        let norm_w_data: Vec<u16>;
+                        let w1b_data: Vec<u16>;
+                        let w3b_data: Vec<u16>;
+                        let w2b_data: Vec<u16>;
+
+                        if let (Ok(nw), Ok(w1), Ok(w3), Ok(w2)) = (
+                            self.tensor_f16(&ffn_norm_name),
+                            self.tensor_f16(&gate_name),
+                            self.tensor_f16(&up_name),
+                            self.tensor_f16(&down_name),
+                        ) {
+                            norm_w_data = nw.to_vec();
+                            w1b_data = w1.to_vec();
+                            w3b_data = w3.to_vec();
+                            w2b_data = w2.to_vec();
+
+                            let ops = self.metal_ops.as_ref().unwrap();
+
+                            if ops.ensure_named_buf("ffn_x", hidden).is_ok()
+                                && ops.ensure_named_buf("ffn_norm_out", hidden).is_ok()
+                                && ops.ensure_named_buf("ffn_gate", inter).is_ok()
+                                && ops.ensure_named_buf("ffn_up", inter).is_ok()
+                                && ops.ensure_named_buf("ffn_down", hidden).is_ok()
+                            {
+                                if let (Ok(norm_wb), Ok(w1b), Ok(w3b), Ok(w2b)) = (
+                                    ops.ensure_tensor_cached(&ffn_norm_name, &norm_w_data),
+                                    ops.ensure_tensor_cached(&gate_name, &w1b_data),
+                                    ops.ensure_tensor_cached(&up_name, &w3b_data),
+                                    ops.ensure_tensor_cached(&down_name, &w2b_data),
+                                ) {
+                                    if ops.write_named_buf("ffn_x", &x).is_ok() {
+                                        if let (Ok(xb), Ok(nb), Ok(gb), Ok(ub), Ok(db)) = (
+                                            ops.get_named_buf("ffn_x"),
+                                            ops.get_named_buf("ffn_norm_out"),
+                                            ops.get_named_buf("ffn_gate"),
+                                            ops.get_named_buf("ffn_up"),
+                                            ops.get_named_buf("ffn_down"),
+                                        ) {
+                                            let batch_res = ops.run_batch(|enc| {
+                                                ops.encode_rms_norm_f16w(enc, &xb, &norm_wb, &nb, hidden, eps, add_one);
+                                                ops.encode_mv_f16_bias(enc, &w1b, &nb, None, &gb, inter, hidden);
+                                                ops.encode_mv_f16_bias(enc, &w3b, &nb, None, &ub, inter, hidden);
+                                                ops.encode_gelu_tanh_mul_f32_inplace(enc, &gb, &ub, inter);
+                                                ops.encode_mv_f16_bias(enc, &w2b, &gb, None, &db, hidden, inter);
+                                                
+                                                // Gemma does a post-FFN norm before the residual add
+                                                // So we can't just do `encode_add_f32_inplace(enc, &xb, &db, hidden)`
+                                                // We must read out `db` (down), then run the rest of the layer on CPU.
+                                                // Let's just break the batch here to simplify, we still save round trips.
+                                                Ok(())
+                                            });
+
+                                            if batch_res.is_ok() {
+                                                // We only read back 'down' because Gemma needs to do post-FFN norm on it,
+                                                // and THEN add it to x.
+                                                if ops.read_named_buf("ffn_down", &mut down).is_ok() {
+                                                    ffn_done = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
-            self.linear_f16_out_in(
-                &mlp_in,
-                &format!("model.layers.{layer}.mlp.gate_proj.weight"),
-                ffn_dim,
-                hidden,
-                gate_slice,
-            )?;
-            self.linear_f16_out_in(
-                &mlp_in,
-                &format!("model.layers.{layer}.mlp.up_proj.weight"),
-                ffn_dim,
-                hidden,
-                up_slice,
-            )?;
-            for i in 0..ffn_dim {
-                ffn_out_slice[i] = gelu_tanh_f32(gate_slice[i]) * up_slice[i];
-            }
-            self.linear_f16_out_in(
-                ffn_out_slice,
-                &format!("model.layers.{layer}.mlp.down_proj.weight"),
-                hidden,
-                ffn_dim,
-                &mut down,
-            )?;
             let x_residual = x.clone();
+
+            if !ffn_done {
+                // ── Pre-FFN norm ───────
+                if use_metal_norm {
+                    let w = self.tensor_f16(&ffn_norm_name)?.to_vec();
+                    let ck = format!("gemma.layer.{layer}.attn_norm");
+                    self.metal_ops.as_ref().unwrap()
+                        .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, add_one, &ck, &mut mlp_in)
+                        .map_err(|e| CoreError::Backend(e.to_string()))?;
+                } else {
+                    self.rmsnorm_weight(&ffn_norm_name, &mut pre_ffn_norm_w)?;
+                    rms_norm_f32(&x, &pre_ffn_norm_w, cfg.rms_norm_eps, &mut mlp_in);
+                }
+
+                self.linear_f16_out_in(&mlp_in, &gate_name, ffn_dim, hidden, gate_slice)?;
+                self.linear_f16_out_in(&mlp_in, &up_name, ffn_dim, hidden, up_slice)?;
+                for i in 0..ffn_dim {
+                    ffn_out_slice[i] = gelu_tanh_f32(gate_slice[i]) * up_slice[i];
+                }
+                self.linear_f16_out_in(ffn_out_slice, &down_name, hidden, ffn_dim, &mut down)?;
+            }
 
             // ── Post-FFN norm on MLP branch, then residual add ──────
             if use_metal_norm {
                 let wffn = self.tensor_f16(
                     &format!("model.layers.{layer}.post_feedforward_layernorm.weight"))?.to_vec();
-                let add_one = self.rmsnorm_weight_is_offset;
                 let mut x_out = vec![0.0f32; hidden];
                 let ck = format!("gemma.layer.{layer}.ffn_norm");
                 self.metal_ops.as_ref().unwrap()

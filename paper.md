@@ -180,10 +180,10 @@ cargo run --release --bin convert -- \
 
 
 Model	Status
-Qwen3-0.6B.cellm (f16)	✅ Works
-Qwen3-0.6B-new.cellm (f16)	✅ Works
-Qwen3-0.6B-fixed-int4.cellm (int4)	✅ Now works!
-Qwen3-0.6B-int4.cellm (old int4)	❌ Garbage (pre-fix)
+Qwen3-0.6B.cellm (f16)	Works
+Qwen3-0.6B-new.cellm (f16)	Works
+Qwen3-0.6B-fixed-int4.cellm (int4)	Now works!
+Qwen3-0.6B-int4.cellm (old int4)	Garbage (pre-fix)
 
 
 ---
@@ -448,7 +448,7 @@ CELLM_AUDIO_DEBUG=1 ./target/release/audio-direct \
   --model models/granite-4.0-350m-f16-v2.cellm \
   --tokenizer models/hf/granite-4.0-350m/tokenizer.json \
   --prompt "Write a short poem about space." \
-  --backend metal
+  --backend metal --gen 100
 
 # Sanity check
 ./target/release/infer \
@@ -492,15 +492,19 @@ cargo run --release --bin convert -- \
   --tokens 64
 
 # Output: "A black and white owl is staring at the camera."
-# Timings: patch=642ms, encoder=166s, decode=22s, total=190s
-```
+# Timings: patch=32.6ms, encoder=4.78s, decode=17.80s, total=23.2s
 
+# Metal — image description
 ./target/release/vlm-direct \
   --model models/to-huggingface/smolvlm-256m-instruct-f16-full/smolvlm-256m-instruct-f16-full.cellm \
   --image models/test_images/bird.jpg \
   --prompt "What do you see?" \
-    --backend metal
+  --tokens 64 \
+  --backend metal
 
+# Output: "A black and white owl is staring at the camera."
+# Timings: patch=58.2ms, encoder=9.78s, decode=6.75s, total=17.35s
+```
 
 ```bash
 
