@@ -3,11 +3,25 @@ import SwiftUI
 struct GenerationSettingsSheet: View {
     @Binding var temperature: Double
     @Binding var maxNewTokens: Int
+    @Binding var selectedBackend: CellmBackend
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         NavigationStack {
             Form {
+                Section {
+                    Picker("Backend", selection: $selectedBackend) {
+                        ForEach(CellmBackend.allCases) { b in
+                            Text(b.label).tag(b)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                } header: {
+                    Text("Inference Backend")
+                } footer: {
+                    Text("Metal uses the GPU for faster inference. CPU is a fallback.")
+                }
+
                 Section {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
@@ -46,7 +60,7 @@ struct GenerationSettingsSheet: View {
                             step: 10
                         )
                         .tint(.blue)
-                        Text("Maximum number of tokens the model will generate per response.")
+                        Text("Maximum tokens the model will generate per response.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -60,6 +74,7 @@ struct GenerationSettingsSheet: View {
                         withAnimation {
                             temperature = 0.2
                             maxNewTokens = 200
+                            selectedBackend = .metal
                         }
                     }
                     .foregroundStyle(.red)
@@ -79,15 +94,20 @@ struct GenerationSettingsSheet: View {
 
     private var temperatureHint: String {
         switch temperature {
-        case 0..<0.05:  return "Greedy (deterministic, most accurate)"
-        case 0.05..<0.4: return "Focused (low creativity, factual)"
-        case 0.4..<0.8: return "Balanced (default)"
-        case 0.8..<1.2: return "Creative (more variety)"
-        default:        return "Very creative (may produce unexpected output)"
+        case 0..<0.05:   return "Greedy — deterministic, most accurate"
+        case 0.05..<0.4: return "Focused — low creativity, factual"
+        case 0.4..<0.8:  return "Balanced (default)"
+        case 0.8..<1.2:  return "Creative — more variety"
+        default:         return "Very creative — may produce unexpected output"
         }
     }
 }
 
 #Preview {
-    GenerationSettingsSheet(temperature: .constant(0.2), maxNewTokens: .constant(200))
+    GenerationSettingsSheet(
+        temperature: .constant(0.2),
+        maxNewTokens: .constant(200),
+        selectedBackend: .constant(.metal)
+    )
 }
+

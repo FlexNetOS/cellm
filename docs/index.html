@@ -480,6 +480,9 @@
             </div>
             <p class="description">A high-performance inference engine for small language models and vision-language models on the edge.</p>
             <p class="description" style="margin-top: 16px; font-weight: 300; color: var(--text-secondary); max-width: 650px;">Mobile-native LLM serving engine research in Rust. Paged KV cache, multi-session scheduling, and Metal/Vulkan kernels for on-device inference under 512MB RAM.</p>
+            <p class="description" style="margin-top: 8px; font-size: 0.8rem; letter-spacing: 0.02em; color: var(--text-secondary); opacity: 0.8;">
+                <strong>CellmFFI.xcframework:</strong> 33MB total (11MB per platform: iOS, Simulator, macOS)
+            </p>
         </header>
 
         <div class="search-container">
@@ -496,6 +499,10 @@
                 <a href="paper.md" class="project-item">
                     <div class="project-title">Research Paper</div>
                     <div class="project-meta">Technical whitepaper on cellm's architecture and performance.</div>
+                </a>
+                <a href="#" class="project-item" style="pointer-events: none;">
+                    <div class="project-title">Binary Footprint</div>
+                    <div class="project-meta">11MB per platform (iOS/macOS). 33MB total XCFramework includes full engine & backends.</div>
                 </a>
             </div>
         </section>

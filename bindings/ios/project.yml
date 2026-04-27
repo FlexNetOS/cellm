@@ -17,10 +17,13 @@ targets:
         MARKETING_VERSION: 0.1.0
         GENERATE_INFOPLIST_FILE: NO
         INFOPLIST_FILE: CellmDemo/Info.plist
+        DEVELOPMENT_TEAM: 3AJTAK83TR
         CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_IDENTITY: "Apple Development"
         EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
     dependencies:
       - framework: ../swift/CellmFFI.xcframework
+      - sdk: Accelerate.framework
 schemes:
   CellmDemo:
     build:
