@@ -1443,9 +1443,21 @@ impl QwenGraphState {
         self.bases_populated = total;
 
         let cb = self.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        let mut enc_open = true;
         for l in 0..num_layers {
-            self.encode_single_layer_efficient(cb, l, cfg, prefix, kv_cache, total, self.bases_stride, off, bid, rotary, offset, bb);
+            let ok = self.encode_single_layer_on_encoder(&enc, l, cfg, prefix, kv_cache, total, self.bases_stride, off, bid, rotary, offset, bb);
+            if !ok {
+                enc.end_encoding();
+                enc_open = false;
+                self.encode_single_layer_efficient(cb, l, cfg, prefix, kv_cache, total, self.bases_stride, off, bid, rotary, offset, bb);
+                for ll in (l + 1)..num_layers {
+                    self.encode_single_layer_efficient(cb, ll, cfg, prefix, kv_cache, total, self.bases_stride, off, bid, rotary, offset, bb);
+                }
+                break;
+            }
         }
+        if enc_open { enc.end_encoding(); }
         
         let enc_final = cb.new_compute_command_encoder();
         self.ops.encode_rms_norm_f16w(enc_final, &self.x_buf, self.get_w_cached(&format!("{prefix}model.norm.weight")), &self.x_norm_buf, h, cfg.rms_norm_eps, offset);
@@ -1608,19 +1620,30 @@ impl QwenGraphState {
             let blit = cb.new_blit_command_encoder();
             blit.copy_from_buffer(&x_all_buf, (i * h * 4) as u64, &self.x_buf, 0, (h * 4) as u64);
             blit.end_encoding();
+            let enc = cb.new_compute_command_encoder();
+            let mut enc_open = true;
             for l in 0..cfg.num_hidden_layers {
-                self.encode_single_layer_efficient(cb, l, cfg, prefix, kv_cache, start_pos + i + 1, max_total, off, bid as u32, rotary, offset, &bases_buf);
+                let ok = self.encode_single_layer_on_encoder(&enc, l, cfg, prefix, kv_cache, start_pos + i + 1, max_total, off, bid as u32, rotary, offset, &bases_buf);
+                if !ok {
+                    enc.end_encoding();
+                    enc_open = false;
+                    self.encode_single_layer_efficient(cb, l, cfg, prefix, kv_cache, start_pos + i + 1, max_total, off, bid as u32, rotary, offset, &bases_buf);
+                    for ll in (l + 1)..cfg.num_hidden_layers {
+                        self.encode_single_layer_efficient(cb, ll, cfg, prefix, kv_cache, start_pos + i + 1, max_total, off, bid as u32, rotary, offset, &bases_buf);
+                    }
+                    break;
+                }
             }
+            if enc_open { enc.end_encoding(); }
         }
         cb.commit();
         cb.wait_until_completed();
         Ok(())
     }
 
-    fn encode_single_layer_efficient(&self, cb: &metal::CommandBufferRef, l: usize, cfg: &ModelConfig, prefix: &str, kv_cache: &mut KVCache, total_tokens_now: usize, stride: usize, off: usize, bid: u32, rotary: f32, offset: bool, bases_buf: &Buffer) {
+    fn encode_single_layer_on_encoder(&self, enc: &metal::ComputeCommandEncoderRef, l: usize, cfg: &ModelConfig, prefix: &str, kv_cache: &mut KVCache, total_tokens_now: usize, stride: usize, off: usize, bid: u32, rotary: f32, offset: bool, bases_buf: &Buffer) -> bool {
         let h = cfg.hidden_size; let nh = cfg.num_attention_heads; let nkv = cfg.num_key_value_heads; let hd = cfg.head_dim;
         let pref = format!("{prefix}layers.{l}");
-        let enc = cb.new_compute_command_encoder();
         self.ops.encode_rms_norm_f16w(enc, &self.x_buf, self.get_w_cached(&format!("{pref}.input_layernorm.weight")), &self.x_norm_buf, h, cfg.rms_norm_eps, offset);
 
         let wq = self.get_w_cached(&format!("{pref}.self_attn.q_proj.weight"));
@@ -1643,8 +1666,7 @@ impl QwenGraphState {
             self.ops.encode_qkv_i8_bias(enc, wq, qs.unwrap(), wk, ks.unwrap(), wv, vs.unwrap(), &self.x_norm_buf, bq, bk, bv, &self.q_buf, &self.k_buf, &self.v_buf, nh * hd, nkv * hd, h); 
         } else { 
             // Force fallback for i4 to individual linear_f16_out_in (which now supports Metal i4)
-            enc.end_encoding();
-            return;
+            return false;
         }
 
         // QK Norm (Head-tied or Per-head)
@@ -1736,7 +1758,15 @@ impl QwenGraphState {
         
         
         self.ops.encode_add_f32_inplace(enc, &self.x_buf, &self.down_buf, h);
-        
+        true
+    }
+
+    fn encode_single_layer_efficient(&self, cb: &metal::CommandBufferRef, l: usize, cfg: &ModelConfig, prefix: &str, kv_cache: &mut KVCache, total_tokens_now: usize, stride: usize, off: usize, bid: u32, rotary: f32, offset: bool, bases_buf: &Buffer) {
+        let enc = cb.new_compute_command_encoder();
+        let ok = self.encode_single_layer_on_encoder(&enc, l, cfg, prefix, kv_cache, total_tokens_now, stride, off, bid, rotary, offset, bases_buf);
+        if !ok {
+            // encoder already not ended by encode_single_layer_on_encoder on fallback path
+        }
         enc.end_encoding();
     }
 }

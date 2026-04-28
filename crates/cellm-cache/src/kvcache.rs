@@ -1302,6 +1302,7 @@ pub struct MetalKvStorage {
     pso_read_f32: ComputePipelineState,
     pso_gather_f32: ComputePipelineState,
     pso_attn_single_gqa_f32: ComputePipelineState,
+    pso_attn_batched_gqa_f32: ComputePipelineState,
     _pso_attn_single_gqa_q8_f32: ComputePipelineState,
     k: Buffer,
     v: Buffer,
@@ -1574,6 +1575,76 @@ impl MetalKvStorage {
                 }
             }
         }
+
+        kernel void kv_attn_batched_gqa_f32(
+            device const half* k_cache [[buffer(0)]],
+            device const half* v_cache [[buffer(1)]],
+            device const uint* bases [[buffer(2)]],
+            device const float* q_all [[buffer(3)]],
+            device float* out_all [[buffer(4)]],
+            constant uint& n_heads [[buffer(5)]],
+            constant uint& n_kv_heads [[buffer(6)]],
+            constant uint& head_dim [[buffer(7)]],
+            constant uint& start_pos [[buffer(8)]],
+            constant uint& num_tokens [[buffer(9)]],
+            constant float& scale [[buffer(10)]],
+            constant float& soft_cap [[buffer(11)]],
+            uint2 gid [[thread_position_in_grid]],
+            uint2 tid [[thread_position_in_threadgroup]],
+            uint2 tgid [[threadgroup_position_in_grid]]
+        ) {
+            uint token_idx = tgid.y;
+            uint head_idx = tgid.x;
+            uint lane = tid.x;
+            if (token_idx >= num_tokens || head_idx >= n_heads) return;
+            uint group_size = n_heads / n_kv_heads;
+            uint kv_h = head_idx / group_size;
+            uint seq_len = start_pos + token_idx + 1;
+            uint q_offset = (token_idx * n_heads + head_idx) * head_dim;
+            const device float* qh = q_all + q_offset;
+            device float* out_h = out_all + q_offset;
+            const uint TGSIZE = 64;
+
+            float max_score = -INFINITY;
+            float denom = 0.0f;
+            float v_acc[128];
+            for (uint j = 0; j < 128; j++) v_acc[j] = 0.0f;
+
+            threadgroup float dots[128];
+            threadgroup float shared_score;
+
+            for (uint t = 0; t < seq_len; ++t) {
+                uint base = bases[t] + kv_h * head_dim;
+                float pdot = 0.0f;
+                for (uint i = lane; i < head_dim; i += TGSIZE) pdot += qh[i] * float(k_cache[base + i]);
+                dots[lane] = pdot;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                if (lane == 0) {
+                    float dot = 0.0f;
+                    for (uint k = 0; k < TGSIZE; ++k) dot += dots[k];
+                    float s = dot * scale;
+                    if (soft_cap > 0.0f) s = tanh(s / soft_cap) * soft_cap;
+                    shared_score = s;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                
+                float score = shared_score;
+                float old_max = max_score;
+                max_score = max(max_score, score);
+                float exp_prev = (old_max == -INFINITY) ? 0.0f : exp(old_max - max_score);
+                float exp_curr = exp(score - max_score);
+                
+                denom = denom * exp_prev + exp_curr;
+                for (uint i = lane, j = 0; i < head_dim; i += TGSIZE, ++j) {
+                    v_acc[j] = v_acc[j] * exp_prev + exp_curr * float(v_cache[base + i]);
+                }
+            }
+
+            for (uint i = lane, j = 0; i < head_dim; i += TGSIZE, ++j) {
+                out_h[i] = v_acc[j] / denom;
+            }
+        }
         "#;
         let lib = {
             let mut guard = KV_CACHE_LIB_CACHE.lock().unwrap();
@@ -1594,6 +1665,7 @@ impl MetalKvStorage {
         let pso_read_f32 = build_pso(&device, &lib, "kv_read_f32")?;
         let pso_gather_f32 = build_pso(&device, &lib, "kv_gather_f32")?;
         let pso_attn_single_gqa_f32 = build_pso(&device, &lib, "kv_attn_single_gqa_f32")?;
+        let pso_attn_batched_gqa_f32 = build_pso(&device, &lib, "kv_attn_batched_gqa_f32")?;
         let pso_attn_single_gqa_q8_f32 = build_pso(&device, &lib, "kv_attn_single_gqa_q8_f32")?;
         let bytes = (total_elems * std::mem::size_of::<f16>()) as u64;
         let k = device.new_buffer(bytes, MTLResourceOptions::StorageModeShared);
@@ -1699,6 +1771,7 @@ impl MetalKvStorage {
             pso_read_f32,
             pso_gather_f32,
             pso_attn_single_gqa_f32,
+            pso_attn_batched_gqa_f32,
             _pso_attn_single_gqa_q8_f32: pso_attn_single_gqa_q8_f32,
             k,
             v,
@@ -2579,7 +2652,7 @@ impl DeviceKvStorage for MetalKvStorage {
             enc.set_bytes(9, 4, scale_ptr);
             enc.set_bytes(10, 4, soft_cap_ptr);
 
-            let threads_per_group = 32;
+            let threads_per_group = 64;
             let grid_size = metal::MTLSize {
                 width: (n_heads * threads_per_group) as u64,
                 height: 1,
@@ -2960,6 +3033,57 @@ impl MetalKvStorage {
         let threads_per_tg = 64;
         let tg = metal::MTLSize { width: threads_per_tg, height: 1, depth: 1 };
         let grid = metal::MTLSize { width: n_heads as u64, height: 1, depth: 1 };
+        enc.dispatch_thread_groups(grid, tg);
+    }
+
+    /// Batched attention for prefill: processes all (token, head) pairs in parallel.
+    /// Each token attends to positions 0..(start_pos + token_idx).
+    pub fn encode_attention_batched(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        bases_buf: &metal::BufferRef,
+        bases_offset: u64,
+        q_all_buf: &metal::BufferRef,
+        out_all_buf: &metal::BufferRef,
+        start_pos: u32,
+        num_tokens: u32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        attn_scale: Option<f32>,
+        soft_cap: Option<f32>,
+    ) {
+        if self.encoding == KvEncodingKind::TurboQuant {
+            eprintln!("[cellm-cache] WARNING: TurboQuant KV cache is not yet supported in batched attention.");
+            return;
+        }
+        let scale = attn_scale.unwrap_or_else(|| 1.0f32 / (head_dim as f32).sqrt());
+        let start_pos_ptr = (&start_pos as *const u32).cast();
+        let num_tokens_ptr = (&num_tokens as *const u32).cast();
+        let n_heads_ptr = (&n_heads as *const u32).cast();
+        let n_kv_heads_ptr = (&n_kv_heads as *const u32).cast();
+        let head_dim_ptr = (&head_dim as *const u32).cast();
+        let scale_ptr = (&scale as *const f32).cast();
+        let soft_cap_val = soft_cap.unwrap_or(0.0f32);
+        let soft_cap_ptr = (&soft_cap_val as *const f32).cast();
+
+        enc.set_compute_pipeline_state(&self.pso_attn_batched_gqa_f32);
+        enc.set_buffer(0, Some(&self.k), 0);
+        enc.set_buffer(1, Some(&self.v), 0);
+        enc.set_buffer(2, Some(bases_buf), bases_offset);
+        enc.set_buffer(3, Some(q_all_buf), 0);
+        enc.set_buffer(4, Some(out_all_buf), 0);
+        enc.set_bytes(5, std::mem::size_of::<u32>() as u64, n_heads_ptr);
+        enc.set_bytes(6, std::mem::size_of::<u32>() as u64, n_kv_heads_ptr);
+        enc.set_bytes(7, std::mem::size_of::<u32>() as u64, head_dim_ptr);
+        enc.set_bytes(8, std::mem::size_of::<u32>() as u64, start_pos_ptr);
+        enc.set_bytes(9, std::mem::size_of::<u32>() as u64, num_tokens_ptr);
+        enc.set_bytes(10, std::mem::size_of::<f32>() as u64, scale_ptr);
+        enc.set_bytes(11, std::mem::size_of::<f32>() as u64, soft_cap_ptr);
+
+        let threads_per_tg = 64;
+        let tg = metal::MTLSize { width: threads_per_tg, height: 1, depth: 1 };
+        let grid = metal::MTLSize { width: n_heads as u64, height: num_tokens as u64, depth: 1 };
         enc.dispatch_thread_groups(grid, tg);
     }
     

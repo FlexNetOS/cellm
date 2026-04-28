@@ -75,6 +75,13 @@ CELLM_QWEN_DEBUG_POS=0 cargo build --release -p cellm-infer && \
 "Explain the fundamental differences between quantum computing and classical computing, including the principle
 nce, and how these properties enable quantum algorithms to achieve exponential speedups for certain computational problems."
 
+./target/release/infer \
+  --model models/to-huggingface/qwen2.5-0.5b-int8-v1/qwen2.5-0.5b-int8-v1.cellm \
+  --tokenizer models/to-huggingface/qwen2.5-0.5b-int8-v1/tokenizer.json \
+  --prompt "Explain the fundamental differences between quantum computing and classical computing, including the principle
+nce, and how these properties enable quantum algorithms to achieve exponential speedups for certain computational problems." \
+  --chat --gen 100 --backend metal
+
 
 ---
 
