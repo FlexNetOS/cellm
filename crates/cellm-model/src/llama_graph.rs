@@ -89,6 +89,18 @@ impl LlamaGraphState {
         })
     }
 
+    pub fn reserve_sequence_capacity(&mut self, max_seq: usize, num_layers: usize) {
+        let new_stride = max_seq.next_power_of_two().max(64);
+        if self.bases_stride < new_stride || self.bases_buf.is_none() {
+            self.bases_stride = new_stride;
+            self.bases_buf = Some(self.device.new_buffer(
+                (new_stride * num_layers * std::mem::size_of::<u32>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            ));
+            self.bases_last_seq = 0;
+        }
+    }
+
     pub fn preload_weight(&mut self, name: String, bytes: &[u8]) {
         let buf = self.device.new_buffer_with_data(
             bytes.as_ptr() as *const std::ffi::c_void,
@@ -238,9 +250,10 @@ impl LlamaGraphState {
         // 3. Initiate Command Buffer!
         let cb = self.queue.new_command_buffer();
 
-        // 4. One encoder per layer — ensures memory ordering between layers.
+        // 4. Single compute encoder for all layers — dispatches execute serially
+        // within an encoder, eliminating ~24× CPU overhead from create/destroy.
+        let enc = cb.new_compute_command_encoder();
         for layer in 0..num_layers {
-            let enc = cb.new_compute_command_encoder();
             let w_in_norm = self.get_weight(&format!("{prefix}model.layers.{layer}.input_layernorm.weight"), Some(&format!("model.layers.{layer}.input_layernorm.weight")));
             self.ops.encode_rms_norm_f16w(enc, &self.x_buf, w_in_norm, &self.x_norm_buf, hidden, cfg.rms_norm_eps, false);
 
@@ -337,10 +350,10 @@ impl LlamaGraphState {
             }
 
             self.ops.encode_add_f32_inplace(enc, &self.x_buf, &self.down_buf, hidden);
-            enc.end_encoding();
         }
+        enc.end_encoding();
 
-        // 5. Final norm + logits in a separate encoder.
+        // 5. Final norm + logits in the same command buffer.
         let enc = cb.new_compute_command_encoder();
         let w_norm = self.get_weight(&format!("{prefix}model.norm.weight"), Some("model.norm.weight"));
         self.ops.encode_rms_norm_f16w(enc, &self.x_buf, w_norm, &self.x_norm_buf, hidden, cfg.rms_norm_eps, false);
@@ -376,18 +389,10 @@ impl LlamaGraphState {
         }
 
         let mut logits = vec![0.0f32; cfg.vocab_size];
-        let mut x_check = vec![0.0f32; hidden];
-        let mut x_norm_check = vec![0.0f32; hidden];
 
         unsafe {
             let ptr = self.logits_buf.contents() as *const f32;
             std::ptr::copy_nonoverlapping(ptr, logits.as_mut_ptr(), cfg.vocab_size);
-
-            let x_ptr = self.x_buf.contents() as *const f32;
-            std::ptr::copy_nonoverlapping(x_ptr, x_check.as_mut_ptr(), hidden);
-
-            let xn_ptr = self.x_norm_buf.contents() as *const f32;
-            std::ptr::copy_nonoverlapping(xn_ptr, x_norm_check.as_mut_ptr(), hidden);
         }
 
         let mut nan_count = 0;

@@ -200,6 +200,12 @@ impl LlamaRunner {
         }
     }
 
+    pub fn reserve_metal_sequence_capacity(&mut self, max_seq: usize) {
+        if let Some(gs) = &mut self.graph_state {
+            gs.reserve_sequence_capacity(max_seq, self.cfg.num_hidden_layers);
+        }
+    }
+
     pub fn embed_token_hidden(&self, token: u32, out: &mut [f32]) -> Result<(), CoreError> {
         self.embed_token(token, out)
     }
@@ -227,6 +233,17 @@ impl LlamaRunner {
     ) -> Result<Vec<(u32, f32)>, CoreError> {
         let logits = self.step_inner(x0, pos, page_table, kv_cache, true)?;
         self.topk_from_logits(&logits, top_k)
+    }
+
+    pub fn step_from_hidden(
+        &mut self,
+        x0: &[f32],
+        pos: usize,
+        page_table: &mut PageTable,
+        kv_cache: &mut KVCache,
+    ) -> Result<(), CoreError> {
+        let _ = self.step_inner(x0, pos, page_table, kv_cache, false)?;
+        Ok(())
     }
 
     pub fn prefill(

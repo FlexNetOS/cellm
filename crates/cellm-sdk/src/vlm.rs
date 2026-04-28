@@ -547,6 +547,15 @@ fn run_decode_cellm(
     let mut page_table =
         PageTable::new(1, cfg.tokens_per_block).map_err(|e| anyhow::anyhow!("{e}"))?;
 
+    // Pre-reserve Metal graph sequence capacity for Llama to avoid repeated
+    // GPU buffer allocations and full bases-buffer rebuilds during prefill.
+    if cfg.backend == BackendKind::Metal {
+        match &mut runner {
+            DecodeRunner::Llama(r) => { r.reserve_metal_sequence_capacity(total_tokens); }
+            _ => {}
+        }
+    }
+
     let mut image_idx = 0usize;
     let mut x = vec![0.0f32; hidden];
     let mut rng = StdRng::seed_from_u64(cfg.seed.max(1));
@@ -566,23 +575,16 @@ fn run_decode_cellm(
                 let src = image_features.index_axis(Axis(0), i);
                 x.copy_from_slice(src.as_slice().context("vision feature row not contiguous")?);
             }
-            let cand = match &mut runner {
+            match &mut runner {
                 DecodeRunner::Llama(r) => r
-                    .step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
+                    .step_from_hidden(&x, pos, &mut page_table, &mut kv_cache)
                     .map_err(|e| anyhow::anyhow!("{e}"))?,
-                DecodeRunner::Gemma(r) => r
-                    .step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
-                    .map_err(|e| anyhow::anyhow!("{e}"))?,
-            };
-            next = sample_from_candidates(
-                &cand,
-                cfg.temperature,
-                cfg.repeat_penalty,
-                cfg.repeat_window,
-                banned_token_ids,
-                &recent,
-                &mut rng,
-            )?;
+                DecodeRunner::Gemma(r) => {
+                    let _ = r
+                        .step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                }
+            }
             pos += 1;
             image_idx += 1;
         }
@@ -751,7 +753,8 @@ fn run_decode_cellm(
         }
     } else {
         for &tok_id in input_ids.iter() {
-            if !prefix_image_features && tok_id == image_token_id {
+            let is_img = !prefix_image_features && tok_id == image_token_id;
+            if is_img {
                 if image_idx >= image_features.shape()[0] {
                     anyhow::bail!("image token count mismatch: prompt has more <image> tokens than vision features");
                 }
@@ -773,20 +776,36 @@ fn run_decode_cellm(
                 }
                 recent.push(tok_id as u32);
             }
-            let cand = match &mut runner {
+            match &mut runner {
                 DecodeRunner::Llama(r) => r
-                    .step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
+                    .step_from_hidden(&x, pos, &mut page_table, &mut kv_cache)
                     .map_err(|e| anyhow::anyhow!("{e}"))?,
                 DecodeRunner::Gemma(r) => {
-                    let is_img = !prefix_image_features && tok_id == image_token_id;
-                    if is_img {
+                    let _ = if is_img {
                         r.step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
                     } else {
                         r.step_topk_from_hidden_with_token(tok_id as u32, &x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
                     }
-                    .map_err(|e| anyhow::anyhow!("{e}"))?
-                },
-            };
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                }
+            }
+            pos += 1;
+        }
+    }
+    if image_idx != image_features.shape()[0] {
+        anyhow::bail!(
+            "image token count mismatch: prompt has fewer <image> tokens ({image_idx}) than vision features ({})",
+            image_features.shape()[0]
+        );
+    }
+
+    // For Llama we skipped logits during prefill to avoid LM-head + topk overhead
+    // on every token. Compute the first generated token once now.
+    if matches!(&runner, DecodeRunner::Llama(_)) && pos > 0 {
+        if let DecodeRunner::Llama(r) = &mut runner {
+            let cand = r
+                .step_topk_from_hidden(&x, pos - 1, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             next = sample_from_candidates(
                 &cand,
                 cfg.temperature,
@@ -796,14 +815,7 @@ fn run_decode_cellm(
                 &recent,
                 &mut rng,
             )?;
-            pos += 1;
         }
-    }
-    if image_idx != image_features.shape()[0] {
-        anyhow::bail!(
-            "image token count mismatch: prompt has fewer <image> tokens ({image_idx}) than vision features ({})",
-            image_features.shape()[0]
-        );
     }
 
     let debug_gen = std::env::var("CELLM_GEN_DEBUG").is_ok();
@@ -3055,6 +3067,14 @@ fn linear_rows(
         weight_t_cache,
     } = backend
     {
+        // The Metal matmul kernel is a naive element-wise implementation that
+        // is orders of magnitude slower than cblas_sgemm (Accelerate/AMX)
+        // for large encoder-scale matrices. Skip it for large batch sizes.
+        let total_ops = rows * in_dim * out_dim;
+        let skip_metal = total_ops >= (1 << 20);
+        if skip_metal {
+            // Fall through to cblas_sgemm
+        } else {
         let key = (weight.as_ptr() as usize, in_dim, out_dim);
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         let maybe_ok = {
@@ -3091,6 +3111,7 @@ fn linear_rows(
             }
             return;
         }
+        } // close else for total_ops < (1 << 20)
     }
     // For large matrices (audio conformer, vision encoder) use rayon to
     // parallelise over input rows.  The threshold avoids spawning threads for
@@ -3216,9 +3237,11 @@ fn self_attention_full(
     let hidden = num_heads * head_dim;
     let scale = scale_override.unwrap_or(1.0f32 / (head_dim as f32).sqrt());
 
-    // Try Metal path first (now supports valid_mask)
+    // Try Metal path first (now supports valid_mask), but skip for large
+    // sequences where the naive per-head Metal matmul is slower than cblas.
+    let large_seq = seq >= 256;
     if let LinearBackend::Metal { ctx, .. } = backend {
-        if self_attention_full_metal(
+        if !large_seq && self_attention_full_metal(
             ctx, q, k, v, seq, num_heads, head_dim, scale, score_buf, prob_buf, out, valid_mask,
         )
         .is_ok()
