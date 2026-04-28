@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:cellm}/bindings/swift",
+            "name": "Debug CellmSmoke (bindings/swift)",
+            "target": "CellmSmoke",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug CellmSmoke (bindings/swift)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:cellm}/bindings/swift",
+            "name": "Release CellmSmoke (bindings/swift)",
+            "target": "CellmSmoke",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release CellmSmoke (bindings/swift)"
+        }
+    ]
+}

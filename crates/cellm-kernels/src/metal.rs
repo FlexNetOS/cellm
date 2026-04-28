@@ -11,6 +11,10 @@ use std::collections::HashMap;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 static ELEM_OPS_LIB_CACHE: Mutex<Option<Library>> = Mutex::new(None);
 
+// PSO cache to avoid recompiling shaders on every MetalOps::create()
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+static PSO_CACHE: Mutex<Option<HashMap<String, ComputePipelineState>>> = Mutex::new(None);
+
 pub struct MetalKernels;
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -1301,8 +1305,20 @@ fn build_pipeline(device: &Device, src: &str, fn_name: &str) -> anyhow::Result<(
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 fn build_pso_ops(device: &metal::DeviceRef, lib: &Library, name: &str) -> anyhow::Result<ComputePipelineState> {
+    let mut cache_guard = PSO_CACHE.lock().unwrap();
+    if cache_guard.is_none() {
+        *cache_guard = Some(HashMap::new());
+    }
+    
+    let cache = cache_guard.as_mut().unwrap();
+    if let Some(pso) = cache.get(name) {
+        return Ok(pso.clone());
+    }
+    
     let f = lib.get_function(name, None).map_err(|_| anyhow::anyhow!("Missing function {name}"))?;
-    device.new_compute_pipeline_state_with_function(&f).map_err(|e| anyhow::anyhow!("PSO {name} failed: {e:?}"))
+    let pso = device.new_compute_pipeline_state_with_function(&f).map_err(|e| anyhow::anyhow!("PSO {name} failed: {e:?}"))?;
+    cache.insert(name.to_string(), pso.clone());
+    Ok(pso)
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]

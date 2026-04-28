@@ -63,6 +63,19 @@ CELLM_QWEN_DEBUG_POS=0 cargo build --release -p cellm-infer && \
   --chat --gen 100 --temperature 0 --backend metal --kv-encoding f16
 ```
 
+
+```bash
+./target/release/infer \
+  --model models/to-huggingface/qwen2.5-0.5b-int8-v1/qwen2.5-0.5b-int8-v1.cellm \
+  --tokenizer models/to-huggingface/qwen2.5-0.5b-int8-v1/tokenizer.json \
+  --prompt "what's sycophancy?" \
+  --chat --gen 100 --backend metal
+```
+
+"Explain the fundamental differences between quantum computing and classical computing, including the principle
+nce, and how these properties enable quantum algorithms to achieve exponential speedups for certain computational problems."
+
+
 ---
 
 ## Qwen 3 0.6B int4
@@ -676,6 +689,44 @@ Consciousness refers to the ability of an individual to be aware of their though
   Consciousness refers to the state of being aware of oneself and one's surroundings.
 ```
 
+
+
+```bash
+./target/release/infer \
+  --model models/LFM2.5-350M.cellm \
+  --tokenizer models/LFM2.5-350M-MLX-4bit/tokenizer.json \
+  --prompt "You rewrite outreach messages. Do not add new facts.
+
+Return only one message.
+
+Rules:
+- Under 45 words.
+- Warm, simple, human.
+- Do not mention AI.
+- Do not invent events, meetings, help, or promises.
+- Do not say “recent” unless last_contacted is known.
+- Use only the base draft and contact facts.
+- Keep the same intent.
+
+Contact facts:
+name: Sarah
+role: Professional
+workplace: Accra Tech Summit
+relationship_strength: 2/5
+last_contacted: never
+known_context: Met at Accra Tech Summit
+capabilities: Contract Review, Firebase, Flutter, Swift
+channel: Messages
+intent: Reconnect
+
+Base draft:
+Hi Sarah, hope you’re doing well. We met at Accra Tech Summit, and I realized I never properly followed up. I’d love to reconnect sometime this week if you have a free moment.
+
+Rewrite the base draft." \
+  --gen 100 --backend metal
+
+
+  ```
 
 ### Performance
 
