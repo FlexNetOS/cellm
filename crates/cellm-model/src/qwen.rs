@@ -242,6 +242,7 @@ impl QwenRunner {
                     }
                 }
                 self.graph_state = Some(gs);
+                self.metal_strict = true;
                 true
             }
             (Err(e), _) | (_, Err(e)) => {
@@ -1299,6 +1300,8 @@ pub struct QwenGraphState {
     pub weight_cache: Mutex<HashMap<String, Option<metal::Buffer>>>,
     pub bases_buf: Option<metal::Buffer>,
     pub bases_capacity: usize,
+    pub bases_stride: usize,
+    pub bases_populated: usize,
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -1328,7 +1331,7 @@ impl QwenGraphState {
             attn_out_buf, mlp_in_buf, gate_buf, up_buf, down_buf,
             logits_buf, q_norm_buf, k_norm_buf, 
             tensor_dtypes: HashMap::new(),
-            bases_buf: None, bases_capacity: 0       })
+            bases_buf: None, bases_capacity: 0, bases_stride: 0, bases_populated: 0       })
     }
 
     fn get_w_cached(&self, name: &str) -> &metal::Buffer {
@@ -1393,28 +1396,55 @@ impl QwenGraphState {
         let h = cfg.hidden_size;
         unsafe { std::ptr::copy_nonoverlapping(x_in.as_ptr(), self.x_buf.contents() as *mut f32, h); }
         let total = pos + 1;
+        let num_layers = cfg.num_hidden_layers;
         
-        // Optimize buffer growth: allocate 2x needed to reduce reallocations
-        let required_capacity = total * cfg.num_hidden_layers;
-        if self.bases_capacity < required_capacity {
-            self.bases_capacity = required_capacity * 2;
-            self.bases_buf = Some(self.device.new_buffer((self.bases_capacity * 4) as u64, metal::MTLResourceOptions::StorageModeShared));
-        }
-        let mut bases = Vec::with_capacity(total * cfg.num_hidden_layers);
+        // Fixed-stride bases buffer: only grow when exceeded, only write new entries
         let cv = kv_cache.view();
-        for l in 0..cfg.num_hidden_layers {
-            for t in 0..total {
+        if self.bases_stride < total {
+            // Grow buffer with 2x padding to reduce future reallocations
+            let new_stride = total.max(self.bases_stride * 2).max(128);
+            let new_capacity = new_stride * num_layers;
+            let new_buf = self.device.new_buffer((new_capacity * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+            
+            // Copy old data to new layout (if any)
+            if let Some(old_buf) = &self.bases_buf {
+                let old_ptr = old_buf.contents() as *const u32;
+                let new_ptr = new_buf.contents() as *mut u32;
+                for l in 0..num_layers {
+                    for t in 0..self.bases_stride {
+                        unsafe {
+                            let val = *old_ptr.add(l * self.bases_stride + t);
+                            *new_ptr.add(l * new_stride + t) = val;
+                        }
+                    }
+                }
+            }
+            
+            self.bases_buf = Some(new_buf);
+            self.bases_capacity = new_capacity;
+            self.bases_stride = new_stride;
+        }
+        
+        let bb = self.bases_buf.as_ref().unwrap();
+        let base_ptr = bb.contents() as *mut u32;
+        
+        // Populate any missing tokens (first use after prefill, or new tokens after reallocation)
+        let populate_start = self.bases_populated;
+        for t in populate_start..total {
+            for l in 0..num_layers {
                 let b = page_table.block_for_token(t).map_err(|e| CoreError::Backend(e.to_string()))?;
                 let o = page_table.offset_in_block(t).map_err(|e| CoreError::Backend(e.to_string()))?;
-                bases.push(cv.layout.token_base_elem(b, l, o)? as u32);
+                let base = cv.layout.token_base_elem(b, l, o)? as u32;
+                unsafe {
+                    *base_ptr.add(l * self.bases_stride + t) = base;
+                }
             }
         }
-        if let Some(bb) = &self.bases_buf { unsafe { std::ptr::copy_nonoverlapping(bases.as_ptr(), bb.contents() as *mut u32, bases.len()); } }
-        let bb = self.bases_buf.as_ref().unwrap();
+        self.bases_populated = total;
 
         let cb = self.queue.new_command_buffer();
-        for l in 0..cfg.num_hidden_layers {
-            self.encode_single_layer_efficient(cb, l, cfg, prefix, kv_cache, total, total, off, bid, rotary, offset, bb);
+        for l in 0..num_layers {
+            self.encode_single_layer_efficient(cb, l, cfg, prefix, kv_cache, total, self.bases_stride, off, bid, rotary, offset, bb);
         }
         
         let enc_final = cb.new_compute_command_encoder();
@@ -1566,27 +1596,24 @@ impl QwenGraphState {
             (x_all.len() * 4) as u64,
             metal::MTLResourceOptions::StorageModeShared,
         );
-        // Encode all per-token CBs without waiting between them. The Metal queue is FIFO
-        // so the GPU executes them serially and correctly. The CPU can encode CB[i+1]
-        // while the GPU is still executing CB[i], eliminating 151 round-trip stalls.
-        let mut last_cb = None;
+        // Encode ALL tokens in a SINGLE command buffer for maximum GPU efficiency.
+        // The GPU executes kernels in order, so token i's KV writes are visible to
+        // token i+1's attention. This eliminates per-token command buffer overhead.
+        let cb = self.queue.new_command_buffer();
         for i in 0..num_tokens {
-            let cb = self.queue.new_command_buffer();
             let pos = start_pos + i;
             let bid = page_table.block_for_token(pos).map_err(|e| CoreError::Backend(e.to_string()))?;
             let off = page_table.offset_in_block(pos).map_err(|e| CoreError::Backend(e.to_string()))?;
-            // GPU-side blit: copy embedding i from x_all_buf into x_buf (no CPU write, no sync needed).
+            // GPU-side blit: copy embedding i from x_all_buf into x_buf
             let blit = cb.new_blit_command_encoder();
             blit.copy_from_buffer(&x_all_buf, (i * h * 4) as u64, &self.x_buf, 0, (h * 4) as u64);
             blit.end_encoding();
             for l in 0..cfg.num_hidden_layers {
                 self.encode_single_layer_efficient(cb, l, cfg, prefix, kv_cache, start_pos + i + 1, max_total, off, bid as u32, rotary, offset, &bases_buf);
             }
-            cb.commit();
-            last_cb = Some(cb);
         }
-        // Single sync point after all tokens are submitted.
-        if let Some(cb) = last_cb { cb.wait_until_completed(); }
+        cb.commit();
+        cb.wait_until_completed();
         Ok(())
     }
 
