@@ -1454,27 +1454,29 @@ impl MetalKvStorage {
             uint group_size = n_heads / n_kv_heads;
             uint kv_h = head_idx / group_size;
             const device float* qh = q + head_idx * head_dim;
+            // Threadgroup size is fixed at 64 to match dispatch in encode_attention.
+            // If changed here, also update the dispatch call site.
+            const uint TGSIZE = 64;
 
             float max_score = -INFINITY;
             float denom = 0.0f;
-            // v_acc accumulates partial V sums; each thread covers head_dim/32 elements.
-            // 32 slots supports head_dim up to 1024 (32 threads × 32 slots = 1024).
-            float v_acc[32];
-            for (uint j = 0; j < 32; j++) v_acc[j] = 0.0f;
+            // v_acc accumulates partial V sums; sized for head_dim up to 8192 with 128 threads.
+            float v_acc[128];
+            for (uint j = 0; j < 128; j++) v_acc[j] = 0.0f;
 
-            threadgroup float dots[32];
+            threadgroup float dots[128];
             threadgroup float shared_score;
 
             for (uint t = 0; t < seq; ++t) {
                 uint base = bases[t] + kv_h * head_dim;
                 float pdot = 0.0f;
-                for (uint i = tid; i < head_dim; i += 32) pdot += qh[i] * float(k_cache[base + i]);
+                for (uint i = tid; i < head_dim; i += TGSIZE) pdot += qh[i] * float(k_cache[base + i]);
                 dots[tid] = pdot;
                 threadgroup_barrier(mem_flags::mem_threadgroup);
 
                 if (tid == 0) {
                     float dot = 0.0f;
-                    for (int k = 0; k < 32; ++k) dot += dots[k];
+                    for (int k = 0; k < TGSIZE; ++k) dot += dots[k];
                     float s = dot * scale;
                     if (soft_cap > 0.0f) s = tanh(s / soft_cap) * soft_cap;
                     shared_score = s;
@@ -1488,12 +1490,12 @@ impl MetalKvStorage {
                 float exp_curr = exp(score - max_score);
                 
                 denom = denom * exp_prev + exp_curr;
-                for (uint i = tid, j = 0; i < head_dim; i += 32, ++j) {
+                for (uint i = tid, j = 0; i < head_dim; i += TGSIZE, ++j) {
                     v_acc[j] = v_acc[j] * exp_prev + exp_curr * float(v_cache[base + i]);
                 }
             }
 
-            for (uint i = tid, j = 0; i < head_dim; i += 32, ++j) {
+            for (uint i = tid, j = 0; i < head_dim; i += TGSIZE, ++j) {
                 out[head_idx * head_dim + i] = v_acc[j] / denom;
             }
         }
@@ -2953,7 +2955,9 @@ impl MetalKvStorage {
         enc.set_bytes(9, std::mem::size_of::<f32>() as u64, scale_ptr);
         enc.set_bytes(10, std::mem::size_of::<f32>() as u64, soft_cap_ptr);
 
-        let threads_per_tg = 32;
+        // Use 64 threads per head for better GPU utilization on models with few heads.
+        // The kernel dynamically adapts via [[threads_per_threadgroup]].
+        let threads_per_tg = 64;
         let tg = metal::MTLSize { width: threads_per_tg, height: 1, depth: 1 };
         let grid = metal::MTLSize { width: n_heads as u64, height: 1, depth: 1 };
         enc.dispatch_thread_groups(grid, tg);
