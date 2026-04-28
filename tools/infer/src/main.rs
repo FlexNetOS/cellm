@@ -1,4 +1,5 @@
 // Author: Jeffrey Asante (https://jeffasante.github.io/)
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
@@ -474,6 +475,9 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
     // Decode.
     let t1 = Instant::now();
     let mut cur = next;
+    let mut output_buffer = String::with_capacity(256);
+    let mut last_flush_step = 0;
+    
     for step in 0..args.gen {
         let pos = seq + step;
         let cand = match &mut runner {
@@ -495,9 +499,20 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
                 }
             }
             if piece.is_empty() { piece = format!("[ID:{}]", cur); }
-            println!("step {:3}: token={} text={:?}", step, cur, piece);
-        } else {
-            println!("step {:3}: token={}", step, cur);
+            
+            // Buffer output and flush periodically to reduce I/O overhead
+            output_buffer.push_str(&piece);
+            let should_flush = piece.ends_with(' ') || piece.ends_with('\n') || 
+                              piece.ends_with('.') || piece.ends_with(',') || 
+                              piece.ends_with('?') || piece.ends_with('!') ||
+                              step - last_flush_step >= 8;
+            
+            if should_flush && !output_buffer.is_empty() {
+                print!("{}", output_buffer);
+                let _ = std::io::stdout().flush();
+                output_buffer.clear();
+                last_flush_step = step;
+            }
         }
 
         if args.stop_eos {
@@ -529,8 +544,15 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
             &mut rng,
         )?;
     }
+    
+    // Flush any remaining buffered output
+    if !output_buffer.is_empty() {
+        print!("{}", output_buffer);
+        let _ = std::io::stdout().flush();
+    }
+    
     println!(
-        "Decode: {} tokens in {:.2}s",
+        "\nDecode: {} tokens in {:.2}s",
         args.gen,
         t1.elapsed().as_secs_f64()
     );
