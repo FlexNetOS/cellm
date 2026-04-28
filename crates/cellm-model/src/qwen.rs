@@ -1587,7 +1587,6 @@ impl QwenGraphState {
         }
         // Single sync point after all tokens are submitted.
         if let Some(cb) = last_cb { cb.wait_until_completed(); }
-        self.queue.new_command_buffer().commit(); // sync
         Ok(())
     }
 
