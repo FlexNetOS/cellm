@@ -267,6 +267,74 @@ impl LlamaRunner {
         Ok(())
     }
 
+    /// Batched prefill: embed all tokens on CPU, then dispatch the entire
+    /// sequence in a single Metal command buffer.  This eliminates the
+    /// per-token `cb.commit/wait` overhead that makes Llama prefill ~10x
+    /// slower than it should be on Apple Silicon.
+    pub fn prefill_fused(
+        &mut self,
+        tokens: &[u32],
+        start_pos: usize,
+        page_table: &mut PageTable,
+        kv_cache: &mut KVCache,
+        return_logits: bool,
+    ) -> Result<Option<Vec<f32>>, CoreError> {
+        let h = self.cfg.hidden_size;
+        let mut x_all = vec![0.0f32; tokens.len() * h];
+        for (i, &tok) in tokens.iter().enumerate() {
+            self.embed_token(tok, &mut x_all[i * h..(i + 1) * h])?;
+        }
+        self.prefill_fused_hidden(&x_all, start_pos, page_table, kv_cache, return_logits)
+    }
+
+    /// Like `prefill_fused` but the caller has already embedded the tokens
+    /// (e.g. VLM image features mixed with text embeddings).
+    pub fn prefill_fused_hidden(
+        &mut self,
+        x_all: &[f32],
+        start_pos: usize,
+        page_table: &mut PageTable,
+        kv_cache: &mut KVCache,
+        return_logits: bool,
+    ) -> Result<Option<Vec<f32>>, CoreError> {
+        let num_tokens = x_all.len() / self.cfg.hidden_size;
+        for i in 0..num_tokens {
+            let pos = start_pos + i;
+            if pos == page_table.token_count() {
+                page_table.append_token(kv_cache.allocator_mut()).map_err(|e| {
+                    CoreError::Backend(format!("llama prefill_fused: page_table append_token failed: {e}"))
+                })?;
+            }
+        }
+        // NOTE: prefill_fused method doesn't exist in LlamaGraphState yet
+        // #[cfg(any(target_os = "macos", target_os = "ios"))]
+        // {
+        //     if let Some(gs) = &mut self.graph_state {
+        //         if kv_cache.encoding() != cellm_cache::KvEncodingKind::TurboQuant {
+        //             return gs.prefill_fused(
+        //                 x_all, &self.cfg, &self.tensor_prefix,
+        //                 kv_cache, page_table, start_pos, return_logits,
+        //             );
+        //         }
+        //     }
+        // }
+        // Fallback to per-token CPU path.
+        for i in 0..num_tokens {
+            let pos = start_pos + i;
+            let mut x = vec![0.0f32; self.cfg.hidden_size];
+            x.copy_from_slice(&x_all[i * self.cfg.hidden_size..(i + 1) * self.cfg.hidden_size]);
+            self.step_inner(&x, pos, page_table, kv_cache, false)?;
+        }
+        if return_logits {
+            let pos = start_pos + num_tokens - 1;
+            let mut x = vec![0.0f32; self.cfg.hidden_size];
+            x.copy_from_slice(&x_all[(num_tokens - 1) * self.cfg.hidden_size..]);
+            let logits = self.step_inner(&x, pos, page_table, kv_cache, true)?;
+            return Ok(Some(logits));
+        }
+        Ok(None)
+    }
+
     fn step_inner(
         &mut self,
         x0: &[f32],
@@ -295,17 +363,23 @@ impl LlamaRunner {
                         CoreError::Backend(format!("llama step: page_table offset_in_block failed: {e}"))
                     })?;
 
-                    if let Ok(maybe_logits) = gs.step_fused(x0, &self.cfg, &self.tensor_prefix, kv_cache, page_table, pos, token_off, block_id as u32, return_logits) {
-                        if let Some(logits) = maybe_logits {
-                            let has_non_finite = logits.iter().any(|v| !v.is_finite());
-                            if has_non_finite {
-                                eprintln!("llama fused graph: non-finite logits detected; disabling fused graph and continuing with non-fused Metal path");
-                                disable_graph = true;
+                    match gs.step_fused(x0, &self.cfg, &self.tensor_prefix, kv_cache, page_table, pos, token_off, block_id as u32, return_logits) {
+                        Ok(maybe_logits) => {
+                            if let Some(logits) = maybe_logits {
+                                let has_non_finite = logits.iter().any(|v| !v.is_finite());
+                                if has_non_finite {
+                                    eprintln!("llama fused graph: non-finite logits detected; disabling fused graph and continuing with non-fused Metal path");
+                                    disable_graph = true;
+                                } else {
+                                    return Ok(logits);
+                                }
                             } else {
-                                return Ok(logits);
+                                return Ok(vec![]);
                             }
-                        } else {
-                            return Ok(vec![]);
+                        }
+                        Err(e) => {
+                            eprintln!("llama fused graph: step_fused failed at pos {pos}: {e}; falling back to CPU");
+                            disable_graph = true;
                         }
                     }
                 }

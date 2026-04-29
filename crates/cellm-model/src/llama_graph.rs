@@ -9,6 +9,8 @@ use cellm_kernels::metal::MetalOps;
 use cellm_cache::{KVCache, PageTable};
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use metal::{Buffer, CommandQueue, Device, MTLResourceOptions};
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use objc::rc::autoreleasepool;
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub struct LlamaGraphState {
@@ -161,6 +163,7 @@ impl LlamaGraphState {
         block_id: u32,
         return_logits: bool,
     ) -> Result<Option<Vec<f32>>, CoreError> {
+        autoreleasepool(|| {
         let hidden = cfg.hidden_size;
         let n_heads = cfg.num_attention_heads;
         let n_kv_heads = cfg.num_key_value_heads;
@@ -407,5 +410,6 @@ impl LlamaGraphState {
         }
 
         Ok(Some(logits))
+        })
     }
 }

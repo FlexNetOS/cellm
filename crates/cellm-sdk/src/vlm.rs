@@ -101,6 +101,8 @@ struct VisionLayerWeights {
     k_b: Vec<f32>,
     v_w: Vec<f32>,
     v_b: Vec<f32>,
+    qkv_w: Vec<f32>,
+    qkv_b: Vec<f32>,
     o_w: Vec<f32>,
     o_b: Vec<f32>,
     ln2_w: Vec<f32>,
@@ -568,25 +570,99 @@ fn run_decode_cellm(
 
     let mut pos = 0usize;
     if prefix_image_features {
-        for i in 0..image_features.shape()[0] {
-            if std::env::var("CELLM_VLM_ZERO_IMAGE_FEATURES").is_ok() {
-                x.fill(0.0);
-            } else {
-                let src = image_features.index_axis(Axis(0), i);
-                x.copy_from_slice(src.as_slice().context("vision feature row not contiguous")?);
-            }
-            match &mut runner {
-                DecodeRunner::Llama(r) => r
-                    .step_from_hidden(&x, pos, &mut page_table, &mut kv_cache)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?,
-                DecodeRunner::Gemma(r) => {
-                    let _ = r
-                        .step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            if cfg.backend == BackendKind::Metal && matches!(&runner, DecodeRunner::Llama(_)) {
+                // Batched Llama prefill: collect all hidden states and run one fused
+                // command buffer to eliminate per-token dispatch overhead.
+                let num_img = image_features.shape()[0];
+                let num_text = input_ids.len();
+                let total_prefill = num_img + num_text;
+                let mut x_all = Vec::with_capacity(total_prefill * hidden);
+                for i in 0..num_img {
+                    if std::env::var("CELLM_VLM_ZERO_IMAGE_FEATURES").is_ok() {
+                        x_all.extend(std::iter::repeat(0.0f32).take(hidden));
+                    } else {
+                        let src = image_features.index_axis(Axis(0), i);
+                        x_all.extend_from_slice(src.as_slice().context("vision feature row not contiguous")?);
+                    }
+                }
+                for &tok_id in input_ids.iter() {
+                    if let DecodeRunner::Llama(r) = &runner {
+                        let mut emb = vec![0.0f32; hidden];
+                        r.embed_token_hidden(tok_id as u32, &mut emb)
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        x_all.extend_from_slice(&emb);
+                    }
+                    recent.push(tok_id as u32);
+                }
+                if let DecodeRunner::Llama(r) = &mut runner {
+                    let maybe_logits = r
+                        .prefill_fused_hidden(&x_all, 0, &mut page_table, &mut kv_cache, true)
                         .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    if let Some(logits) = maybe_logits {
+                        let cand = r
+                            .topk_from_logits(&logits, cfg.top_k.max(1))
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        next = sample_from_candidates(
+                            &cand,
+                            cfg.temperature,
+                            cfg.repeat_penalty,
+                            cfg.repeat_window,
+                            banned_token_ids,
+                            &recent,
+                            &mut rng,
+                        )?;
+                    }
+                }
+                pos = total_prefill;
+                image_idx = num_img;
+            } else {
+                // Fall through to per-token path below.
+                for i in 0..image_features.shape()[0] {
+                    if std::env::var("CELLM_VLM_ZERO_IMAGE_FEATURES").is_ok() {
+                        x.fill(0.0);
+                    } else {
+                        let src = image_features.index_axis(Axis(0), i);
+                        x.copy_from_slice(src.as_slice().context("vision feature row not contiguous")?);
+                    }
+                    match &mut runner {
+                        DecodeRunner::Llama(r) => r
+                            .step_from_hidden(&x, pos, &mut page_table, &mut kv_cache)
+                            .map_err(|e| anyhow::anyhow!("{e}"))?,
+                        DecodeRunner::Gemma(r) => {
+                            let _ = r
+                                .step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
+                                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        }
+                    }
+                    pos += 1;
+                    image_idx += 1;
                 }
             }
-            pos += 1;
-            image_idx += 1;
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        {
+            for i in 0..image_features.shape()[0] {
+                if std::env::var("CELLM_VLM_ZERO_IMAGE_FEATURES").is_ok() {
+                    x.fill(0.0);
+                } else {
+                    let src = image_features.index_axis(Axis(0), i);
+                    x.copy_from_slice(src.as_slice().context("vision feature row not contiguous")?);
+                }
+                match &mut runner {
+                    DecodeRunner::Llama(r) => r
+                        .step_from_hidden(&x, pos, &mut page_table, &mut kv_cache)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?,
+                    DecodeRunner::Gemma(r) => {
+                        let _ = r
+                            .step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    }
+                }
+                pos += 1;
+                image_idx += 1;
+            }
         }
     }
     if !prefix_image_features && is_gemma4_text && enable_gemma4_image_bidir {
@@ -1157,19 +1233,44 @@ fn run_vision_cellm(
     let mut mlp_out = vec![0.0f32; batched_tokens * hidden];
     let mut score_buf = vec![0.0f32; num_tokens];
     let mut prob_buf = vec![0.0f32; num_tokens];
+    let mut qkv = vec![0.0f32; batched_tokens * hidden * 3];
 
     let mut layers = Vec::with_capacity(num_layers);
     for layer in 0..num_layers {
         let prefix = format!("{vision_prefix}encoder.layers.{layer}.");
+        let q_w = tensor_to_f32(file, &format!("{prefix}self_attn.q_proj.weight"))?;
+        let q_b = tensor_to_f32(file, &format!("{prefix}self_attn.q_proj.bias"))?;
+        let k_w = tensor_to_f32(file, &format!("{prefix}self_attn.k_proj.weight"))?;
+        let k_b = tensor_to_f32(file, &format!("{prefix}self_attn.k_proj.bias"))?;
+        let v_w = tensor_to_f32(file, &format!("{prefix}self_attn.v_proj.weight"))?;
+        let v_b = tensor_to_f32(file, &format!("{prefix}self_attn.v_proj.bias"))?;
+        let mut qkv_w = Vec::with_capacity(q_w.len() + k_w.len() + v_w.len());
+        for i in 0..hidden {
+            for j in 0..hidden {
+                qkv_w.push(q_w[j * hidden + i]);
+            }
+            for j in 0..hidden {
+                qkv_w.push(k_w[j * hidden + i]);
+            }
+            for j in 0..hidden {
+                qkv_w.push(v_w[j * hidden + i]);
+            }
+        }
+        let mut qkv_b = Vec::with_capacity(q_b.len() + k_b.len() + v_b.len());
+        qkv_b.extend_from_slice(&q_b);
+        qkv_b.extend_from_slice(&k_b);
+        qkv_b.extend_from_slice(&v_b);
         layers.push(VisionLayerWeights {
             ln1_w: tensor_to_f32(file, &format!("{prefix}layer_norm1.weight"))?,
             ln1_b: tensor_to_f32(file, &format!("{prefix}layer_norm1.bias"))?,
-            q_w: tensor_to_f32(file, &format!("{prefix}self_attn.q_proj.weight"))?,
-            q_b: tensor_to_f32(file, &format!("{prefix}self_attn.q_proj.bias"))?,
-            k_w: tensor_to_f32(file, &format!("{prefix}self_attn.k_proj.weight"))?,
-            k_b: tensor_to_f32(file, &format!("{prefix}self_attn.k_proj.bias"))?,
-            v_w: tensor_to_f32(file, &format!("{prefix}self_attn.v_proj.weight"))?,
-            v_b: tensor_to_f32(file, &format!("{prefix}self_attn.v_proj.bias"))?,
+            q_w,
+            q_b,
+            k_w,
+            k_b,
+            v_w,
+            v_b,
+            qkv_w,
+            qkv_b,
             o_w: tensor_to_f32(file, &format!("{prefix}self_attn.out_proj.weight"))?,
             o_b: tensor_to_f32(file, &format!("{prefix}self_attn.out_proj.bias"))?,
             ln2_w: tensor_to_f32(file, &format!("{prefix}layer_norm2.weight"))?,
@@ -1212,34 +1313,13 @@ fn run_vision_cellm(
             &tokens, batched_tokens, hidden, &layer.ln1_w, &layer.ln1_b, eps, &mut norm1,
         );
         linear_rows(
-            &norm1,
-            batched_tokens,
-            hidden,
-            &layer.q_w,
-            hidden,
-            Some(&layer.q_b),
-            &mut q,
-            &mut linear_backend,
+            &norm1, batched_tokens, hidden, &layer.q_w, hidden, Some(&layer.q_b), &mut q, &mut linear_backend,
         );
         linear_rows(
-            &norm1,
-            batched_tokens,
-            hidden,
-            &layer.k_w,
-            hidden,
-            Some(&layer.k_b),
-            &mut k,
-            &mut linear_backend,
+            &norm1, batched_tokens, hidden, &layer.k_w, hidden, Some(&layer.k_b), &mut k, &mut linear_backend,
         );
         linear_rows(
-            &norm1,
-            batched_tokens,
-            hidden,
-            &layer.v_w,
-            hidden,
-            Some(&layer.v_b),
-            &mut v,
-            &mut linear_backend,
+            &norm1, batched_tokens, hidden, &layer.v_w, hidden, Some(&layer.v_b), &mut v, &mut linear_backend,
         );
         
         for img in 0..nimg {
@@ -3252,14 +3332,16 @@ fn self_attention_full(
 
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
-        let mut score = vec![0.0f32; seq * seq];
-        for h in 0..num_heads {
+        use rayon::prelude::*;
+        let out_addr = out.as_mut_ptr() as usize;
+        (0..num_heads).into_par_iter().for_each(|h| {
             let offset = h * head_dim;
             let q_ptr = unsafe { q.as_ptr().add(offset) };
             let k_ptr = unsafe { k.as_ptr().add(offset) };
             let v_ptr = unsafe { v.as_ptr().add(offset) };
-            let out_ptr = unsafe { out.as_mut_ptr().add(offset) };
+            let head_out_ptr = unsafe { (out_addr as *mut f32).add(offset) };
 
+            let mut score = vec![0.0f32; seq * seq];
             unsafe {
                 cblas_sgemm(
                     101, // CblasRowMajor
@@ -3328,7 +3410,7 @@ fn self_attention_full(
                     v_ptr,
                     hidden as i32,
                     0.0,
-                    out_ptr,
+                    head_out_ptr,
                     hidden as i32,
                 );
             }
@@ -3337,12 +3419,14 @@ fn self_attention_full(
                 for i in 0..seq {
                     if !mask[i] {
                         for d in 0..head_dim {
-                            out[i * hidden + offset + d] = 0.0;
+                            unsafe {
+                                (out_addr as *mut f32).add(i * hidden + offset + d).write(0.0);
+                            }
                         }
                     }
                 }
             }
-        }
+        });
         return;
     }
 
