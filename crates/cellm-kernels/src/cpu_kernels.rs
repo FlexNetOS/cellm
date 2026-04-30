@@ -37,20 +37,128 @@ pub fn rms_norm_f32(x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
     }
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod accelerate {
+    #[link(name = "Accelerate", kind = "framework")]
+    extern "C" {
+        pub fn cblas_sgemv(
+            order: i32,
+            trans_a: i32,
+            m: i32,
+            n: i32,
+            alpha: f32,
+            a: *const f32,
+            lda: i32,
+            x: *const f32,
+            incx: i32,
+            beta: f32,
+            y: *mut f32,
+            incy: i32,
+        );
+        pub fn cblas_sgemm(
+            order: i32,
+            trans_a: i32,
+            trans_b: i32,
+            m: i32,
+            n: i32,
+            k: i32,
+            alpha: f32,
+            a: *const f32,
+            lda: i32,
+            b: *const f32,
+            ldb: i32,
+            beta: f32,
+            c: *mut f32,
+            ldc: i32,
+        );
+    }
+    pub const CBLAS_ROW_MAJOR: i32 = 101;
+    pub const CBLAS_NO_TRANS: i32 = 111;
+}
+
 pub fn matmul_f32(a: &[f32], m: usize, k: usize, b: &[f32], n: usize, out: &mut [f32]) {
     debug_assert_eq!(a.len(), m * k);
     debug_assert_eq!(b.len(), k * n);
     debug_assert_eq!(out.len(), m * n);
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        use accelerate::*;
+        // Use Accelerate BLAS for matrix-matrix products (prefill, n>1) where
+        // tiling and AMX are effective. For n==1 (decode), parallel NEON loops
+        // are faster because BLAS sgemv doesn't parallelize well for these sizes.
+        if m >= 1 && k >= 64 && n > 1 {
+            unsafe {
+                cblas_sgemm(
+                    CBLAS_ROW_MAJOR,
+                    CBLAS_NO_TRANS,
+                    CBLAS_NO_TRANS,
+                    m as i32,
+                    n as i32,
+                    k as i32,
+                    1.0,
+                    a.as_ptr(),
+                    k as i32,
+                    b.as_ptr(),
+                    n as i32,
+                    0.0,
+                    out.as_mut_ptr(),
+                    n as i32,
+                );
+            }
+            return;
+        }
+    }
+
     if n == 1 {
-        // Matrix-vector product - parallelize across rows.
+        // Matrix-vector product - parallelize across rows with NEON on aarch64.
         out.par_iter_mut().enumerate().for_each(|(i, o)| {
             let row = &a[i * k..(i + 1) * k];
-            let mut acc = 0.0f32;
-            for kk in 0..k {
-                acc += row[kk] * b[kk];
+
+            #[cfg(target_arch = "aarch64")]
+            {
+                let mut acc;
+                let mut kk = 0;
+                unsafe {
+                    use std::arch::aarch64::*;
+                    let mut sum0 = vdupq_n_f32(0.0);
+                    let mut sum1 = vdupq_n_f32(0.0);
+                    let mut sum2 = vdupq_n_f32(0.0);
+                    let mut sum3 = vdupq_n_f32(0.0);
+
+                    while kk + 16 <= k {
+                        let av0 = vld1q_f32(row.as_ptr().add(kk));
+                        let av1 = vld1q_f32(row.as_ptr().add(kk + 4));
+                        let av2 = vld1q_f32(row.as_ptr().add(kk + 8));
+                        let av3 = vld1q_f32(row.as_ptr().add(kk + 12));
+                        let bv0 = vld1q_f32(b.as_ptr().add(kk));
+                        let bv1 = vld1q_f32(b.as_ptr().add(kk + 4));
+                        let bv2 = vld1q_f32(b.as_ptr().add(kk + 8));
+                        let bv3 = vld1q_f32(b.as_ptr().add(kk + 12));
+                        sum0 = vmlaq_f32(sum0, av0, bv0);
+                        sum1 = vmlaq_f32(sum1, av1, bv1);
+                        sum2 = vmlaq_f32(sum2, av2, bv2);
+                        sum3 = vmlaq_f32(sum3, av3, bv3);
+                        kk += 16;
+                    }
+                    let res = vaddq_f32(vaddq_f32(sum0, sum1), vaddq_f32(sum2, sum3));
+                    acc = vgetq_lane_f32(res, 0) + vgetq_lane_f32(res, 1) + vgetq_lane_f32(res, 2) + vgetq_lane_f32(res, 3);
+                }
+                while kk < k {
+                    acc += row[kk] * b[kk];
+                    kk += 1;
+                }
+                *o = acc;
             }
-            *o = acc;
+
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                let mut acc = 0.0f32;
+                for kk in 0..k {
+                    acc += row[kk] * b[kk];
+                }
+                *o = acc;
+            }
         });
     } else {
         // Matrix-matrix product - parallelize across output rows.
@@ -82,7 +190,7 @@ pub fn matmul_i8_f32(
     out.par_iter_mut().enumerate().for_each(|(i, o)| {
         let row = &a_i8[i * k..(i + 1) * k];
         let scale = f16::from_bits(a_scales_f16[i]).to_f32();
-        
+
         #[cfg(target_arch = "aarch64")]
         {
             let mut dot = 0.0f32;
@@ -93,22 +201,22 @@ pub fn matmul_i8_f32(
                 let mut sum1 = vdupq_n_f32(0.0);
                 let mut sum2 = vdupq_n_f32(0.0);
                 let mut sum3 = vdupq_n_f32(0.0);
-                
+
                 while i_inner + 16 <= k {
                     let wv = vld1q_s8(row.as_ptr().add(i_inner));
                     let xv0 = vld1q_f32(b.as_ptr().add(i_inner));
                     let xv1 = vld1q_f32(b.as_ptr().add(i_inner + 4));
                     let xv2 = vld1q_f32(b.as_ptr().add(i_inner + 8));
                     let xv3 = vld1q_f32(b.as_ptr().add(i_inner + 12));
-                    
+
                     let wv16_low = vmovl_s8(vget_low_s8(wv));
                     let wv16_high = vmovl_s8(vget_high_s8(wv));
-                    
+
                     let w_f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(wv16_low)));
                     let w_f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(wv16_low)));
                     let w_f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(wv16_high)));
                     let w_f3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(wv16_high)));
-                    
+
                     sum0 = vmlaq_f32(sum0, w_f0, xv0);
                     sum1 = vmlaq_f32(sum1, w_f1, xv1);
                     sum2 = vmlaq_f32(sum2, w_f2, xv2);
@@ -148,7 +256,7 @@ pub fn matmul_f16_f32(
 
     out.par_iter_mut().with_min_len(32).enumerate().for_each(|(i, o)| {
         let row = &a_f16[i * k..(i + 1) * k];
-        
+
         #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
         {
             let mut dot = 0.0f32;
@@ -327,15 +435,15 @@ pub fn attention_single_token_gqa_f32(
     out.par_chunks_exact_mut(head_dim).enumerate().for_each(|(h, out_h)| {
         let kv_h = h / qkv_ratio;
         let qh = &q[h * head_dim..(h + 1) * head_dim];
-        
-        // We need a thread-local score buffer. 
+
+        // We need a thread-local score buffer.
         // For simplicity in this kernel, we'll allocate it, but ideally it's passed in.
         let mut scores = vec![0.0f32; seq];
         for t in 0..seq {
             let kt_base = (t * n_kv_heads + kv_h) * head_dim;
             let kt = &k[kt_base..kt_base + head_dim];
             let mut dot = 0.0f32;
-            
+
             #[cfg(target_arch = "aarch64")]
             unsafe {
                 use std::arch::aarch64::*;
@@ -369,7 +477,7 @@ pub fn attention_single_token_gqa_f32(
             let vt_base = (t * n_kv_heads + kv_h) * head_dim;
             let vt = &v[vt_base..vt_base + head_dim];
             let w = scores[t];
-            
+
             #[cfg(target_arch = "aarch64")]
             unsafe {
                 use std::arch::aarch64::*;

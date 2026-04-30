@@ -314,35 +314,35 @@ Qwen3-0.6B-int4.cellm (old int4)	Garbage (pre-fix)
 ```sh
 # CPU
 ./target/release/infer \
-  --model models/to-huggingface/gemma-4-E2B-it-int4-aggr-v5/gemma-4-E2B-it-int4-aggr-v5.cellmd \
+  --model models/to-huggingface/gemma-4-E2B-it-int4-aggr-v2/gemma-4-E2B-it-int4-aggr-v2.cellm \
   --tokenizer models/to-huggingface/gemma-4-E2B-it-int4-aggr-v5/tokenizer.json \
   --prompt "What is consciousness?" \
   --chat --chat-format auto --gen 32 --temperature 0 --backend cpu --kv-encoding f16
 
 # Metal — f16
 ./target/release/infer \
-  --model models/to-huggingface/gemma-4-E2B-it-int4-aggr-v5/gemma-4-E2B-it-int4-aggr-v5.cellmd \
+  --model models/to-huggingface/gemma-4-E2B-it-int4-aggr-v2/gemma-4-E2B-it-int4-aggr-v2.cellm \
   --tokenizer models/to-huggingface/gemma-4-E2B-it-int4-aggr-v5/tokenizer.json \
   --prompt "what's sycophancy?" \
   --chat --gen 32 --temperature 0 --backend metal --kv-encoding f16
 
 # Metal — turboquant KV
 ./target/release/infer \
-  --model models/to-huggingface/gemma-4-E2B-it-int4-aggr-v5/gemma-4-E2B-it-int4-aggr-v5.cellmd \
+  --model models/to-huggingface/gemma-4-E2B-it-int4-aggr-v2/gemma-4-E2B-it-int4-aggr-v2.cellm \
   --tokenizer models/to-huggingface/gemma-4-E2B-it-int4-aggr-v5/tokenizer.json \
   --prompt $'Graph Lowering Compiler Techniques for\nNeural Networks?' \
   --chat --chat-format auto --gen 100 --temperature 0 --backend metal --kv-encoding turboquant
 
 # CPU — who is elon musk
 ./target/release/infer \
-  --model models/to-huggingface/gemma-4-E2B-it-int4-aggr-v5/gemma-4-E2B-it-int4-aggr-v5.cellmd \
+  --model models/to-huggingface/gemma-4-E2B-it-int4-aggr-v2/gemma-4-E2B-it-int4-aggr-v2.cellm \
   --tokenizer models/to-huggingface/gemma-4-E2B-it-int4-aggr-v5/tokenizer.json \
   --prompt "who is elon musk?" \
   --chat --tokens 100 --backend cpu
 
 
   ./target/release/infer \
-  --model models/to-huggingface/gemma-4-E2B-it-int4-aggr-v5/gemma-4-E2B-it-int4-aggr-v5.cellmd \
+  --model models/to-huggingface/gemma-4-E2B-it-int4-aggr-v2/gemma-4-E2B-it-int4-aggr-v2.cellm \
   --tokenizer models/to-huggingface/gemma-4-E2B-it-int4-aggr-v5/tokenizer.json \
   --prompt "who is elon musk?" \
   --chat --gen 100 --backend metal
@@ -352,7 +352,7 @@ Qwen3-0.6B-int4.cellm (old int4)	Garbage (pre-fix)
 ### Vision
 
 ```sh
-MODEL=models/to-huggingface/gemma-4-E2B-it-int4-aggr-v5/gemma-4-E2B-it-int4-aggr-v5.cellmd
+MODEL=models/to-huggingface/gemma-4-E2B-it-int4-aggr-v2/gemma-4-E2B-it-int4-aggr-v2.cellm
 
 ./target/release/vlm-direct \
   --model "$MODEL" \
@@ -368,7 +368,7 @@ CELLM_VLM_DEBUG_FEATURE_STATS=1 ./target/release/vlm-direct \
   --backend cpu --tokens 16
   
   
-  MODEL=models/to-huggingface/gemma-4-E2B-it-int4-aggr-v5/gemma-4-E2B-it-int4-aggr-v5.cellmd
+  MODEL=models/to-huggingface/gemma-4-E2B-it-int4-aggr-v2/gemma-4-E2B-it-int4-aggr-v2.cellm
   
   ./target/release/vlm-direct \
     --model "$MODEL" \
@@ -379,7 +379,7 @@ CELLM_VLM_DEBUG_FEATURE_STATS=1 ./target/release/vlm-direct \
 
 
 
-    MODEL=models/to-huggingface/gemma-4-E2B-it-int4-aggr-v5/gemma-4-E2B-it-int4-aggr-v5.cellmd
+    MODEL=models/to-huggingface/gemma-4-E2B-it-int4-aggr-v2/gemma-4-E2B-it-int4-aggr-v2.cellm
 ./target/release/vlm-direct \
   --model "$MODEL" \
   --image models/test_images/bird.jpg \
@@ -393,7 +393,7 @@ CELLM_VLM_DEBUG_FEATURE_STATS=1 ./target/release/vlm-direct \
 ### Audio
 
 ```sh
-MODEL=models/to-huggingface/gemma-4-E2B-it-int4-aggr-v5/gemma-4-E2B-it-int4-aggr-v5.cellmd
+MODEL=models/to-huggingface/gemma-4-E2B-it-int4-aggr-v2/gemma-4-E2B-it-int4-aggr-v2.cellm
 
 ./target/release/audio-direct \
   --model "$MODEL" \
@@ -533,12 +533,11 @@ cargo run --release --bin convert -- \
   --image models/test_images/bird.jpg \
   --prompt "What do you see?" \
   --backend metal \
-  --gen 100
+  --tokens 100
 ```
 
 
 ```bash
-
 ./target/release/vlm-direct \
   --model models/to-huggingface/smolvlm-256m-instruct-f16-full/smolvlm-256m-instruct-f16-full.cellm \
   --image image_5FB898F1-0AC7-401C-AB1D-63E304A75599.png \
@@ -783,6 +782,18 @@ hf download Qwen/Qwen3.5-0.8B --local-dir models/hf/qwen3.5-0.8b
   --gen 64 --temperature 0 --backend cpu --kv-encoding f16
 ```
 
+
+```bash
+# CPU
+./target/release/infer \
+  --model models/to-huggingface/qwen3.5-0.8b-v1/qwen3.5-0.8b-f16.cellm \
+  --tokenizer models/to-huggingface/qwen3.5-0.8b-v1/tokenizer.json \
+  --prompt "Hello, who are you?" \
+  --chat --chat-format auto \
+  --gen 64 --temperature 0 --backend metal --kv-encoding f16
+```
+
+
 ### Run (int4)
 
 ```bash
@@ -794,6 +805,28 @@ hf download Qwen/Qwen3.5-0.8B --local-dir models/hf/qwen3.5-0.8b
   --chat --chat-format auto \
   --gen 64 --temperature 0 --backend cpu --kv-encoding f16
 ```
+
+
+```bash
+# METAL
+./target/release/infer \
+  --model models/to-huggingface/qwen3.5-0.8b-v1/qwen3.5-0.8b-i4.cellm \
+  --tokenizer models/to-huggingface/qwen3.5-0.8b-v1/tokenizer.json \
+  --prompt "Hello, who are you?" \
+  --chat --chat-format auto \
+  --gen 64 --temperature 0 --backend metal --kv-encoding f16
+```
+
+
+```bash
+# METAL
+./target/release/infer \
+  --model models/to-huggingface/qwen3.5-0.8b-v1/qwen3.5-0.8b-i4.cellm \
+  --tokenizer models/to-huggingface/qwen3.5-0.8b-v1/tokenizer.json \
+  --prompt "Hello, who are you?" \
+  --gen 64 --backend metal
+```
+
 
 ### Run (1-bit)
 

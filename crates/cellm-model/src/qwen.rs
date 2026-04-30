@@ -241,6 +241,14 @@ impl QwenRunner {
                         gs.preload_weight(name.clone(), bytes);
                     }
                 }
+                // Metal graph only supports FullAttention layers; LinearAttention requires
+                // state-space kernels not yet implemented on GPU.
+                if self.layer_kinds.iter().any(|k| *k == LayerKind::LinearAttention) {
+                    eprintln!("qwen: Metal graph skipped — model has LinearAttention layers (not yet supported on GPU). Using CPU layer loop with Metal matmul where available.");
+                    self.metal_strict = false;
+                    self.graph_state = None;
+                    return false;
+                }
                 self.graph_state = Some(gs);
                 self.metal_strict = true;
                 true

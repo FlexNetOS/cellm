@@ -777,9 +777,6 @@ fn select_next_with_params(
     if candidates.is_empty() {
         anyhow::bail!("no candidates");
     }
-    if temperature <= 0.0 {
-        return Ok(candidates[0].0);
-    }
 
     let temperature = temperature as f32;
     let repeat_penalty = repeat_penalty as f32;
@@ -791,6 +788,7 @@ fn select_next_with_params(
         scores.push(s);
     }
 
+    // Apply repetition penalty first (before temperature/greedy selection)
     if repeat_penalty > 1.0 && repeat_window > 0 && !recent.is_empty() {
         let start = recent.len().saturating_sub(repeat_window);
         for i in 0..scores.len() {
@@ -798,6 +796,19 @@ fn select_next_with_params(
                 scores[i] /= repeat_penalty;
             }
         }
+    }
+
+    // Greedy selection (temperature 0) - pick highest score after penalty
+    if temperature <= 0.0 {
+        let mut best_idx = 0;
+        let mut best_score = scores[0];
+        for i in 1..scores.len() {
+            if scores[i] > best_score {
+                best_score = scores[i];
+                best_idx = i;
+            }
+        }
+        return Ok(ids[best_idx]);
     }
 
     let mut max = f32::NEG_INFINITY;

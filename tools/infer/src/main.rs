@@ -213,7 +213,7 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
                 if r.enable_metal_full_backend() {
                     println!("LLM backend: metal (Qwen full acceleration)");
                 } else {
-                    anyhow::bail!("LLM backend: metal requested, but Qwen full-metal init failed");
+                    println!("LLM backend: metal requested, but Qwen full-metal init failed (using CPU layer loop with Metal matmul)");
                 }
             }
             Runner::Gemma(r) => {
@@ -316,6 +316,10 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
                         ChatFormat::Gemma4
                     } else if tokenizer_config_gemma_turn(tok_path) {
                         ChatFormat::Gemma
+                    } else if tokenizer_json_has_chatml_tokens(tok_path) {
+                        // Fallback: tokenizer_config.json may be missing but
+                        // tokenizer.json added_tokens has ChatML special tokens (Qwen3.5).
+                        ChatFormat::Chatml
                     } else {
                         ChatFormat::Plain
                     }
@@ -422,14 +426,19 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
     );
 
     let mut rng = XorShift64::new(args.seed.unwrap_or_else(seed_from_time));
-    let chat_im_end = tokenizer
-        .as_ref()
-        .and_then(|t| {
-            (args.chat && effective_chat_format == ChatFormat::Chatml)
-                .then(|| t.token_to_id("<|im_end|>"))
-                .flatten()
-        });
-
+    // Look up special token IDs from our added_token_ids map rather than the tokenizers
+    // crate, which may fail to register them during deserialization (Qwen3.5 bug).
+    // We search by substring pattern to avoid hardcoding exact token strings.
+    let chat_im_end = if args.chat && effective_chat_format == ChatFormat::Chatml {
+        find_token_id_by_substring(&added_token_ids, "im_end")
+    } else {
+        None
+    };
+    let chat_im_start = if args.chat && effective_chat_format == ChatFormat::Chatml {
+        find_token_id_by_substring(&added_token_ids, "im_start")
+    } else {
+        None
+    };
     // Prefill.
     let t0 = Instant::now();
     let mut next = 0u32;
@@ -451,7 +460,17 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
                 r.step_topk(last_tok, prompt_tokens.len() - 1, &mut page_table, &mut kv_cache, args.top_k)?
             }
             Runner::Gemma(r) => r.step_topk(tok, i, &mut page_table, &mut kv_cache, args.top_k)?,
-            Runner::Qwen(r) => r.step_topk(tok, i, &mut page_table, &mut kv_cache, args.top_k)?,
+            Runner::Qwen(r) => {
+                // Qwen supports batch prefill. Process all but the last token in one pass,
+                // then step the final token to get logits for sampling the first decode token.
+                if i > 0 {
+                    all_ids.push(tok);
+                    continue;
+                }
+                r.prefill(&prompt_tokens[..prompt_tokens.len() - 1], 0, &mut page_table, &mut kv_cache)?;
+                let last_tok = *prompt_tokens.last().unwrap();
+                r.step_topk(last_tok, prompt_tokens.len() - 1, &mut page_table, &mut kv_cache, args.top_k)?
+            }
             Runner::Granite(r) => r.step_topk(tok, i, &mut page_table, &mut kv_cache, args.top_k)?,
             Runner::Lfm(r) => r.step_topk(tok, i, &mut page_table, &mut kv_cache, args.top_k)?,
         };
@@ -530,6 +549,11 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
             }
             if let Some(im_end) = chat_im_end {
                 if cur == im_end {
+                    break;
+                }
+            }
+            if let Some(im_start) = chat_im_start {
+                if cur == im_start {
                     break;
                 }
             }
@@ -743,7 +767,33 @@ fn tokenizer_config_chatml(tokenizer_json_path: &std::path::Path) -> bool {
     let Some(tpl) = v.get("chat_template").and_then(|x| x.as_str()) else {
         return false;
     };
-    tpl.contains("<|im_start|>") && tpl.contains("<|im_end|>")
+    tpl.contains("im_start") && tpl.contains("im_end")
+}
+
+fn tokenizer_json_has_chatml_tokens(tokenizer_json_path: &std::path::Path) -> bool {
+    let Ok(bytes) = std::fs::read(tokenizer_json_path) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    let Some(arr) = v.get("added_tokens").and_then(|x| x.as_array()) else {
+        return false;
+    };
+    let mut has_im_start = false;
+    let mut has_im_end = false;
+    for item in arr {
+        let Some(content) = item.get("content").and_then(|x| x.as_str()) else {
+            continue;
+        };
+        if content.contains("im_start") {
+            has_im_start = true;
+        }
+        if content.contains("im_end") {
+            has_im_end = true;
+        }
+    }
+    has_im_start && has_im_end
 }
 
 fn tokenizer_config_gemma_turn(tokenizer_json_path: &std::path::Path) -> bool {
@@ -963,6 +1013,8 @@ fn load_added_token_ids(tokenizer_json_path: &std::path::Path) -> Result<std::co
         .map_err(|e| anyhow::anyhow!("parse tokenizer {:?} failed: {e}", tokenizer_json_path))?;
 
     let mut out = std::collections::HashMap::new();
+    
+    // Load from tokenizer.json added_tokens
     if let Some(arr) = v.get("added_tokens").and_then(|x| x.as_array()) {
         for item in arr {
             let Some(content) = item.get("content").and_then(|x| x.as_str()) else {
@@ -974,6 +1026,79 @@ fn load_added_token_ids(tokenizer_json_path: &std::path::Path) -> Result<std::co
             out.insert(content.to_string(), id as u32);
         }
     }
+    
+    // Also load from tokenizer_config.json special_tokens and additional_special_tokens
+    // This is needed for models like Qwen3.5 that define special tokens there
+    if let Some(dir) = tokenizer_json_path.parent() {
+        let cfg_path = dir.join("tokenizer_config.json");
+        if let Ok(cfg_bytes) = std::fs::read(&cfg_path) {
+            if let Ok(cfg) = serde_json::from_slice::<Value>(&cfg_bytes) {
+                // Load eos_token, bos_token, pad_token, etc.
+                for key in ["eos_token", "bos_token", "pad_token", "unk_token"] {
+                    if let Some(token_obj) = cfg.get(key) {
+                        let (content, id) = if let Some(s) = token_obj.as_str() {
+                            (s.to_string(), None)
+                        } else if let Some(obj) = token_obj.as_object() {
+                            let content = obj.get("content").and_then(|x| x.as_str()).map(|s| s.to_string());
+                            let id = obj.get("id").and_then(|x| x.as_u64()).map(|n| n as u32);
+                            (content.unwrap_or_default(), id)
+                        } else {
+                            (String::new(), None)
+                        };
+                        if !content.is_empty() {
+                            if let Some(token_id) = id {
+                                out.insert(content, token_id);
+                            } else if out.contains_key(&content) {
+                                // Already loaded from added_tokens, skip
+                            } else {
+                                // Try to find the ID in added_tokens by content
+                                if let Some(arr) = v.get("added_tokens").and_then(|x| x.as_array()) {
+                                    for item in arr {
+                                        if let Some(item_content) = item.get("content").and_then(|x| x.as_str()) {
+                                            if item_content == content {
+                                                if let Some(item_id) = item.get("id").and_then(|x| x.as_u64()) {
+                                                    out.insert(content.to_string(), item_id as u32);
+                                                }
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // Load additional_special_tokens array
+                if let Some(additional) = cfg.get("additional_special_tokens").and_then(|x| x.as_array()) {
+                    for token in additional {
+                        if let Some(s) = token.as_str() {
+                            // Try to find the ID in added_tokens
+                            if let Some(arr) = v.get("added_tokens").and_then(|x| x.as_array()) {
+                                for item in arr {
+                                    if let Some(item_content) = item.get("content").and_then(|x| x.as_str()) {
+                                        if item_content == s {
+                                            if let Some(item_id) = item.get("id").and_then(|x| x.as_u64()) {
+                                                out.insert(s.to_string(), item_id as u32);
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        } else if let Some(obj) = token.as_object() {
+                            let content = obj.get("content").and_then(|x| x.as_str());
+                            let id = obj.get("id").and_then(|x| x.as_u64()).map(|n| n as u32);
+                            if let (Some(c), Some(i)) = (content, id) {
+                                out.insert(c.to_string(), i);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
     Ok(out)
 }
 
@@ -988,9 +1113,6 @@ fn select_next(
     if candidates.is_empty() {
         anyhow::bail!("no candidates");
     }
-    if temperature <= 0.0 {
-        return Ok(candidates[0].0);
-    }
 
     let mut ids: Vec<u32> = Vec::with_capacity(candidates.len());
     let mut scores: Vec<f32> = Vec::with_capacity(candidates.len());
@@ -999,6 +1121,7 @@ fn select_next(
         scores.push(s);
     }
 
+    // Apply repetition penalty first (before temperature/greedy selection)
     if repeat_penalty > 1.0 && repeat_window > 0 && !recent.is_empty() {
         let start = recent.len().saturating_sub(repeat_window);
         for i in 0..scores.len() {
@@ -1006,6 +1129,19 @@ fn select_next(
                 scores[i] /= repeat_penalty;
             }
         }
+    }
+
+    // Greedy selection (temperature 0) - pick highest score after penalty
+    if temperature <= 0.0 {
+        let mut best_idx = 0;
+        let mut best_score = scores[0];
+        for i in 1..scores.len() {
+            if scores[i] > best_score {
+                best_score = scores[i];
+                best_idx = i;
+            }
+        }
+        return Ok(ids[best_idx]);
     }
 
     // Softmax with temperature over the candidate set.
@@ -1164,6 +1300,12 @@ fn run_litertlm_proxy(file: &CellmFile, args: &Args) -> Result<()> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     println!("{}", stdout.trim_end());
     Ok(())
+}
+
+fn find_token_id_by_substring(map: &std::collections::HashMap<String, u32>, needle: &str) -> Option<u32> {
+    map.iter()
+        .find(|(k, _)| k.contains(needle))
+        .map(|(_, &v)| v)
 }
 
 fn allow_litert_proxy() -> bool {
