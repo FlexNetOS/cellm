@@ -1650,7 +1650,7 @@ impl MetalKvStorage {
             let mut guard = KV_CACHE_LIB_CACHE.lock().unwrap();
             if guard.is_none() {
                 let options = metal::CompileOptions::new();
-                options.set_fast_math_enabled(true);
+                options.set_fast_math_enabled(false);
                 *guard = Some(
                     device
                         .new_library_with_source(src, &options)

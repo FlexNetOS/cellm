@@ -817,7 +817,7 @@ impl MetalOps {
             let mut guard = ELEM_OPS_LIB_CACHE.lock().unwrap();
             if guard.is_none() {
                 let options = metal::CompileOptions::new();
-                options.set_fast_math_enabled(true);
+                options.set_fast_math_enabled(false);
                 *guard = Some(
                     device
                         .new_library_with_source(ELEM_OPS_SHADER, &options)

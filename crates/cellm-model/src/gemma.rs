@@ -258,10 +258,17 @@ impl GemmaRunner {
                 // Gemma4 is excluded because it uses mixed i4 quantization and complex
                 // per-layer features (shared-KV, PLE, layer-output-scale) not yet supported.
                 if self.is_gemma3_text && !self.is_gemma4_text {
+                    let has_unsupported_graph_dtype = self.file.header.tensors.iter().any(|t| {
+                        let d = t.dtype.as_str();
+                        d == "i4" || d == "i2"
+                    });
+                    if has_unsupported_graph_dtype {
+                        eprintln!("gemma: fused Metal graph disabled: model contains i4/i2 quantized weights not yet supported by the Metal graph kernels");
+                    }
                     let graph_enabled = std::env::var("CELLM_GEMMA_ENABLE_GRAPH")
                         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                         .unwrap_or(true);
-                    if graph_enabled {
+                    if graph_enabled && !has_unsupported_graph_dtype {
                         let layer_specs: Vec<GemmaGraphLayerSpec> = self.layer_attn.iter().map(|s| {
                             GemmaGraphLayerSpec {
                                 n_heads:     s.n_heads,
