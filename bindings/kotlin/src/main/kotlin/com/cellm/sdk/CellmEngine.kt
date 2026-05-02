@@ -130,6 +130,9 @@ class CellmEngine private constructor(
         @JvmStatic
         private external fun nativeResetStatsWindow(handle: Long): Int
 
+        @JvmStatic
+        private external fun nativeDescribeImage(handle: Long, session: Long, imageBytes: ByteArray, prompt: String): String
+
         /**
          * Create an engine with default settings (CPU backend, F16 KV encoding,
          * Fair scheduling, 256 blocks of 16 tokens).
@@ -260,6 +263,14 @@ class CellmEngine private constructor(
         nativeResetStatsWindow(handle)
     }
 
+
+    /**
+     * Run VLM inference on an image.  The image must be JPEG-encoded bytes.
+     * This call blocks until generation finishes; run on a background thread.
+     */
+    fun describeImage(session: CellmSession, imageBytes: ByteArray, prompt: String): String {
+        return nativeDescribeImage(handle, session.handle, imageBytes, prompt)
+    }
     override fun close() {
         if (handle != 0L) {
             nativeDestroy(handle)

@@ -8,19 +8,8 @@ import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 
-/**
- * Downloads model files from HuggingFace and GitHub to app-local storage.
- *
- * For each model, three files are retrieved when available:
- * - .cellm / .cellmd  (model weights)
- * - tokenizer.json
- * - tokenizer_config.json
- *
- * All files are stored under context.filesDir/cellm-models/.
- */
 object ModelDownloader {
 
-    /** Bundled models available for download. */
     val availableModels = listOf(
         ModelSpec(
             id = "qwen2.5-0.5b-int8",
@@ -57,6 +46,15 @@ object ModelDownloader {
             modelUrl = "https://huggingface.co/jeffasante/cellm-models/resolve/main/lfm2.5-350m-v1/lfm2.5-350m-v1.cellm?download=true",
             tokenizerUrl = "https://huggingface.co/jeffasante/cellm-models/resolve/main/lfm2.5-350m-v1/tokenizer.json?download=true",
             tokenizerConfigUrl = null
+        ),
+        ModelSpec(
+            id = "smolvlm-256m-instruct",
+            displayName = "SmolVLM 256M (VLM)",
+            description = "Vision-language model. Accepts image + text input.",
+            sizeMb = 520,
+            modelUrl = "https://huggingface.co/jeffasante/cellm-models/resolve/main/smolvlm-256m-instruct-int8-v1/smolvlm-256m-instruct-int8-v1.cellm?download=true",
+            tokenizerUrl = "https://huggingface.co/jeffasante/cellm-models/resolve/main/smolvlm-256m-instruct-int8-v1/tokenizer.json?download=true",
+            tokenizerConfigUrl = null
         )
     )
 
@@ -82,12 +80,10 @@ object ModelDownloader {
         val tokenizerConfigPath: String?
     )
 
-    /** Directory where downloaded models are stored. */
     fun modelsDir(context: Context): File {
         return File(context.filesDir, "cellm-models").also { it.mkdirs() }
     }
 
-    /** Check if a model is already downloaded. */
     fun isDownloaded(context: Context, model: ModelSpec): Boolean {
         val dir = File(modelsDir(context), model.id)
         val modelFile = File(dir, model.modelUrl.substringAfterLast("/").replace("?download=true", ""))
@@ -95,7 +91,6 @@ object ModelDownloader {
         return modelFile.exists() && tokenizerFile.exists()
     }
 
-    /** Get paths for an already downloaded model. */
     fun getModelFiles(context: Context, model: ModelSpec): ModelFiles? {
         val dir = File(modelsDir(context), model.id)
         val modelFile = File(dir, model.modelUrl.substringAfterLast("/").replace("?download=true", ""))
@@ -109,11 +104,6 @@ object ModelDownloader {
         )
     }
 
-    /**
-     * Download a model with progress callbacks.
-     *
-     * @param onProgress called with download progress (0.0 to 1.0) for overall completion.
-     */
     suspend fun download(
         context: Context,
         model: ModelSpec,
@@ -183,14 +173,12 @@ object ModelDownloader {
         dest: File,
         onProgress: (received: Long, total: Long) -> Unit
     ) {
-        var currentUrl = urlString
         var lastError = "Download failed"
 
-        // Try multiple URL variations (with/without download=true, raw URLs).
         val urlsToTry = listOf(
-            currentUrl,
-            currentUrl.replace("?download=true", ""),
-            currentUrl.replace("blob/", "resolve/")
+            urlString,
+            urlString.replace("?download=true", ""),
+            urlString.replace("blob/", "resolve/")
         ).distinct()
 
         for (url in urlsToTry) {
@@ -232,14 +220,13 @@ object ModelDownloader {
                     onProgress(receivedBytes, totalBytes)
                 }
 
-                // Validate the downloaded file.
                 if (isLikelyHtml(dest)) {
                     dest.delete()
                     lastError = "Download returned HTML instead of model data"
                     continue
                 }
 
-                return // success
+                return
             } catch (e: Exception) {
                 lastError = e.message ?: "Unknown error"
                 dest.delete()
