@@ -6,13 +6,73 @@ use metal::{
     Buffer, CommandQueue, ComputePipelineState, Device, Library, MTLResourceOptions,
 };
 #[cfg(any(target_os = "macos", target_os = "ios"))]
+use objc::{msg_send, sel, sel_impl};
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 use objc::rc::autoreleasepool;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use std::sync::Mutex;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use std::hash::{Hash, Hasher};
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use std::collections::hash_map::DefaultHasher;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use std::fs;
 
 // Compiled Metal library cache — compiled once per process lifetime.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 static KV_CACHE_LIB_CACHE: Mutex<Option<Library>> = Mutex::new(None);
+
+/// Load a compiled .metallib from disk, or compile from source and cache it.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn load_or_compile_metallib(
+    device: &Device,
+    source: &str,
+    fast_math: bool,
+    cache_name: &str,
+) -> Result<Library, CoreError> {
+    let mut hasher = DefaultHasher::new();
+    source.hash(&mut hasher);
+    fast_math.hash(&mut hasher);
+    let hash = format!("{:016x}", hasher.finish());
+
+    let cache_dir = std::env::var_os("HOME")
+        .map(|h| std::path::PathBuf::from(h).join(".cache/cellm/shaders"))
+        .unwrap_or_else(|| std::env::temp_dir().join("cellm_shaders"));
+    let cache_path = cache_dir.join(format!("{}_{}.metallib", cache_name, hash));
+
+    if cache_path.exists() {
+        match device.new_library_with_file(&cache_path) {
+            Ok(lib) => return Ok(lib),
+            Err(e) => {
+                eprintln!("cellm: warning: failed to load cached metallib, recompiling: {}", e);
+                let _ = fs::remove_file(&cache_path);
+            }
+        }
+    }
+
+    let options = metal::CompileOptions::new();
+    options.set_fast_math_enabled(fast_math);
+    let lib = device
+        .new_library_with_source(source, &options)
+        .map_err(|e| CoreError::Backend(format!("kv cache metal storage: compile failed: {e:?}")))?;
+
+    let _ = fs::create_dir_all(&cache_dir);
+    let url_str = format!("file://{}", cache_path.to_str().unwrap_or(""));
+    let url = metal::URL::new_with_string(&url_str);
+    unsafe {
+        use objc::runtime::Object;
+        let mut err: *mut Object = std::ptr::null_mut();
+        let _result: bool = msg_send![&*lib, serializeToURL: &*url error: &mut err];
+        if !err.is_null() {
+            let desc: *mut Object = msg_send![err, localizedDescription];
+            let cstr: *const std::ffi::c_char = msg_send![desc, UTF8String];
+            let msg = std::ffi::CStr::from_ptr(cstr).to_string_lossy();
+            eprintln!("cellm: warning: failed to serialize metallib to cache: {}", msg);
+        }
+    }
+
+    Ok(lib)
+}
 
 use crate::BlockAllocator;
 
@@ -1649,12 +1709,9 @@ impl MetalKvStorage {
         let lib = {
             let mut guard = KV_CACHE_LIB_CACHE.lock().unwrap();
             if guard.is_none() {
-                let options = metal::CompileOptions::new();
-                options.set_fast_math_enabled(false);
                 *guard = Some(
-                    device
-                        .new_library_with_source(src, &options)
-                        .map_err(|e| CoreError::Backend(format!("kv cache metal storage: compile failed: {e:?}")))?
+                    load_or_compile_metallib(&device, src, false, "cellm_cache")
+                        .map_err(|e| CoreError::Backend(format!("kv cache metal storage: {e:?}")))?
                 );
             }
             guard.as_ref().unwrap().clone()
@@ -2965,6 +3022,10 @@ impl KVCache {
 
     pub fn allocator(&self) -> &BlockAllocator {
         &self.allocator
+    }
+
+    pub fn max_seq_len(&self) -> usize {
+        self.layout.total_blocks * self.layout.tokens_per_block
     }
 
     pub fn view_mut(&mut self) -> KvCacheView<'_> {

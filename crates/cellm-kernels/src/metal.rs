@@ -2,9 +2,17 @@
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use metal::*;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
+use objc::{msg_send, sel, sel_impl};
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 use objc::rc::autoreleasepool;
 use std::sync::Mutex;
 use std::collections::HashMap;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use std::hash::{Hash, Hasher};
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use std::collections::hash_map::DefaultHasher;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use std::fs;
 
 // Compiled Metal library cache — MSL is compiled once per process so iOS cold-launches
 // don't pay the compile cost on every app restart after a cache eviction.
@@ -14,6 +22,62 @@ static ELEM_OPS_LIB_CACHE: Mutex<Option<Library>> = Mutex::new(None);
 // PSO cache to avoid recompiling shaders on every MetalOps::create()
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 static PSO_CACHE: Mutex<Option<HashMap<String, ComputePipelineState>>> = Mutex::new(None);
+
+/// Load a compiled .metallib from disk, or compile from source and cache it.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn load_or_compile_metallib(
+    device: &Device,
+    source: &str,
+    fast_math: bool,
+    cache_name: &str,
+) -> anyhow::Result<Library> {
+    // Hash source + options to form a versioned filename
+    let mut hasher = DefaultHasher::new();
+    source.hash(&mut hasher);
+    fast_math.hash(&mut hasher);
+    let hash = format!("{:016x}", hasher.finish());
+
+    let cache_dir = std::env::var_os("HOME")
+        .map(|h| std::path::PathBuf::from(h).join(".cache/cellm/shaders"))
+        .unwrap_or_else(|| std::env::temp_dir().join("cellm_shaders"));
+    let cache_path = cache_dir.join(format!("{}_{}.metallib", cache_name, hash));
+
+    // Try loading pre-compiled library
+    if cache_path.exists() {
+        match device.new_library_with_file(&cache_path) {
+            Ok(lib) => return Ok(lib),
+            Err(e) => {
+                eprintln!("cellm: warning: failed to load cached metallib, recompiling: {}", e);
+                let _ = fs::remove_file(&cache_path);
+            }
+        }
+    }
+
+    // Compile from source
+    let options = metal::CompileOptions::new();
+    options.set_fast_math_enabled(fast_math);
+    let lib = device
+        .new_library_with_source(source, &options)
+        .map_err(|e| anyhow::anyhow!("Compile failed: {e:?}"))?;
+
+    // Serialize to disk
+    let _ = fs::create_dir_all(&cache_dir);
+    let url_str = format!("file://{}", cache_path.to_str().unwrap_or(""));
+    let url = metal::URL::new_with_string(&url_str);
+    unsafe {
+        use objc::runtime::Object;
+        let mut err: *mut Object = std::ptr::null_mut();
+        let _result: bool = msg_send![&*lib, serializeToURL: &*url error: &mut err];
+        if !err.is_null() {
+            let desc: *mut Object = msg_send![err, localizedDescription];
+            let cstr: *const std::ffi::c_char = msg_send![desc, UTF8String];
+            let msg = std::ffi::CStr::from_ptr(cstr).to_string_lossy();
+            eprintln!("cellm: warning: failed to serialize metallib to cache: {}", msg);
+        }
+    }
+
+    Ok(lib)
+}
 
 pub struct MetalKernels;
 
@@ -736,6 +800,254 @@ kernel void mv_f32(
     o[gid] = acc;
 }
 
+kernel void attention_gqa_f32(
+    device const float* q         [[buffer(0)]],
+    device const float* k         [[buffer(1)]],
+    device const float* v         [[buffer(2)]],
+    device       float* out       [[buffer(3)]],
+    constant     uint&  n_heads   [[buffer(4)]],
+    constant     uint&  n_kv_heads[[buffer(5)]],
+    constant     uint&  head_dim  [[buffer(6)]],
+    constant     uint&  seq_len   [[buffer(7)]],
+    constant     float& scale     [[buffer(8)]],
+    constant     float& soft_cap  [[buffer(9)]],
+    constant     uint&  kv_stride [[buffer(10)]],
+    uint gid                      [[thread_position_in_grid]]
+) {
+    if (gid >= n_heads) return;
+
+    uint group_size = max(n_heads / n_kv_heads, 1u);
+    uint kv_h = gid / group_size;
+
+    device const float* qh = q + gid * head_dim;
+    device       float* oh = out + gid * head_dim;
+
+    for (uint i = 0; i < head_dim; i++) {
+        oh[i] = 0.0f;
+    }
+
+    if (seq_len == 0) return;
+
+    // Compute max score for numerical stability
+    float max_score = -INFINITY;
+    for (uint t = 0; t < seq_len; t++) {
+        device const float* kt = k + t * kv_stride + kv_h * head_dim;
+        float dot = 0.0f;
+        for (uint i = 0; i < head_dim; i++) {
+            dot += qh[i] * kt[i];
+        }
+        float score = dot * scale;
+        if (soft_cap > 0.0f) {
+            score = tanh(score / soft_cap) * soft_cap;
+        }
+        if (score > max_score) {
+            max_score = score;
+        }
+    }
+
+    // Compute softmax weights and weighted sum of V
+    float sum = 0.0f;
+    for (uint t = 0; t < seq_len; t++) {
+        device const float* kt = k + t * kv_stride + kv_h * head_dim;
+        float dot = 0.0f;
+        for (uint i = 0; i < head_dim; i++) {
+            dot += qh[i] * kt[i];
+        }
+        float score = dot * scale;
+        if (soft_cap > 0.0f) {
+            score = tanh(score / soft_cap) * soft_cap;
+        }
+        float w = exp(score - max_score);
+        sum += w;
+
+        device const float* vt = v + t * kv_stride + kv_h * head_dim;
+        for (uint i = 0; i < head_dim; i++) {
+            oh[i] += w * vt[i];
+        }
+    }
+
+    // Normalize
+    for (uint i = 0; i < head_dim; i++) {
+        oh[i] /= sum;
+    }
+}
+
+// Threadgroup-parallel decode attention: 128 threads per head cooperate
+// to parallelize over sequence tokens.  Uses shared-memory reductions
+// for softmax and for accumulating weighted V sums dimension-by-dimension.
+kernel void attention_gqa_f32_fast(
+    device const float* q         [[buffer(0)]],
+    device const float* k         [[buffer(1)]],
+    device const float* v         [[buffer(2)]],
+    device       float* out       [[buffer(3)]],
+    constant     uint&  n_heads   [[buffer(4)]],
+    constant     uint&  n_kv_heads[[buffer(5)]],
+    constant     uint&  head_dim  [[buffer(6)]],
+    constant     uint&  seq_len   [[buffer(7)]],
+    constant     float& scale     [[buffer(8)]],
+    constant     float& soft_cap  [[buffer(9)]],
+    constant     uint&  kv_stride [[buffer(10)]],
+    uint         tid    [[thread_index_in_threadgroup]],
+    uint         gid    [[threadgroup_position_in_grid]],
+    uint         tgsize [[threads_per_threadgroup]]
+) {
+    uint head = gid;
+    uint group_size = max(n_heads / n_kv_heads, 1u);
+    uint kv_h = head / group_size;
+
+    uint n_threads = tgsize;
+    uint thread_id = tid;
+
+    device const float* qh = q + head * head_dim;
+    device       float* oh = out + head * head_dim;
+
+    if (seq_len == 0) return;
+
+    // Divide sequence across threads in the group.
+    uint tokens_per_thread = (seq_len + n_threads - 1) / n_threads;
+    uint start_t = thread_id * tokens_per_thread;
+    uint end_t   = min(start_t + tokens_per_thread, seq_len);
+
+    // ---- Phase 1: local max score ----
+    float local_max = -INFINITY;
+    for (uint t = start_t; t < end_t; t++) {
+        device const float* kt = k + t * kv_stride + kv_h * head_dim;
+        float dp = 0.0f;
+        uint i = 0;
+        for (; i + 3 < head_dim; i += 4) {
+            float4 qv = float4(qh[i], qh[i+1], qh[i+2], qh[i+3]);
+            float4 kv = float4(kt[i], kt[i+1], kt[i+2], kt[i+3]);
+            dp += dot(qv, kv);
+        }
+        for (; i < head_dim; i++) {
+            dp += qh[i] * kt[i];
+        }
+        float score = dp * scale;
+        if (soft_cap > 0.0f) {
+            score = tanh(score / soft_cap) * soft_cap;
+        }
+        local_max = max(local_max, score);
+    }
+
+    // Reduce max across threadgroup
+    threadgroup float shared[128];
+    shared[thread_id] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (thread_id == 0) {
+        float m = shared[0];
+        for (uint i = 1; i < n_threads; i++) {
+            m = max(m, shared[i]);
+        }
+        shared[0] = m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float global_max = shared[0];
+
+    // ---- Phase 2: local sum of exponentials ----
+    float local_sum = 0.0f;
+    for (uint t = start_t; t < end_t; t++) {
+        device const float* kt = k + t * kv_stride + kv_h * head_dim;
+        float dp = 0.0f;
+        uint i = 0;
+        for (; i + 3 < head_dim; i += 4) {
+            float4 qv = float4(qh[i], qh[i+1], qh[i+2], qh[i+3]);
+            float4 kv = float4(kt[i], kt[i+1], kt[i+2], kt[i+3]);
+            dp += dot(qv, kv);
+        }
+        for (; i < head_dim; i++) {
+            dp += qh[i] * kt[i];
+        }
+        float score = dp * scale;
+        if (soft_cap > 0.0f) {
+            score = tanh(score / soft_cap) * soft_cap;
+        }
+        local_sum += exp(score - global_max);
+    }
+
+    // Reduce sum across threadgroup
+    shared[thread_id] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (thread_id == 0) {
+        float s = 0.0f;
+        for (uint i = 0; i < n_threads; i++) {
+            s += shared[i];
+        }
+        shared[0] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float global_sum = shared[0];
+
+    // ---- Phase 3: weighted V sum, reduced per dimension ----
+    // We tile over head_dim to keep shared memory small (TILE * n_threads).
+    const uint TILE = 32;
+    threadgroup float tg_partial[TILE][128];
+
+    for (uint d_base = 0; d_base < head_dim; d_base += TILE) {
+        uint d_end = min(d_base + TILE, head_dim);
+        uint tile_count = d_end - d_base;
+
+        // Local partials for this tile
+        float local_partials[TILE];
+        for (uint i = 0; i < tile_count; i++) {
+            local_partials[i] = 0.0f;
+        }
+
+        for (uint t = start_t; t < end_t; t++) {
+            // Recompute weight for this token
+            device const float* kt = k + t * kv_stride + kv_h * head_dim;
+            float dp = 0.0f;
+            uint i = 0;
+            for (; i + 3 < head_dim; i += 4) {
+                float4 qv = float4(qh[i], qh[i+1], qh[i+2], qh[i+3]);
+                float4 kv = float4(kt[i], kt[i+1], kt[i+2], kt[i+3]);
+                dp += dot(qv, kv);
+            }
+            for (; i < head_dim; i++) {
+                dp += qh[i] * kt[i];
+            }
+            float score = dp * scale;
+            if (soft_cap > 0.0f) {
+                score = tanh(score / soft_cap) * soft_cap;
+            }
+            float w = exp(score - global_max);
+
+            device const float* vt = v + t * kv_stride + kv_h * head_dim;
+            for (uint i = 0; i < tile_count; i++) {
+                local_partials[i] += w * vt[d_base + i];
+            }
+        }
+
+        // Store partials in threadgroup memory
+        for (uint i = 0; i < tile_count; i++) {
+            tg_partial[i][thread_id] = local_partials[i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Thread 0 reduces and normalizes this tile
+        if (thread_id == 0) {
+            for (uint i = 0; i < tile_count; i++) {
+                float acc = 0.0f;
+                for (uint j = 0; j < n_threads; j++) {
+                    acc += tg_partial[i][j];
+                }
+                oh[d_base + i] = acc / global_sum;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+kernel void scatter_f32(
+    device const float* src [[buffer(0)]],
+    device       float* dst [[buffer(1)]],
+    constant     uint&  offset [[buffer(2)]],
+    constant     uint&  n      [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid < n) {
+        dst[offset + gid] = src[gid];
+    }
+}
 "#;
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -759,12 +1071,18 @@ pub struct MetalOps {
     pub pso_mv_q1: ComputePipelineState,
     pub pso_lfm_conv: ComputePipelineState,
     pub pso_mv_f32: ComputePipelineState,
+    pub pso_attention_gqa: ComputePipelineState,
+    pub pso_attention_gqa_fast: ComputePipelineState,
+    pub pso_scatter_f32: ComputePipelineState,
 
     x_buf: Mutex<Option<Buffer>>,
     out_buf: Mutex<Option<Buffer>>,
     tensor_cache: Mutex<HashMap<String, Buffer>>,
     /// Named scratch buffers for batched execution (kept on GPU between ops)
     named_bufs: Mutex<HashMap<String, Buffer>>,
+
+    /// Per-layer persistent KV cache buffers (k, v) — max 128 layers.
+    kv_cache_bufs: Mutex<Vec<(Option<Buffer>, Option<Buffer>)>>,
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -790,10 +1108,14 @@ impl Clone for MetalOps {
             pso_mv_q1: self.pso_mv_q1.clone(),
             pso_lfm_conv: self.pso_lfm_conv.clone(),
             pso_mv_f32: self.pso_mv_f32.clone(),
+            pso_attention_gqa: self.pso_attention_gqa.clone(),
+            pso_attention_gqa_fast: self.pso_attention_gqa_fast.clone(),
+            pso_scatter_f32: self.pso_scatter_f32.clone(),
             x_buf: Mutex::new(None),
             out_buf: Mutex::new(None),
             tensor_cache: Mutex::new(HashMap::new()),
             named_bufs: Mutex::new(HashMap::new()),
+            kv_cache_bufs: Mutex::new(Vec::new()),
         }
     }
 }
@@ -816,12 +1138,9 @@ impl MetalOps {
         let lib = {
             let mut guard = ELEM_OPS_LIB_CACHE.lock().unwrap();
             if guard.is_none() {
-                let options = metal::CompileOptions::new();
-                options.set_fast_math_enabled(false);
                 *guard = Some(
-                    device
-                        .new_library_with_source(ELEM_OPS_SHADER, &options)
-                        .map_err(|e| anyhow::anyhow!("Compile failed: {e:?}"))?
+                    load_or_compile_metallib(&device, ELEM_OPS_SHADER, false, "cellm_kernels")
+                        .map_err(|e| anyhow::anyhow!("Kernel library failed: {e:?}"))?
                 );
             }
             guard.as_ref().unwrap().clone()
@@ -843,20 +1162,66 @@ impl MetalOps {
         let pso_mv_q1 = build_pso_ops(&device, &lib, "mv_q1_0_g128")?;
         let pso_lfm_conv = build_pso_ops(&device, &lib, "lfm_conv")?;
         let pso_mv_f32 = build_pso_ops(&device, &lib, "mv_f32")?;
+        let pso_attention_gqa = build_pso_ops(&device, &lib, "attention_gqa_f32")?;
+        let pso_attention_gqa_fast = build_pso_ops(&device, &lib, "attention_gqa_f32_fast")?;
+        let pso_scatter_f32 = build_pso_ops(&device, &lib, "scatter_f32")?;
 
         Ok(Self {
             device, queue, _lib: lib.clone(),
             pso_rms_norm, pso_rope_adj, pso_rope_half, pso_mv_f16, pso_mv_i8, pso_mv_i4, pso_mv_qkv_f16, pso_mv_qkv_i8, pso_mv2_f16, pso_mv2_i8,
-            pso_add_f32, pso_silu_mul_f32, pso_gelu_mul_f32, pso_mv_q1, pso_lfm_conv, pso_mv_f32,
+            pso_add_f32, pso_silu_mul_f32, pso_gelu_mul_f32, pso_mv_q1, pso_lfm_conv, pso_mv_f32, pso_attention_gqa, pso_attention_gqa_fast, pso_scatter_f32,
             x_buf: Mutex::new(None), out_buf: Mutex::new(None),
             tensor_cache: Mutex::new(HashMap::new()),
             named_bufs: Mutex::new(HashMap::new()),
+            kv_cache_bufs: Mutex::new(Vec::with_capacity(128)),
         })
     }
 
     // Named GPU buffer management
     // These let the LFM runner keep data on GPU between operations,
     // eliminating per-op CPU↔GPU copies.
+
+    /// Ensure per-layer persistent KV cache buffers exist.
+    /// `kv_dim` is floats per token, `max_tokens` is max sequence length.
+    pub fn ensure_layer_kv_cache(&self, layer: usize, kv_dim: usize, max_tokens: usize) -> anyhow::Result<()> {
+        let mut caches = self.kv_cache_bufs.lock().unwrap();
+        if caches.len() <= layer {
+            caches.resize_with(layer + 1, || (None, None));
+        }
+        let bytes = (kv_dim * max_tokens * 4) as u64;
+        if caches[layer].0.is_none() || caches[layer].0.as_ref().unwrap().length() < bytes {
+            caches[layer].0 = Some(self.device.new_buffer(bytes, MTLResourceOptions::StorageModeShared));
+        }
+        if caches[layer].1.is_none() || caches[layer].1.as_ref().unwrap().length() < bytes {
+            caches[layer].1 = Some(self.device.new_buffer(bytes, MTLResourceOptions::StorageModeShared));
+        }
+        Ok(())
+    }
+
+    /// Write a single token's K and V into the persistent GPU cache at position `pos`.
+    /// Buffers store f32 (4 bytes/elem) to match the attention kernel's expected format.
+    pub fn write_kv_token(&self, layer: usize, pos: usize, kv_dim: usize, k_token: &[f32], v_token: &[f32]) -> anyhow::Result<()> {
+        let caches = self.kv_cache_bufs.lock().unwrap();
+        let entry = caches.get(layer).ok_or_else(|| anyhow::anyhow!("KV cache not initialized for layer {}", layer))?;
+        let kbuf: &Buffer = entry.0.as_ref().ok_or_else(|| anyhow::anyhow!("KV cache K not initialized for layer {}", layer))?;
+        let vbuf: &Buffer = entry.1.as_ref().ok_or_else(|| anyhow::anyhow!("KV cache V not initialized for layer {}", layer))?;
+        assert_eq!(k_token.len(), kv_dim);
+        assert_eq!(v_token.len(), kv_dim);
+        unsafe {
+            let k_dst = (kbuf.contents() as *mut f32).add(pos * kv_dim);
+            std::ptr::copy_nonoverlapping(k_token.as_ptr(), k_dst, kv_dim);
+            let v_dst = (vbuf.contents() as *mut f32).add(pos * kv_dim);
+            std::ptr::copy_nonoverlapping(v_token.as_ptr(), v_dst, kv_dim);
+        }
+        // On shared/managed memory, no explicit commit needed for CPU writes to be visible to GPU
+        Ok(())
+    }
+
+    pub fn get_kv_cache_buffers(&self, layer: usize) -> Option<(Buffer, Buffer)> {
+        let caches = self.kv_cache_bufs.lock().unwrap();
+        let (k_opt, v_opt) = caches.get(layer)?.clone();
+        Some((k_opt?, v_opt?))
+    }
 
     /// Ensure a named GPU buffer exists with at least `elems` f32 capacity.
     pub fn ensure_named_buf(&self, name: &str, elems: usize) -> anyhow::Result<()> {
@@ -907,6 +1272,39 @@ impl MetalOps {
             cache.insert(key.to_string(), upload_f32(&self.device, data)?);
         }
         Ok(cache.get(key).unwrap().clone())
+    }
+
+    /// Cache an i8 weight buffer if not already cached, return the buffer.
+    pub fn ensure_tensor_cached_i8(&self, key: &str, data: &[i8]) -> anyhow::Result<Buffer> {
+        let mut cache = self.tensor_cache.lock().unwrap();
+        if !cache.contains_key(key) {
+            cache.insert(key.to_string(), upload_i8(&self.device, data)?);
+        }
+        Ok(cache.get(key).unwrap().clone())
+    }
+
+    /// Retrieve a cloned buffer reference from the tensor cache if present.
+    pub fn get_cached_tensor(&self, key: &str) -> Option<Buffer> {
+        self.tensor_cache.lock().unwrap().get(key).cloned()
+    }
+
+    /// Cache an i4 weight buffer (u8 packed nibbles) and its f16 scales if not already cached.
+    pub fn ensure_tensor_cached_i4(&self, w_key: &str, w_u8: &[u8], s_key: &str, s_f16: &[u16]) -> anyhow::Result<(Buffer, Buffer)> {
+        {
+            let mut cache = self.tensor_cache.lock().unwrap();
+            if !cache.contains_key(w_key) {
+                cache.insert(w_key.to_string(), upload_i8(&self.device, unsafe {
+                    std::slice::from_raw_parts(w_u8.as_ptr() as *const i8, w_u8.len())
+                })?);
+            }
+            if !cache.contains_key(s_key) {
+                cache.insert(s_key.to_string(), upload_u16(&self.device, s_f16)?);
+            }
+        }
+        let cache = self.tensor_cache.lock().unwrap();
+        let w = cache.get(w_key).unwrap().clone();
+        let s = cache.get(s_key).unwrap().clone();
+        Ok((w, s))
     }
 
     /// Run a batch of pre-encoded operations in a single command buffer.
@@ -1241,6 +1639,19 @@ impl MetalOps {
         enc.dispatch_threads(MTLSize { width: n as u64, height: 1, depth: 1 }, MTLSize { width: w.min(n as u64), height: 1, depth: 1 });
     }
 
+    pub fn encode_scatter_f32(&self, enc: &metal::ComputeCommandEncoderRef, src: &metal::BufferRef, dst: &metal::BufferRef, offset: usize, n: usize) {
+        let off = offset as u32;
+        let n32 = n as u32;
+        enc.set_compute_pipeline_state(&self.pso_scatter_f32);
+        enc.set_buffer(0, Some(src), 0);
+        enc.set_buffer(1, Some(dst), 0);
+        enc.set_bytes(2, 4, (&off as *const u32).cast());
+        enc.set_bytes(3, 4, (&n32 as *const u32).cast());
+        let threads = n as u64;
+        let w = self.pso_scatter_f32.thread_execution_width() as u64;
+        enc.dispatch_threads(MTLSize { width: threads, height: 1, depth: 1 }, MTLSize { width: w.min(threads), height: 1, depth: 1 });
+    }
+
     pub fn encode_silu_mul_f32_inplace(&self, enc: &metal::ComputeCommandEncoderRef, a: &metal::BufferRef, b: &metal::BufferRef, n: usize) {
         let n32 = n as u32;
         enc.set_compute_pipeline_state(&self.pso_silu_mul_f32);
@@ -1415,6 +1826,45 @@ impl MetalOps {
         enc.dispatch_threads(MTLSize { width: rows as u64, height: 1, depth: 1 }, MTLSize { width: w_size, height: 1, depth: 1 });
     }
 
+    pub fn encode_attention_gqa_f32(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        q: &Buffer,
+        k: &Buffer,
+        v: &Buffer,
+        out: &Buffer,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        seq_len: usize,
+        scale: f32,
+        soft_cap: f32,
+        kv_stride: usize,
+    ) {
+        let nh = n_heads as u32;
+        let nkv = n_kv_heads as u32;
+        let hd = head_dim as u32;
+        let sl = seq_len as u32;
+        let sc = scale as f32;
+        let cap = soft_cap as f32;
+        let ks = kv_stride as u32;
+        enc.set_compute_pipeline_state(&self.pso_attention_gqa_fast);
+        enc.set_buffer(0, Some(q), 0);
+        enc.set_buffer(1, Some(k), 0);
+        enc.set_buffer(2, Some(v), 0);
+        enc.set_buffer(3, Some(out), 0);
+        enc.set_bytes(4, 4, (&nh as *const u32).cast());
+        enc.set_bytes(5, 4, (&nkv as *const u32).cast());
+        enc.set_bytes(6, 4, (&hd as *const u32).cast());
+        enc.set_bytes(7, 4, (&sl as *const u32).cast());
+        enc.set_bytes(8, 4, (&sc as *const f32).cast());
+        enc.set_bytes(9, 4, (&cap as *const f32).cast());
+        enc.set_bytes(10, 4, (&ks as *const u32).cast());
+        enc.dispatch_thread_groups(
+            MTLSize { width: n_heads as u64, height: 1, depth: 1 },
+            MTLSize { width: 128, height: 1, depth: 1 },
+        );
+    }
 
     pub fn encode_lfm_conv(
         &self,
@@ -1490,12 +1940,807 @@ impl MetalOps {
         });
         read_f32(ob, out)
     }
+
+    /// Run GQA attention on GPU followed by i4 o_proj matmul, all in one command buffer.
+    /// q: [n_heads, head_dim] f32
+    /// k/v: [seq_len, kv_stride] f32 (gathered from KV cache, may be padded)
+    /// o_proj: i4 weight [hidden, q_dim]
+    pub fn attention_and_proj_i4(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        seq_len: usize,
+        kv_stride: usize,
+        attn_scale: f32,
+        soft_cap: f32,
+        o_proj_w: &[u8],
+        o_proj_s: &[u16],
+        o_proj_out_dim: usize,
+        o_proj_in_dim: usize,
+        o_proj_key: &str,
+        out: &mut [f32],
+    ) -> anyhow::Result<()> {
+        let q_dim = n_heads * head_dim;
+        assert_eq!(q.len(), q_dim);
+        assert!(k.len() >= seq_len * kv_stride, "k.len={} < seq_len*kv_stride={}", k.len(), seq_len * kv_stride);
+        assert!(v.len() >= seq_len * kv_stride, "v.len={} < seq_len*kv_stride={}", v.len(), seq_len * kv_stride);
+        assert_eq!(out.len(), o_proj_out_dim);
+
+        // 1. Cache o_proj weight.
+        let w_key = format!("attn.o_proj.w.{}", o_proj_key);
+        let s_key = format!("attn.o_proj.s.{}", o_proj_key);
+        {
+            let mut cache = self.tensor_cache.lock().unwrap();
+            if !cache.contains_key(&w_key) {
+                cache.insert(w_key.clone(), upload_i8(&self.device, unsafe {
+                    std::slice::from_raw_parts(o_proj_w.as_ptr() as *const i8, o_proj_w.len())
+                })?);
+            }
+            if !cache.contains_key(&s_key) {
+                cache.insert(s_key.clone(), upload_u16(&self.device, o_proj_s)?);
+            }
+        }
+
+        // 2. Ensure named buffers.
+        self.ensure_named_buf("attn_q", q_dim)?;
+        self.ensure_named_buf("attn_k", k.len())?;
+        self.ensure_named_buf("attn_v", v.len())?;
+        self.ensure_named_buf("attn_out", q_dim)?;
+        self.ensure_named_buf("attn_proj_out", o_proj_out_dim)?;
+
+        // 3. Upload Q/K/V.
+        self.write_named_buf("attn_q", q)?;
+        self.write_named_buf("attn_k", k)?;
+        self.write_named_buf("attn_v", v)?;
+
+        // 4. Get buffer handles.
+        let cache = self.tensor_cache.lock().unwrap();
+        let o_proj_wb = cache.get(&w_key).unwrap().clone();
+        let o_proj_sb = cache.get(&s_key).unwrap().clone();
+        drop(cache);
+
+        let q_buf = self.get_named_buf("attn_q")?;
+        let k_buf = self.get_named_buf("attn_k")?;
+        let v_buf = self.get_named_buf("attn_v")?;
+        let attn_out_buf = self.get_named_buf("attn_out")?;
+        let proj_out_buf = self.get_named_buf("attn_proj_out")?;
+
+        // 5. Encode attention + o_proj in one command buffer.
+        self.run_batch(|enc| {
+            self.encode_attention_gqa_f32(
+                enc, &q_buf, &k_buf, &v_buf, &attn_out_buf,
+                n_heads, n_kv_heads, head_dim, seq_len,
+                attn_scale, soft_cap, kv_stride,
+            );
+            self.encode_mv_i4(
+                enc, &o_proj_wb, &o_proj_sb, &attn_out_buf, &proj_out_buf,
+                o_proj_out_dim, o_proj_in_dim, o_proj_in_dim,
+            );
+            Ok(())
+        })?;
+
+        // 6. Read back.
+        self.read_named_buf("attn_proj_out", out)?;
+        Ok(())
+    }
+
+    /// Decode-step helper: QKV i4 projections + per-head Q/K norms + RoPE in one command buffer.
+    /// Q stays resident on GPU in named buffer "attn_block_q".
+    /// K and V are downloaded to `new_k` / `new_v` so the caller can write them to the CPU KV cache.
+    pub fn project_qkv_norm_rope_i4(
+        &self,
+        x_norm: &[f32],
+        q_w: &[u8],
+        q_s: &[u16],
+        q_dim: usize,
+        q_key: &str,
+        k_w: &[u8],
+        k_s: &[u16],
+        k_dim: usize,
+        k_key: &str,
+        v_w: &[u8],
+        v_s: &[u16],
+        v_dim: usize,
+        v_key: &str,
+        hidden: usize,
+        q_norm_w: Option<&[u16]>,
+        k_norm_w: Option<&[u16]>,
+        rope_theta: f32,
+        pos: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        kv_head_dim: usize,
+        new_k: &mut [f32],
+        new_v: &mut [f32],
+    ) -> anyhow::Result<()> {
+        assert_eq!(x_norm.len(), hidden);
+        assert_eq!(new_k.len(), k_dim);
+        assert_eq!(new_v.len(), v_dim);
+
+        let q_w_key = format!("attn.q.w.{}", q_key);
+        let q_s_key = format!("attn.q.s.{}", q_key);
+        let k_w_key = format!("attn.k.w.{}", k_key);
+        let k_s_key = format!("attn.k.s.{}", k_key);
+        let v_w_key = format!("attn.v.w.{}", v_key);
+        let v_s_key = format!("attn.v.s.{}", v_key);
+
+        {
+            let mut cache = self.tensor_cache.lock().unwrap();
+            if !cache.contains_key(&q_w_key) {
+                cache.insert(q_w_key.clone(), upload_i8(&self.device, unsafe {
+                    std::slice::from_raw_parts(q_w.as_ptr() as *const i8, q_w.len())
+                })?);
+            }
+            if !cache.contains_key(&q_s_key) {
+                cache.insert(q_s_key.clone(), upload_u16(&self.device, q_s)?);
+            }
+            if !cache.contains_key(&k_w_key) {
+                cache.insert(k_w_key.clone(), upload_i8(&self.device, unsafe {
+                    std::slice::from_raw_parts(k_w.as_ptr() as *const i8, k_w.len())
+                })?);
+            }
+            if !cache.contains_key(&k_s_key) {
+                cache.insert(k_s_key.clone(), upload_u16(&self.device, k_s)?);
+            }
+            if !cache.contains_key(&v_w_key) {
+                cache.insert(v_w_key.clone(), upload_i8(&self.device, unsafe {
+                    std::slice::from_raw_parts(v_w.as_ptr() as *const i8, v_w.len())
+                })?);
+            }
+            if !cache.contains_key(&v_s_key) {
+                cache.insert(v_s_key.clone(), upload_u16(&self.device, v_s)?);
+            }
+        }
+
+        let q_norm_key = q_norm_w.map(|_| format!("attn.q_norm.w.{}", q_key));
+        let k_norm_key = k_norm_w.map(|_| format!("attn.k_norm.w.{}", k_key));
+        if let Some(w) = q_norm_w {
+            let key = format!("attn.q_norm.w.{}", q_key);
+            let mut cache = self.tensor_cache.lock().unwrap();
+            if !cache.contains_key(&key) {
+                cache.insert(key.clone(), upload_u16(&self.device, w)?);
+            }
+        }
+        if let Some(w) = k_norm_w {
+            let key = format!("attn.k_norm.w.{}", k_key);
+            let mut cache = self.tensor_cache.lock().unwrap();
+            if !cache.contains_key(&key) {
+                cache.insert(key.clone(), upload_u16(&self.device, w)?);
+            }
+        }
+
+        self.ensure_named_buf("attn_block_x", hidden)?;
+        self.ensure_named_buf("attn_block_q", q_dim)?;
+        self.ensure_named_buf("attn_block_k", k_dim)?;
+        self.ensure_named_buf("attn_block_v", v_dim)?;
+
+        self.write_named_buf("attn_block_x", x_norm)?;
+
+        let cache = self.tensor_cache.lock().unwrap();
+        let q_wb = cache.get(&q_w_key).unwrap().clone();
+        let q_sb = cache.get(&q_s_key).unwrap().clone();
+        let k_wb = cache.get(&k_w_key).unwrap().clone();
+        let k_sb = cache.get(&k_s_key).unwrap().clone();
+        let v_wb = cache.get(&v_w_key).unwrap().clone();
+        let v_sb = cache.get(&v_s_key).unwrap().clone();
+        let q_norm_wb = q_norm_key.as_ref().and_then(|k| cache.get(k).cloned());
+        let k_norm_wb = k_norm_key.as_ref().and_then(|k| cache.get(k).cloned());
+        drop(cache);
+
+        let x_buf = self.get_named_buf("attn_block_x")?;
+        let q_buf = self.get_named_buf("attn_block_q")?;
+        let k_buf = self.get_named_buf("attn_block_k")?;
+        let v_buf = self.get_named_buf("attn_block_v")?;
+
+        self.run_batch(|enc| {
+            self.encode_mv_i4(enc, &q_wb, &q_sb, &x_buf, &q_buf, q_dim, hidden, hidden);
+            self.encode_mv_i4(enc, &k_wb, &k_sb, &x_buf, &k_buf, k_dim, hidden, hidden);
+            self.encode_mv_i4(enc, &v_wb, &v_sb, &x_buf, &v_buf, v_dim, hidden, hidden);
+
+            if let Some(ref qw) = q_norm_wb {
+                for hidx in 0..n_heads {
+                    let off = (hidx * head_dim * 4) as u64;
+                    self.encode_rms_norm_f16w_at(enc, &q_buf, off, qw, 0, &q_buf, off, head_dim, 1e-6, false);
+                }
+            }
+            if let Some(ref kw) = k_norm_wb {
+                for hidx in 0..n_kv_heads {
+                    let off = (hidx * kv_head_dim * 4) as u64;
+                    self.encode_rms_norm_f16w_at(enc, &k_buf, off, kw, 0, &k_buf, off, kv_head_dim, 1e-6, false);
+                }
+            }
+
+            self.encode_rope_half_f32(enc, &q_buf, n_heads, head_dim, head_dim, pos, rope_theta);
+            self.encode_rope_half_f32(enc, &k_buf, n_kv_heads, kv_head_dim, kv_head_dim, pos, rope_theta);
+            Ok(())
+        })?;
+
+        self.read_named_buf("attn_block_k", new_k)?;
+        self.read_named_buf("attn_block_v", new_v)?;
+        Ok(())
+    }
+
+    /// Attention + o_proj where Q is already resident on GPU (e.g. from `project_qkv_norm_rope_i4`).
+    /// K/V sequences are uploaded from CPU buffers gathered from the KV cache.
+    pub fn attention_and_proj_i4_preloaded_q(
+        &self,
+        q_buf_name: &str,
+        k_seq: &[f32],
+        v_seq: &[f32],
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        seq_len: usize,
+        kv_stride: usize,
+        attn_scale: f32,
+        soft_cap: f32,
+        o_proj_w: &[u8],
+        o_proj_s: &[u16],
+        o_proj_out_dim: usize,
+        o_proj_in_dim: usize,
+        o_proj_key: &str,
+        out: &mut [f32],
+    ) -> anyhow::Result<()> {
+        let q_dim = n_heads * head_dim;
+        assert_eq!(out.len(), o_proj_out_dim);
+
+        let q_buf = self.get_named_buf(q_buf_name)?;
+
+        self.ensure_named_buf("attn_k_preload", k_seq.len())?;
+        self.ensure_named_buf("attn_v_preload", v_seq.len())?;
+        self.ensure_named_buf("attn_out_preload", q_dim)?;
+        self.ensure_named_buf("attn_proj_out_preload", o_proj_out_dim)?;
+        self.write_named_buf("attn_k_preload", k_seq)?;
+        self.write_named_buf("attn_v_preload", v_seq)?;
+
+        let k_buf = self.get_named_buf("attn_k_preload")?;
+        let v_buf = self.get_named_buf("attn_v_preload")?;
+        let attn_out_buf = self.get_named_buf("attn_out_preload")?;
+        let proj_out_buf = self.get_named_buf("attn_proj_out_preload")?;
+
+        let w_key = format!("attn.o_proj.w.{}", o_proj_key);
+        let s_key = format!("attn.o_proj.s.{}", o_proj_key);
+        {
+            let mut cache = self.tensor_cache.lock().unwrap();
+            if !cache.contains_key(&w_key) {
+                cache.insert(w_key.clone(), upload_i8(&self.device, unsafe {
+                    std::slice::from_raw_parts(o_proj_w.as_ptr() as *const i8, o_proj_w.len())
+                })?);
+            }
+            if !cache.contains_key(&s_key) {
+                cache.insert(s_key.clone(), upload_u16(&self.device, o_proj_s)?);
+            }
+        }
+
+        let cache = self.tensor_cache.lock().unwrap();
+        let o_proj_wb = cache.get(&w_key).unwrap().clone();
+        let o_proj_sb = cache.get(&s_key).unwrap().clone();
+        drop(cache);
+
+        self.run_batch(|enc| {
+            self.encode_attention_gqa_f32(
+                enc, &q_buf, &k_buf, &v_buf, &attn_out_buf,
+                n_heads, n_kv_heads, head_dim, seq_len,
+                attn_scale, soft_cap, kv_stride,
+            );
+            self.encode_mv_i4(
+                enc, &o_proj_wb, &o_proj_sb, &attn_out_buf, &proj_out_buf,
+                o_proj_out_dim, o_proj_in_dim, o_proj_in_dim,
+            );
+            Ok(())
+        })?;
+
+        self.read_named_buf("attn_proj_out_preload", out)?;
+        Ok(())
+    }
+
+    /// Attention + o_proj with persistent GPU KV cache.
+    /// Q is uploaded from CPU; K/V are read from persistent per-layer GPU buffers.
+    pub fn attention_and_proj_i4_persistent_kv(
+        &self,
+        q: &[f32],
+        k_buf: &Buffer,
+        v_buf: &Buffer,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        seq_len: usize,
+        kv_stride: usize,
+        attn_scale: f32,
+        soft_cap: f32,
+        o_proj_w: &[u8],
+        o_proj_s: &[u16],
+        o_proj_out_dim: usize,
+        o_proj_in_dim: usize,
+        o_proj_key: &str,
+        out: &mut [f32],
+    ) -> anyhow::Result<()> {
+        assert_eq!(q.len(), n_heads * head_dim);
+        assert_eq!(out.len(), o_proj_out_dim);
+
+        let q_bytes = (q.len() * 4) as u64;
+        self.ensure_named_buf("attn_q", q.len())?;
+
+        // 1) Upload Q
+        let mut tmp_q: Option<Buffer> = None;
+        {
+            let nb = self.named_bufs.lock().unwrap();
+            let b = nb.get("attn_q").unwrap();
+            if b.length() < q_bytes {
+                tmp_q = Some(upload_f32(&self.device, q)?);
+            } else {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        q.as_ptr() as *const u8,
+                        b.contents() as *mut u8,
+                        q_bytes as usize,
+                    );
+                }
+            }
+        }
+
+        // 2) Dispatch attention (fast kernel, reads K/V from persistent buffers)
+        let q_buf_ref;
+        {
+            let nb = self.named_bufs.lock().unwrap();
+            q_buf_ref = nb.get("attn_q").cloned().unwrap();
+        }
+        let q_buf = tmp_q.as_ref().unwrap_or(&q_buf_ref);
+        let attn_out_name = "attn_out_persistent";
+        self.ensure_named_buf(attn_out_name, n_heads * head_dim)?;
+        let attn_out_buf;
+        {
+            let nb = self.named_bufs.lock().unwrap();
+            attn_out_buf = nb.get(attn_out_name).cloned().unwrap();
+        }
+
+        let cmd_buf = self.queue.new_command_buffer();
+        let enc = cmd_buf.new_compute_command_encoder();
+        self.encode_attention_gqa_f32(
+            &enc,
+            q_buf,
+            k_buf,
+            v_buf,
+            &attn_out_buf,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            seq_len,
+            attn_scale,
+            soft_cap,
+            kv_stride,
+        );
+        enc.end_encoding();
+
+        // 3) o_proj (i4)
+        let o_proj_name = format!("gemma.o_proj.{}", o_proj_key);
+        let w_name = format!("o_proj_w.{}", o_proj_key);
+        let s_name = format!("o_proj_s.{}", o_proj_key);
+        let mut cache = self.tensor_cache.lock().unwrap();
+        if !cache.contains_key(&w_name) {
+            cache.insert(w_name.clone(), upload_i8(&self.device, unsafe { std::slice::from_raw_parts(o_proj_w.as_ptr() as *const i8, o_proj_w.len()) })?);
+        }
+        if !cache.contains_key(&s_name) {
+            cache.insert(s_name.clone(), upload_u16(&self.device, o_proj_s)?);
+        }
+        drop(cache);
+        let wbuf = self.tensor_cache.lock().unwrap().get(&w_name).cloned().unwrap();
+        let sbuf = self.tensor_cache.lock().unwrap().get(&s_name).cloned().unwrap();
+        let proj_out_name = "attn_proj_out_persistent";
+        self.ensure_named_buf(proj_out_name, o_proj_out_dim)?;
+
+        let enc2 = cmd_buf.new_compute_command_encoder();
+        let proj_out_buf = self.ensure_named_buf(proj_out_name, 1).ok().and_then(|_| {
+            self.named_bufs.lock().unwrap().get(proj_out_name).cloned()
+        }).unwrap_or_else(|| attn_out_buf.clone());
+        self.encode_mv_i4(
+            &enc2,
+            &wbuf,
+            &sbuf,
+            &attn_out_buf,
+            &proj_out_buf,
+            o_proj_out_dim,
+            o_proj_in_dim,
+            o_proj_in_dim,
+        );
+        enc2.end_encoding();
+        cmd_buf.commit();
+        cmd_buf.wait_until_completed();
+
+        self.read_named_buf(proj_out_name, out)?;
+        Ok(())
+    }
+
+    /// Batch multiple i4 matrix-vector multiplications that share the same input vector.
+    /// Each job = (w_u8, s_f16, out_dim, in_dim, gs, cache_key).
+    /// Output slices are passed separately by index to satisfy the borrow checker.
+    pub fn batch_mv_i4(
+        &self,
+        x: &[f32],
+        jobs: &[(&[u8], &[u16], usize, usize, usize, &str)],
+        outs: &mut [&mut [f32]],
+    ) -> anyhow::Result<()> {
+        assert_eq!(jobs.len(), outs.len(), "batch_mv_i4: job count must match output count");
+        if jobs.is_empty() {
+            return Ok(());
+        }
+
+        // 1. Cache all weights and scales.
+        let mut wbuffers = Vec::with_capacity(jobs.len());
+        let mut sbuffers = Vec::with_capacity(jobs.len());
+        for (w_u8, s_f16, _out_dim, _in_dim, _gs, cache_key) in jobs.iter() {
+            let w_key = format!("logits.w.{}", cache_key);
+            let s_key = format!("logits.s.{}", cache_key);
+            {
+                let mut cache = self.tensor_cache.lock().unwrap();
+                if !cache.contains_key(&w_key) {
+                    cache.insert(w_key.clone(), upload_i8(&self.device, unsafe {
+                        std::slice::from_raw_parts(w_u8.as_ptr() as *const i8, w_u8.len())
+                    })?);
+                }
+                if !cache.contains_key(&s_key) {
+                    cache.insert(s_key.clone(), upload_u16(&self.device, s_f16)?);
+                }
+                wbuffers.push(cache.get(&w_key).unwrap().clone());
+                sbuffers.push(cache.get(&s_key).unwrap().clone());
+            }
+        }
+
+        // 2. Ensure input buffer and named output buffers.
+        ensure_buf_f32(&self.device, &mut *self.x_buf.lock().unwrap(), x.len())?;
+        for (idx, (out_dim, ..)) in jobs.iter().map(|j| (j.2, j.3, j.4, j.5)).enumerate() {
+            let out_name = format!("i4_batch_out_{}", idx);
+            self.ensure_named_buf(&out_name, out_dim)?;
+        }
+
+        // 3. Write input.
+        {
+            let xb_ref = self.x_buf.lock().unwrap();
+            let xb = xb_ref.as_ref().unwrap();
+            write_f32(xb, x)?;
+        }
+
+        // 4. Collect output buffer handles.
+        let mut out_buffers = Vec::with_capacity(jobs.len());
+        for idx in 0..jobs.len() {
+            let out_name = format!("i4_batch_out_{}", idx);
+            out_buffers.push(self.get_named_buf(&out_name)?);
+        }
+
+        // 5. Run all kernels in a single command buffer.
+        let xb_guard = self.x_buf.lock().unwrap();
+        let xb = xb_guard.as_ref().unwrap();
+        self.run_batch(|enc| {
+            for (idx, job) in jobs.iter().enumerate() {
+                let out_dim = job.2;
+                let in_dim = job.3;
+                let gs = job.4;
+                self.encode_mv_i4(enc, &wbuffers[idx], &sbuffers[idx], xb, &out_buffers[idx], out_dim, in_dim, gs);
+            }
+            Ok(())
+        })?;
+        drop(xb_guard);
+
+        // 6. Read all outputs.
+        for (idx, out) in outs.iter_mut().enumerate() {
+            let out_name = format!("i4_batch_out_{}", idx);
+            self.read_named_buf(&out_name, out)?;
+        }
+
+        Ok(())
+    }
+
+    /// Fused MLP block for Gemma: gate_proj + up_proj + gelu_tanh_mul + down_proj +
+    /// optional post-FFN RMSNorm + residual_add, all in a single command buffer.
+    /// This saves the intermediate CPU↔GPU round-trips that occur when gate/up are
+    /// read back for CPU GELU and then re-uploaded for down_proj.
+    pub fn fused_mlp_i4(
+        &self,
+        mlp_in: &[f32],
+        residual: &[f32],
+        gate_w: &[u8],
+        gate_s: &[u16],
+        gate_dim: usize,
+        gate_key: &str,
+        up_w: &[u8],
+        up_s: &[u16],
+        up_dim: usize,
+        up_key: &str,
+        down_w: &[u8],
+        down_s: &[u16],
+        down_out_dim: usize,
+        down_key: &str,
+        post_norm_w_f16: Option<&[u16]>,
+        post_norm_key: Option<&str>,
+        post_norm_eps: f32,
+        post_norm_add_one: bool,
+        hidden: usize,
+        out: &mut [f32],
+    ) -> anyhow::Result<()> {
+        assert_eq!(mlp_in.len(), hidden);
+        assert_eq!(residual.len(), hidden);
+        assert_eq!(out.len(), hidden);
+        assert_eq!(gate_dim, up_dim);
+
+        // 1. Cache weights and scales.
+        let gate_w_key = format!("mlp.gate.w.{}", gate_key);
+        let gate_s_key = format!("mlp.gate.s.{}", gate_key);
+        let up_w_key = format!("mlp.up.w.{}", up_key);
+        let up_s_key = format!("mlp.up.s.{}", up_key);
+        let down_w_key = format!("mlp.down.w.{}", down_key);
+        let down_s_key = format!("mlp.down.s.{}", down_key);
+
+        {
+            let mut cache = self.tensor_cache.lock().unwrap();
+            if !cache.contains_key(&gate_w_key) {
+                cache.insert(gate_w_key.clone(), upload_i8(&self.device, unsafe {
+                    std::slice::from_raw_parts(gate_w.as_ptr() as *const i8, gate_w.len())
+                })?);
+            }
+            if !cache.contains_key(&gate_s_key) {
+                cache.insert(gate_s_key.clone(), upload_u16(&self.device, gate_s)?);
+            }
+            if !cache.contains_key(&up_w_key) {
+                cache.insert(up_w_key.clone(), upload_i8(&self.device, unsafe {
+                    std::slice::from_raw_parts(up_w.as_ptr() as *const i8, up_w.len())
+                })?);
+            }
+            if !cache.contains_key(&up_s_key) {
+                cache.insert(up_s_key.clone(), upload_u16(&self.device, up_s)?);
+            }
+            if !cache.contains_key(&down_w_key) {
+                cache.insert(down_w_key.clone(), upload_i8(&self.device, unsafe {
+                    std::slice::from_raw_parts(down_w.as_ptr() as *const i8, down_w.len())
+                })?);
+            }
+            if !cache.contains_key(&down_s_key) {
+                cache.insert(down_s_key.clone(), upload_u16(&self.device, down_s)?);
+            }
+        }
+
+        // Cache post-FFN norm weight if provided.
+        let post_norm_w_key = post_norm_key.map(|k| format!("mlp.post_norm.w.{}", k));
+        if let (Some(w), Some(key)) = (post_norm_w_f16, post_norm_key) {
+            let w_key = format!("mlp.post_norm.w.{}", key);
+            let mut cache = self.tensor_cache.lock().unwrap();
+            if !cache.contains_key(&w_key) {
+                cache.insert(w_key.clone(), upload_u16(&self.device, w)?);
+            }
+        }
+
+        // 2. Ensure named buffers.
+        self.ensure_named_buf("mlp_in", hidden)?;
+        self.ensure_named_buf("mlp_residual", hidden)?;
+        self.ensure_named_buf("mlp_gate", gate_dim)?;
+        self.ensure_named_buf("mlp_up", up_dim)?;
+        self.ensure_named_buf("mlp_down", down_out_dim)?;
+        if post_norm_w_f16.is_some() {
+            self.ensure_named_buf("mlp_down_normed", down_out_dim)?;
+        }
+
+        // 3. Upload inputs.
+        self.write_named_buf("mlp_in", mlp_in)?;
+        self.write_named_buf("mlp_residual", residual)?;
+
+        // 4. Get buffer handles.
+        let cache = self.tensor_cache.lock().unwrap();
+        let gate_wb = cache.get(&gate_w_key).unwrap().clone();
+        let gate_sb = cache.get(&gate_s_key).unwrap().clone();
+        let up_wb = cache.get(&up_w_key).unwrap().clone();
+        let up_sb = cache.get(&up_s_key).unwrap().clone();
+        let down_wb = cache.get(&down_w_key).unwrap().clone();
+        let down_sb = cache.get(&down_s_key).unwrap().clone();
+        let post_norm_wb = post_norm_w_key.as_ref().and_then(|k| cache.get(k).cloned());
+        drop(cache);
+
+        let mlp_in_buf = self.get_named_buf("mlp_in")?;
+        let residual_buf = self.get_named_buf("mlp_residual")?;
+        let gate_buf = self.get_named_buf("mlp_gate")?;
+        let up_buf = self.get_named_buf("mlp_up")?;
+        let down_buf = self.get_named_buf("mlp_down")?;
+        let down_normed_buf = if post_norm_w_f16.is_some() {
+            Some(self.get_named_buf("mlp_down_normed")?)
+        } else {
+            None
+        };
+
+        // 5. Encode everything in one command buffer.
+        self.run_batch(|enc| {
+            // gate = mlp_in @ W_gate
+            self.encode_mv_i4(enc, &gate_wb, &gate_sb, &mlp_in_buf, &gate_buf, gate_dim, hidden, hidden);
+            // up = mlp_in @ W_up
+            self.encode_mv_i4(enc, &up_wb, &up_sb, &mlp_in_buf, &up_buf, up_dim, hidden, hidden);
+            // gate = GELU(gate) * up  (in-place on gate)
+            self.encode_gelu_tanh_mul_f32_inplace(enc, &gate_buf, &up_buf, gate_dim);
+            // down = gate @ W_down  (gs = gate_dim because input to down_proj is gate_dim/ ffn_dim)
+            self.encode_mv_i4(enc, &down_wb, &down_sb, &gate_buf, &down_buf, down_out_dim, gate_dim, gate_dim);
+            // Optional post-FFN RMSNorm, then residual add.
+            if let (Some(wb), Some(dnb)) = (&post_norm_wb, &down_normed_buf) {
+                self.encode_rms_norm_f16w(enc, &down_buf, wb, dnb, down_out_dim, post_norm_eps, post_norm_add_one);
+                self.encode_add_f32_inplace(enc, &residual_buf, dnb, down_out_dim);
+            } else {
+                self.encode_add_f32_inplace(enc, &residual_buf, &down_buf, down_out_dim);
+            }
+            Ok(())
+        })?;
+
+        // 6. Read result back.
+        self.read_named_buf("mlp_residual", out)?;
+        Ok(())
+    }
+
+    /// Fused block: post-attention norm + residual + pre-FFN norm + MLP (gate+up+gelu+down+
+    /// optional post-FFN norm + residual), all in one command buffer.
+    /// This eliminates the CPU↔GPU round-trips between o_proj and the MLP.
+    pub fn fused_post_attn_residual_mlp_i4(
+        &self,
+        attn_proj: &[f32],
+        x: &[f32],
+        post_attn_norm_w: &[u16],
+        post_attn_norm_eps: f32,
+        post_attn_norm_add_one: bool,
+        pre_ffn_norm_w: &[u16],
+        pre_ffn_norm_eps: f32,
+        pre_ffn_norm_add_one: bool,
+        gate_w: &[u8],
+        gate_s: &[u16],
+        gate_dim: usize,
+        gate_key: &str,
+        up_w: &[u8],
+        up_s: &[u16],
+        up_dim: usize,
+        up_key: &str,
+        down_w: &[u8],
+        down_s: &[u16],
+        down_out_dim: usize,
+        down_key: &str,
+        post_ffn_norm_w: Option<&[u16]>,
+        post_ffn_norm_key: Option<&str>,
+        post_ffn_norm_eps: f32,
+        post_ffn_norm_add_one: bool,
+        hidden: usize,
+        out: &mut [f32],
+    ) -> anyhow::Result<()> {
+        assert_eq!(attn_proj.len(), hidden);
+        assert_eq!(x.len(), hidden);
+        assert_eq!(out.len(), hidden);
+        assert_eq!(gate_dim, up_dim);
+
+        // 1. Cache all weights.
+        let pa_key = format!("tail.pa.w.{gate_key}");
+        let pf_key = format!("tail.pf.w.{gate_key}");
+        let gate_w_key = format!("tail.gate.w.{gate_key}");
+        let gate_s_key = format!("tail.gate.s.{gate_key}");
+        let up_w_key = format!("tail.up.w.{gate_key}");
+        let up_s_key = format!("tail.up.s.{gate_key}");
+        let down_w_key = format!("tail.down.w.{gate_key}");
+        let down_s_key = format!("tail.down.s.{gate_key}");
+
+        {
+            let mut cache = self.tensor_cache.lock().unwrap();
+            if !cache.contains_key(&pa_key) {
+                cache.insert(pa_key.clone(), upload_u16(&self.device, post_attn_norm_w)?);
+            }
+            if !cache.contains_key(&pf_key) {
+                cache.insert(pf_key.clone(), upload_u16(&self.device, pre_ffn_norm_w)?);
+            }
+            if !cache.contains_key(&gate_w_key) {
+                cache.insert(gate_w_key.clone(), upload_i8(&self.device, unsafe {
+                    std::slice::from_raw_parts(gate_w.as_ptr() as *const i8, gate_w.len())
+                })?);
+            }
+            if !cache.contains_key(&gate_s_key) {
+                cache.insert(gate_s_key.clone(), upload_u16(&self.device, gate_s)?);
+            }
+            if !cache.contains_key(&up_w_key) {
+                cache.insert(up_w_key.clone(), upload_i8(&self.device, unsafe {
+                    std::slice::from_raw_parts(up_w.as_ptr() as *const i8, up_w.len())
+                })?);
+            }
+            if !cache.contains_key(&up_s_key) {
+                cache.insert(up_s_key.clone(), upload_u16(&self.device, up_s)?);
+            }
+            if !cache.contains_key(&down_w_key) {
+                cache.insert(down_w_key.clone(), upload_i8(&self.device, unsafe {
+                    std::slice::from_raw_parts(down_w.as_ptr() as *const i8, down_w.len())
+                })?);
+            }
+            if !cache.contains_key(&down_s_key) {
+                cache.insert(down_s_key.clone(), upload_u16(&self.device, down_s)?);
+            }
+        }
+
+        let post_ffn_key = post_ffn_norm_key.map(|k| format!("tail.post.w.{k}"));
+        if let (Some(w), Some(key)) = (post_ffn_norm_w, post_ffn_norm_key) {
+            let k = format!("tail.post.w.{key}");
+            let mut cache = self.tensor_cache.lock().unwrap();
+            if !cache.contains_key(&k) {
+                cache.insert(k.clone(), upload_u16(&self.device, w)?);
+            }
+        }
+
+        // 2. Ensure buffers.
+        self.ensure_named_buf("tail_attn_proj", hidden)?;
+        self.ensure_named_buf("tail_x", hidden)?;
+        self.ensure_named_buf("tail_post_attn", hidden)?;
+        self.ensure_named_buf("tail_mlp_in", hidden)?;
+        self.ensure_named_buf("tail_gate", gate_dim)?;
+        self.ensure_named_buf("tail_up", up_dim)?;
+        self.ensure_named_buf("tail_down", hidden)?;
+        if post_ffn_norm_w.is_some() {
+            self.ensure_named_buf("tail_down_normed", hidden)?;
+        }
+
+        // 3. Upload inputs.
+        self.write_named_buf("tail_attn_proj", attn_proj)?;
+        self.write_named_buf("tail_x", x)?;
+
+        // 4. Get handles.
+        let cache = self.tensor_cache.lock().unwrap();
+        let pa_wb = cache.get(&pa_key).unwrap().clone();
+        let pf_wb = cache.get(&pf_key).unwrap().clone();
+        let gate_wb = cache.get(&gate_w_key).unwrap().clone();
+        let gate_sb = cache.get(&gate_s_key).unwrap().clone();
+        let up_wb = cache.get(&up_w_key).unwrap().clone();
+        let up_sb = cache.get(&up_s_key).unwrap().clone();
+        let down_wb = cache.get(&down_w_key).unwrap().clone();
+        let down_sb = cache.get(&down_s_key).unwrap().clone();
+        let post_ffn_wb = post_ffn_key.as_ref().and_then(|k| cache.get(k).cloned());
+        drop(cache);
+
+        let attn_proj_buf = self.get_named_buf("tail_attn_proj")?;
+        let x_buf = self.get_named_buf("tail_x")?;
+        let post_attn_buf = self.get_named_buf("tail_post_attn")?;
+        let mlp_in_buf = self.get_named_buf("tail_mlp_in")?;
+        let gate_buf = self.get_named_buf("tail_gate")?;
+        let up_buf = self.get_named_buf("tail_up")?;
+        let down_buf = self.get_named_buf("tail_down")?;
+        let down_normed_buf = if post_ffn_norm_w.is_some() {
+            Some(self.get_named_buf("tail_down_normed")?)
+        } else {
+            None
+        };
+
+        // 5. Encode: post-attn norm → residual → pre-FFN norm → gate → up → gelu → down → post-FFN norm (opt) → residual.
+        self.run_batch(|enc| {
+            // post_attn_normed = RMSNorm(attn_proj)
+            self.encode_rms_norm_f16w(enc, &attn_proj_buf, &pa_wb, &post_attn_buf, hidden, post_attn_norm_eps, post_attn_norm_add_one);
+            // x += post_attn_normed   (now x = x + post_attn_norm(attn_proj))
+            self.encode_add_f32_inplace(enc, &x_buf, &post_attn_buf, hidden);
+            // mlp_in = RMSNorm(x)
+            self.encode_rms_norm_f16w(enc, &x_buf, &pf_wb, &mlp_in_buf, hidden, pre_ffn_norm_eps, pre_ffn_norm_add_one);
+            // gate = mlp_in @ W_gate
+            self.encode_mv_i4(enc, &gate_wb, &gate_sb, &mlp_in_buf, &gate_buf, gate_dim, hidden, hidden);
+            // up = mlp_in @ W_up
+            self.encode_mv_i4(enc, &up_wb, &up_sb, &mlp_in_buf, &up_buf, up_dim, hidden, hidden);
+            // gate = GELU(gate) * up  (in-place on gate)
+            self.encode_gelu_tanh_mul_f32_inplace(enc, &gate_buf, &up_buf, gate_dim);
+            // down = gate @ W_down
+            self.encode_mv_i4(enc, &down_wb, &down_sb, &gate_buf, &down_buf, down_out_dim, gate_dim, gate_dim);
+            // optional post-FFN norm, then residual add into x_buf
+            if let (Some(pwb), Some(dnb)) = (&post_ffn_wb, &down_normed_buf) {
+                self.encode_rms_norm_f16w(enc, &down_buf, pwb, dnb, down_out_dim, post_ffn_norm_eps, post_ffn_norm_add_one);
+                self.encode_add_f32_inplace(enc, &x_buf, dnb, down_out_dim);
+            } else {
+                self.encode_add_f32_inplace(enc, &x_buf, &down_buf, down_out_dim);
+            }
+            Ok(())
+        })?;
+
+        // 6. Read x back (final hidden state for this layer).
+        self.read_named_buf("tail_x", out)?;
+        Ok(())
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 fn build_pipeline(device: &Device, src: &str, fn_name: &str) -> anyhow::Result<(Library, ComputePipelineState)> {
-    let options = metal::CompileOptions::new();
-    let lib = device.new_library_with_source(src, &options).map_err(|e| anyhow::anyhow!("Compile failed: {e:?}"))?;
+    let lib = load_or_compile_metallib(device, src, false, &format!("matmul_{}", fn_name))?;
     let func = lib.get_function(fn_name, None).map_err(|e| anyhow::anyhow!("Missing fn {fn_name}: {e:?}"))?;
     let pso = device.new_compute_pipeline_state_with_function(&func).map_err(|e| anyhow::anyhow!("PSO failed: {e:?}"))?;
     Ok((lib, pso))

@@ -77,6 +77,7 @@ impl QwenRunner {
             intermediate_size: h.intermediate_size,
             rms_norm_eps: h.rms_norm_eps,
             rope_theta: h.rope_theta,
+            attention_softcap: 0.0,
         };
 
         if !has_tensor_file(&file, "language_model.model.embed_tokens.weight")
@@ -126,6 +127,10 @@ impl QwenRunner {
             graph_state: None,
             tensor_prefix: "".to_string(),
         })
+    }
+
+    pub fn file(&self) -> &CellmFile {
+        &self.file
     }
 
     pub fn config(&self) -> &ModelConfig {
@@ -215,7 +220,7 @@ impl QwenRunner {
                 self.linear_backend = QwenLinearBackend::Metal { ctx };
                 self.metal_strict = false;
                 self.metal_ops = Some(mo.clone());
-                
+
                 let mut gs = QwenGraphState::new(
                     self.cfg.hidden_size,
                     self.cfg.num_attention_heads,
@@ -289,14 +294,14 @@ impl QwenRunner {
                     else if has_tensor_file(&self.file, "language_model.model.embed_tokens.weight") { "language_model.model." }
                     else if has_tensor_file(&self.file, "model.embed_tokens.weight") { "model." }
                     else { "" };
-                
+
                 // Ensure page table has space for all tokens
                 for i in 0..tokens.len() {
                     if start_pos + i == page_table.token_count() {
                         page_table.append_token(kv_cache.allocator_mut()).map_err(|e| CoreError::Backend(format!("qwen async decode append_token failed: {e}")))?;
                     }
                 }
-                
+
                 // Prepare embeddings for all tokens
                 let mut all_embeddings = Vec::new();
                 for &token in tokens {
@@ -304,7 +309,7 @@ impl QwenRunner {
                     self.embed_token(token, &mut embedding)?;
                     all_embeddings.push(embedding);
                 }
-                
+
                 // For now, use sequential processing as fallback - async implementation needs more work
                 let mut all_logits = Vec::new();
                 for (i, &token) in tokens.iter().enumerate() {
@@ -314,7 +319,7 @@ impl QwenRunner {
                     let logits = self.step_inner(&x, pos, page_table, kv_cache, true)?;
                     all_logits.push(logits);
                 }
-                
+
                 // Convert to top-k results
                 let mut results = Vec::new();
                 for logits in all_logits {
@@ -323,7 +328,7 @@ impl QwenRunner {
                 return Ok(results);
             }
         }
-        
+
         // Fallback to sequential processing
         let mut results = Vec::new();
         for &token in tokens {
@@ -502,7 +507,7 @@ impl QwenRunner {
                             let mut q_norm_w = vec![0.0f32; q_norm_len];
                             self.rmsnorm_weight(&q_norm_w_name, &mut q_norm_w)?;
                             if self.rmsnorm_weight_is_offset { add_one_inplace(&mut q_norm_w); }
-                            
+
                             for hidx in 0..n_heads {
                                 let start = hidx * head_dim;
                                 let end = start + head_dim;
@@ -553,11 +558,11 @@ impl QwenRunner {
                         gather_bases.push(cr.layout.token_base_elem(b, layer, o)?);
                     }
                     cr.attention_single_token_gqa_from_bases(
-                        &gather_bases, 
-                        &q, 
-                        n_heads, 
-                        n_kv_heads, 
-                        head_dim, 
+                        &gather_bases,
+                        &q,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
                         None, // attn_scale
                         None, // soft_cap
                         &mut attn_out
@@ -726,7 +731,7 @@ impl QwenRunner {
         let vocab = cfg.vocab_size;
         let mut logits = vec![0.0f32; vocab];
         let dtype = self.file.tensor_index(weight_name).unwrap().dtype.clone();
-        
+
         match dtype.as_str() {
             "f16" => {
                 let w = self.tensor_f16(weight_name)?.to_vec();
@@ -1123,7 +1128,7 @@ impl QwenRunner {
                 let row_stride = (in_dim + 1) / 2;
                 let row = &bytes[row_idx * row_stride..(row_idx + 1) * row_stride];
                 let scales = self.tensor_f16(&format!("{weight_name}.qscale"))?;
-                
+
                 let out_dim = self.tensor_shape(weight_name)?[0];
                 let n_scales = scales.len();
                 let scales_per_row = n_scales / out_dim;
@@ -1266,11 +1271,11 @@ impl QwenRunner {
         let wq_ptr = wq.as_ptr(); let wq_len = wq.len();
         let wk_ptr = wk.as_ptr(); let wk_len = wk.len();
         let wv_ptr = wv.as_ptr(); let wv_len = wv.len();
-        
-        self.metal_ops.as_mut().unwrap().logits_qkv_f16(x, 
-            unsafe { std::slice::from_raw_parts(wq_ptr, wq_len) }, 
-            unsafe { std::slice::from_raw_parts(wk_ptr, wk_len) }, 
-            unsafe { std::slice::from_raw_parts(wv_ptr, wv_len) }, 
+
+        self.metal_ops.as_mut().unwrap().logits_qkv_f16(x,
+            unsafe { std::slice::from_raw_parts(wq_ptr, wq_len) },
+            unsafe { std::slice::from_raw_parts(wk_ptr, wk_len) },
+            unsafe { std::slice::from_raw_parts(wv_ptr, wv_len) },
             qd, kd, vd, ind, &qr, &kr, &vr, qo, ko, vo).map_err(|e| CoreError::Backend(e.to_string()))?;
         Ok(true)
     }
@@ -1337,7 +1342,7 @@ impl QwenGraphState {
             weight_cache: Mutex::new(HashMap::new()),
             x_buf, x_norm_buf, q_buf, k_buf, v_buf,
             attn_out_buf, mlp_in_buf, gate_buf, up_buf, down_buf,
-            logits_buf, q_norm_buf, k_norm_buf, 
+            logits_buf, q_norm_buf, k_norm_buf,
             tensor_dtypes: HashMap::new(),
             bases_buf: None, bases_capacity: 0, bases_stride: 0, bases_populated: 0       })
     }
@@ -1384,7 +1389,7 @@ impl QwenGraphState {
     pub fn preload_weight(&mut self, name: String, bytes: &[u8]) {
         self.weights.insert(name, self.device.new_buffer_with_data(bytes.as_ptr() as *const _, bytes.len() as u64, metal::MTLResourceOptions::StorageModeShared));
     }
-    
+
     fn try_get_w(&self, name: &str) -> Option<&metal::Buffer> { self.weights.get(&self.resolve_tensor_name(name)) }
 
     fn get_dtype(&self, name: &str) -> String {
@@ -1405,7 +1410,7 @@ impl QwenGraphState {
         unsafe { std::ptr::copy_nonoverlapping(x_in.as_ptr(), self.x_buf.contents() as *mut f32, h); }
         let total = pos + 1;
         let num_layers = cfg.num_hidden_layers;
-        
+
         // Fixed-stride bases buffer: only grow when exceeded, only write new entries
         let cv = kv_cache.view();
         if self.bases_stride < total {
@@ -1413,7 +1418,7 @@ impl QwenGraphState {
             let new_stride = total.max(self.bases_stride * 2).max(128);
             let new_capacity = new_stride * num_layers;
             let new_buf = self.device.new_buffer((new_capacity * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
-            
+
             // Copy old data to new layout (if any)
             if let Some(old_buf) = &self.bases_buf {
                 let old_ptr = old_buf.contents() as *const u32;
@@ -1427,15 +1432,15 @@ impl QwenGraphState {
                     }
                 }
             }
-            
+
             self.bases_buf = Some(new_buf);
             self.bases_capacity = new_capacity;
             self.bases_stride = new_stride;
         }
-        
+
         let bb = self.bases_buf.as_ref().unwrap();
         let base_ptr = bb.contents() as *mut u32;
-        
+
         // Populate any missing tokens (first use after prefill, or new tokens after reallocation)
         let populate_start = self.bases_populated;
         for t in populate_start..total {
@@ -1466,7 +1471,7 @@ impl QwenGraphState {
             }
         }
         if enc_open { enc.end_encoding(); }
-        
+
         let enc_final = cb.new_compute_command_encoder();
         self.ops.encode_rms_norm_f16w(enc_final, &self.x_buf, self.get_w_cached(&format!("{prefix}model.norm.weight")), &self.x_norm_buf, h, cfg.rms_norm_eps, offset);
         enc_final.end_encoding();
@@ -1480,7 +1485,7 @@ impl QwenGraphState {
             } else {
                 (embed_name.clone(), self.get_w_cached(&embed_name), self.try_get_w_cached(&format!("{embed_name}.qscale")))
             };
-            
+
             if let Some(s) = sl { self.ops.encode_mv_i8(enc_logits, wl, s, &self.x_norm_buf, &self.logits_buf, cfg.vocab_size, h); }
             else if self.get_dtype(&target_name) == "q1_0_g128" { self.ops.encode_mv_q1(enc_logits, wl, &self.x_norm_buf, &self.logits_buf, cfg.vocab_size, h); }
             else { self.ops.encode_mv_f16(enc_logits, wl, &self.x_norm_buf, &self.logits_buf, cfg.vocab_size, h); }
@@ -1500,30 +1505,30 @@ impl QwenGraphState {
         let h = cfg.hidden_size;
         let batch_size = tokens.len();
         let mut results = Vec::with_capacity(batch_size);
-        
+
         // Pre-allocate individual logits buffers for each token
         let mut logits_buffers = Vec::with_capacity(batch_size);
         for _ in 0..batch_size {
             logits_buffers.push(self.device.new_buffer((cfg.vocab_size * 4) as u64, metal::MTLResourceOptions::StorageModeShared));
         }
-        
+
         // Stage 1: Prepare all command buffers without GPU synchronization
         let mut command_buffers = Vec::new();
         for (i, &token) in tokens.iter().enumerate() {
             let pos = start_pos + i;
             let total = pos + 1;
-            
+
             // Prepare embedding for this token (simplified - needs actual embedding)
             let mut x = vec![0.0f32; h];
             unsafe { std::ptr::copy_nonoverlapping(x.as_ptr(), self.x_buf.contents() as *mut f32, h); }
-            
+
             // Prepare bases buffer with growth optimization
             let required_capacity = total * cfg.num_hidden_layers;
             if self.bases_capacity < required_capacity {
                 self.bases_capacity = required_capacity * 2;
                 self.bases_buf = Some(self.device.new_buffer((self.bases_capacity * 4) as u64, metal::MTLResourceOptions::StorageModeShared));
             }
-            
+
             let mut bases = Vec::with_capacity(required_capacity);
             let cv = kv_cache.view();
             for l in 0..cfg.num_hidden_layers {
@@ -1533,20 +1538,20 @@ impl QwenGraphState {
                     bases.push(cv.layout.token_base_elem(b, l, o)? as u32);
                 }
             }
-            
+
             if let Some(bb) = &self.bases_buf {
                 unsafe { std::ptr::copy_nonoverlapping(bases.as_ptr(), bb.contents() as *mut u32, bases.len()); }
             }
             let bb = self.bases_buf.as_ref().unwrap();
-            
+
             // Create command buffer for this token
             let cb = self.queue.new_command_buffer();
-            
+
             // Process all layers
             for l in 0..cfg.num_hidden_layers {
                 self.encode_single_layer_efficient(cb, l, cfg, prefix, kv_cache, total, total, off, bid, rotary, offset, bb);
             }
-            
+
             // Final norm
             let enc_final = cb.new_compute_command_encoder();
             self.ops.encode_rms_norm_f16w(enc_final, &self.x_buf, self.get_w_cached(&format!("{prefix}model.norm.weight")), &self.x_norm_buf, h, cfg.rms_norm_eps, offset);
@@ -1561,39 +1566,39 @@ impl QwenGraphState {
             } else {
                 (embed_name.clone(), self.get_w_cached(&embed_name), self.try_get_w_cached(&format!("{embed_name}.qscale")))
             };
-            
+
             let logits_buf = &logits_buffers[i];
-            if let Some(s) = sl { 
-                self.ops.encode_mv_i8(enc_logits, wl, s, &self.x_norm_buf, logits_buf, cfg.vocab_size, h); 
-            } else if self.get_dtype(&target_name) == "q1_0_g128" { 
-                self.ops.encode_mv_q1(enc_logits, wl, &self.x_norm_buf, logits_buf, cfg.vocab_size, h); 
-            } else { 
-                self.ops.encode_mv_f16(enc_logits, wl, &self.x_norm_buf, logits_buf, cfg.vocab_size, h); 
+            if let Some(s) = sl {
+                self.ops.encode_mv_i8(enc_logits, wl, s, &self.x_norm_buf, logits_buf, cfg.vocab_size, h);
+            } else if self.get_dtype(&target_name) == "q1_0_g128" {
+                self.ops.encode_mv_q1(enc_logits, wl, &self.x_norm_buf, logits_buf, cfg.vocab_size, h);
+            } else {
+                self.ops.encode_mv_f16(enc_logits, wl, &self.x_norm_buf, logits_buf, cfg.vocab_size, h);
             }
             enc_logits.end_encoding();
-            
+
             cb.commit();
             command_buffers.push(cb);
         }
-        
+
         // Stage 2: Single synchronization point for all tokens
         for cb in &command_buffers {
             cb.wait_until_completed();
         }
-        
+
         // Stage 3: Collect all results from individual buffers
         for logits_buf in &logits_buffers {
             let mut out = vec![0.0f32; cfg.vocab_size];
-            unsafe { 
+            unsafe {
                 std::ptr::copy_nonoverlapping(
-                    logits_buf.contents() as *const f32, 
-                    out.as_mut_ptr(), 
+                    logits_buf.contents() as *const f32,
+                    out.as_mut_ptr(),
                     cfg.vocab_size
-                ); 
+                );
             }
             results.push(out);
         }
-        
+
         Ok(results)
     }
 
@@ -1662,7 +1667,7 @@ impl QwenGraphState {
         let bv = self.try_get_w_cached(&format!("{pref}.self_attn.v_proj.bias"));
         let (qs, ks, vs) = (self.try_get_w_cached(&format!("{pref}.self_attn.q_proj.weight.qscale")), self.try_get_w_cached(&format!("{pref}.self_attn.k_proj.weight.qscale")), self.try_get_w_cached(&format!("{pref}.self_attn.v_proj.weight.qscale")));
         let q_dtype = self.get_dtype(&format!("{pref}.self_attn.q_proj.weight"));
-        
+
         if q_dtype == "q1_0_g128" {
             self.ops.encode_mv_q1(enc, wq, &self.x_norm_buf, &self.q_buf, nh * hd, h);
             self.ops.encode_mv_q1(enc, wk, &self.x_norm_buf, &self.k_buf, nkv * hd, h);
@@ -1670,9 +1675,9 @@ impl QwenGraphState {
             if let Some(b) = bq { self.ops.encode_add_f32_inplace(enc, &self.q_buf, b, nh * hd); }
             if let Some(b) = bk { self.ops.encode_add_f32_inplace(enc, &self.k_buf, b, nkv * hd); }
             if let Some(b) = bv { self.ops.encode_add_f32_inplace(enc, &self.v_buf, b, nkv * hd); }
-        } else if q_dtype == "i8" && qs.is_some() && ks.is_some() && vs.is_some() { 
-            self.ops.encode_qkv_i8_bias(enc, wq, qs.unwrap(), wk, ks.unwrap(), wv, vs.unwrap(), &self.x_norm_buf, bq, bk, bv, &self.q_buf, &self.k_buf, &self.v_buf, nh * hd, nkv * hd, h); 
-        } else { 
+        } else if q_dtype == "i8" && qs.is_some() && ks.is_some() && vs.is_some() {
+            self.ops.encode_qkv_i8_bias(enc, wq, qs.unwrap(), wk, ks.unwrap(), wv, vs.unwrap(), &self.x_norm_buf, bq, bk, bv, &self.q_buf, &self.k_buf, &self.v_buf, nh * hd, nkv * hd, h);
+        } else {
             // Force fallback for i4 to individual linear_f16_out_in (which now supports Metal i4)
             return false;
         }
@@ -1701,15 +1706,15 @@ impl QwenGraphState {
         km.encode_write_token_f32(enc, kv_cache.layout().token_base_elem(bid, l, off).unwrap(), &self.k_buf, &self.v_buf, nkv * hd);
 
         km.encode_attention(
-            enc, 
-            bases_buf, 
-            (l * stride * 4) as u64, 
-            &self.q_buf, 
-            &self.attn_out_buf, 
-            total_tokens_now as u32, 
-            nh as u32, 
-            nkv as u32, 
-            hd as u32, 
+            enc,
+            bases_buf,
+            (l * stride * 4) as u64,
+            &self.q_buf,
+            &self.attn_out_buf,
+            total_tokens_now as u32,
+            nh as u32,
+            nkv as u32,
+            hd as u32,
             None, // attn_scale
             None  // soft_cap
         );
@@ -1720,13 +1725,13 @@ impl QwenGraphState {
         if self.get_dtype(&format!("{pref}.self_attn.o_proj.weight")) == "q1_0_g128" {
             self.ops.encode_mv_q1(enc, wo, &self.attn_out_buf, &self.mlp_in_buf, h, h);
             if let Some(b) = bo { self.ops.encode_add_f32_inplace(enc, &self.mlp_in_buf, b, h); }
-        } else if let Some(s) = so { 
-            self.ops.encode_mv_i8_bias(enc, wo, s, &self.attn_out_buf, bo, &self.mlp_in_buf, h, h); 
-        } else { 
-            self.ops.encode_mv_f16_bias(enc, wo, &self.attn_out_buf, bo, &self.mlp_in_buf, h, h); 
+        } else if let Some(s) = so {
+            self.ops.encode_mv_i8_bias(enc, wo, s, &self.attn_out_buf, bo, &self.mlp_in_buf, h, h);
+        } else {
+            self.ops.encode_mv_f16_bias(enc, wo, &self.attn_out_buf, bo, &self.mlp_in_buf, h, h);
         }
         self.ops.encode_add_f32_inplace(enc, &self.x_buf, &self.mlp_in_buf, h);
-        
+
         self.ops.encode_rms_norm_f16w(enc, &self.x_buf, self.get_w_cached(&format!("{pref}.post_attention_layernorm.weight")), &self.x_norm_buf, h, cfg.rms_norm_eps, offset);
 
         let wg = self.get_w_cached(&format!("{pref}.mlp.gate_proj.weight"));
@@ -1741,15 +1746,15 @@ impl QwenGraphState {
             self.ops.encode_mv_q1(enc, wu, &self.x_norm_buf, &self.up_buf, cfg.intermediate_size, h);
             if let Some(b) = bg { self.ops.encode_add_f32_inplace(enc, &self.gate_buf, b, cfg.intermediate_size); }
             if let Some(b) = bu { self.ops.encode_add_f32_inplace(enc, &self.up_buf, b, cfg.intermediate_size); }
-        } else if let (Some(g), Some(u)) = (sg, su) { 
-            self.ops.encode_mv_i8_bias(enc, wg, g, &self.x_norm_buf, bg, &self.gate_buf, cfg.intermediate_size, h); 
-            self.ops.encode_mv_i8_bias(enc, wu, u, &self.x_norm_buf, bu, &self.up_buf, cfg.intermediate_size, h); 
-        } else { 
-            self.ops.encode_mv_f16_bias(enc, wg, &self.x_norm_buf, bg, &self.gate_buf, cfg.intermediate_size, h); 
-            self.ops.encode_mv_f16_bias(enc, wu, &self.x_norm_buf, bu, &self.up_buf, cfg.intermediate_size, h); 
+        } else if let (Some(g), Some(u)) = (sg, su) {
+            self.ops.encode_mv_i8_bias(enc, wg, g, &self.x_norm_buf, bg, &self.gate_buf, cfg.intermediate_size, h);
+            self.ops.encode_mv_i8_bias(enc, wu, u, &self.x_norm_buf, bu, &self.up_buf, cfg.intermediate_size, h);
+        } else {
+            self.ops.encode_mv_f16_bias(enc, wg, &self.x_norm_buf, bg, &self.gate_buf, cfg.intermediate_size, h);
+            self.ops.encode_mv_f16_bias(enc, wu, &self.x_norm_buf, bu, &self.up_buf, cfg.intermediate_size, h);
         }
         self.ops.encode_silu_mul_f32_inplace(enc, &self.gate_buf, &self.up_buf, cfg.intermediate_size);
-        
+
         // Final Down Proj
         let wd = self.get_w_cached(&format!("{pref}.mlp.down_proj.weight"));
         let bd = self.try_get_w_cached(&format!("{pref}.mlp.down_proj.bias"));
@@ -1758,13 +1763,13 @@ impl QwenGraphState {
         if self.get_dtype(&format!("{pref}.mlp.down_proj.weight")) == "q1_0_g128" {
             self.ops.encode_mv_q1(enc, wd, &self.gate_buf, &self.down_buf, h, cfg.intermediate_size);
             if let Some(b) = bd { self.ops.encode_add_f32_inplace(enc, &self.down_buf, b, h); }
-        } else if let Some(s) = sd { 
-            self.ops.encode_mv_i8_bias(enc, wd, s, &self.gate_buf, bd, &self.down_buf, h, cfg.intermediate_size); 
-        } else { 
-            self.ops.encode_mv_f16_bias(enc, wd, &self.gate_buf, bd, &self.down_buf, h, cfg.intermediate_size); 
+        } else if let Some(s) = sd {
+            self.ops.encode_mv_i8_bias(enc, wd, s, &self.gate_buf, bd, &self.down_buf, h, cfg.intermediate_size);
+        } else {
+            self.ops.encode_mv_f16_bias(enc, wd, &self.gate_buf, bd, &self.down_buf, h, cfg.intermediate_size);
         }
-        
-        
+
+
         self.ops.encode_add_f32_inplace(enc, &self.x_buf, &self.down_buf, h);
         true
     }

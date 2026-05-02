@@ -13,7 +13,7 @@
 use cellm_cache::kvcache::{KvEncodingKind, MetalKvStorage};
 use cellm_core::kv_cache::DeviceKvStorage;
 
-// ── helpers ────────
+// helpers   
 
 fn lcg(seed: u64) -> impl FnMut() -> f32 {
     let mut s = seed;

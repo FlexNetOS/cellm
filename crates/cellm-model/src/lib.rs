@@ -11,6 +11,7 @@ pub mod gemma_graph;
 pub mod qwen;
 pub mod granite;
 pub mod lfm;
+pub mod batched;
 
 #[derive(Clone, Debug)]
 pub struct ModelConfig {
@@ -23,4 +24,5 @@ pub struct ModelConfig {
     pub intermediate_size: usize,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
+    pub attention_softcap: f32,
 }

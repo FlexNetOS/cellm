@@ -11,6 +11,8 @@ pub enum DType {
     U8,
     /// 8-bit symmetric block quantization (block size = 32)
     Q8_0,
+    /// 4-bit grouped quantization (block size = 256, groups of 32 with shared scale)
+    Q4_K,
 }
 
 impl DType {
@@ -27,12 +29,15 @@ impl DType {
             // Q8_0: 32 int8 values + 1 f32 scale = 36 bytes per block of 32
             // Report per-element as approximate (actual storage is block-based)
             DType::Q8_0 => 1,
+            // Q4_K: 256 nibbles + 8 f32 scales = 288 bytes per block of 256
+            // Report per-element as approximate (actual storage is block-based)
+            DType::Q4_K => 1,
         }
     }
 
     /// True if this dtype requires a backend that understands block quantization.
     pub fn is_quantized(&self) -> bool {
-        matches!(self, DType::I2 | DType::Q8_0)
+        matches!(self, DType::I2 | DType::Q8_0 | DType::Q4_K)
     }
 
     pub fn name(&self) -> &'static str {
@@ -45,6 +50,7 @@ impl DType {
             DType::I8 => "i8",
             DType::U8 => "u8",
             DType::Q8_0 => "q8_0",
+            DType::Q4_K => "q4_k",
         }
     }
 }
@@ -67,6 +73,7 @@ impl TryFrom<&str> for DType {
             "i8" => Ok(DType::I8),
             "u8" => Ok(DType::U8),
             "q8_0" => Ok(DType::Q8_0),
+            "q4_k" => Ok(DType::Q4_K),
             other => Err(format!("unknown dtype: {other}")),
         }
     }

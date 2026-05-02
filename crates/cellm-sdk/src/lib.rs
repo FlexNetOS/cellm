@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use cellm_cache::{KVCache, KvEncodingKind, KvStorageKind, PageTable};
 use cellm_core::KvCacheLayout;
 use cellm_model::{gemma::GemmaRunner, llama::LlamaRunner, qwen::QwenRunner, lfm::LfmRunner, CellmFile, ModelConfig};
-use cellm_scheduler::{RoundRobinScheduler, Session as SchedSession, SessionState, ThermalLevel, ThermalPolicy};
+use cellm_scheduler::{BatchDetector, BatchGroup, BatchSessionInfo, PolicyExecutor, RoundRobinScheduler, SchedulingPlan, SchedulingPolicy, Session as SchedSession, SessionState, ThermalLevel, ThermalPolicy};
 use serde_json::Value;
 
 pub type SessionId = u64;
@@ -27,6 +27,8 @@ pub struct EngineConfig {
     pub kv_encoding: KvEncodingKind,
     pub turboq_int8_dot: bool,
     pub turboq_qjl_corr: bool,
+    /// Scheduling policy: Fair (round-robin), LatencyFirst, or ThroughputFirst.
+    pub scheduling_policy: SchedulingPolicy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +51,7 @@ impl Default for EngineConfig {
             kv_encoding: KvEncodingKind::F16,
             turboq_int8_dot: true,
             turboq_qjl_corr: true,
+            scheduling_policy: SchedulingPolicy::Fair,
         }
     }
 }
@@ -120,12 +123,22 @@ pub struct Engine {
     session_meta: HashMap<SessionId, SchedSession>,
     next_session_id: SessionId,
     rr: RoundRobinScheduler,
+    policy_exec: PolicyExecutor,
+    batch_detector: BatchDetector,
     thermal: ThermalPolicy,
     top_k: usize,
     temperature: f64,
     repeat_penalty: f64,
     repeat_window: usize,
     seed: u64,
+    /// Total tokens generated across all sessions (lifetime).
+    total_tokens_generated: u64,
+    /// Timestamp of the last stats snapshot for tok/s calculation.
+    last_stats_snapshot: std::time::Instant,
+    /// Tokens generated since last stats snapshot.
+    tokens_since_snapshot: u64,
+    /// Cached tokens-per-second from the most recent stats() call.
+    cached_tok_per_sec: f64,
 }
 
 impl Engine {
@@ -208,12 +221,18 @@ impl Engine {
             session_meta: HashMap::new(),
             next_session_id: 1,
             rr: RoundRobinScheduler::new(),
+            policy_exec: PolicyExecutor::new(engine_cfg.scheduling_policy),
+            batch_detector: BatchDetector::new(),
             thermal: ThermalPolicy::default(),
             top_k: engine_cfg.top_k,
             temperature: engine_cfg.temperature,
             repeat_penalty: engine_cfg.repeat_penalty,
             repeat_window: engine_cfg.repeat_window,
             seed: engine_cfg.seed,
+            total_tokens_generated: 0,
+            last_stats_snapshot: std::time::Instant::now(),
+            tokens_since_snapshot: 0,
+            cached_tok_per_sec: 0.0,
         })
     }
 
@@ -517,12 +536,36 @@ impl Engine {
     }
 
     pub fn stats(&self) -> EngineStats {
+        let elapsed = self.last_stats_snapshot.elapsed().as_secs_f64();
+        let tok_per_sec = if elapsed > 0.0 {
+            self.tokens_since_snapshot as f64 / elapsed
+        } else {
+            self.cached_tok_per_sec
+        };
         EngineStats {
             active_sessions: self.sessions.len(),
             used_kv_blocks: self.kv_cache.allocator().in_use_count(),
             free_kv_blocks: self.kv_cache.allocator().free_count(),
             thermal_level: self.thermal.level(),
+            total_tokens_generated: self.total_tokens_generated,
+            current_tok_per_sec: tok_per_sec,
+            scheduling_policy: self.policy_exec.policy(),
         }
+    }
+
+    /// Reset the tok/s measurement window (called by the consumer after reading stats).
+    pub fn reset_stats_window(&mut self) {
+        self.last_stats_snapshot = std::time::Instant::now();
+        self.tokens_since_snapshot = 0;
+    }
+
+    /// Set the scheduling policy at runtime.
+    pub fn set_scheduling_policy(&mut self, policy: SchedulingPolicy) {
+        self.policy_exec.set_policy(policy);
+    }
+
+    pub fn scheduling_policy(&self) -> SchedulingPolicy {
+        self.policy_exec.policy()
     }
 
     pub fn model_config(&self) -> &ModelConfig {
@@ -603,12 +646,13 @@ impl Engine {
     }
 
     fn pump_decode_burst(&mut self, budget: usize) -> anyhow::Result<usize> {
-        if budget == 0 {
-            return Ok(0);
-        }
-        let mut produced = 0usize;
+        if budget == 0 { return Ok(0); }
+        match self.policy_exec.policy() {
+            SchedulingPolicy::Fair => {
+                let mut produced = 0usize;
         for _ in 0..budget {
-            let Some(id) = self.pick_next_decodable_session() else {
+            let id = self.pick_next_decodable_fair();
+            let Some(id) = id else {
                 break;
             };
             let Some(tok) = self.decode_one_for_session(id)? else {
@@ -620,9 +664,50 @@ impl Engine {
             }
         }
         Ok(produced)
+            }
+            SchedulingPolicy::LatencyFirst => self.decode_burst_latency(budget),
+            SchedulingPolicy::ThroughputFirst => self.decode_burst_throughput(budget),
+        }
     }
 
-    fn pick_next_decodable_session(&mut self) -> Option<SessionId> {
+    fn decode_burst_latency(&mut self, budget: usize) -> anyhow::Result<usize> {
+        let sessions: Vec<&cellm_scheduler::Session> = self.session_meta.values().collect();
+        let plan = self.policy_exec.tick(&sessions, &[]);
+        let mut produced = 0usize;
+        for &id in &plan.decode_ids {
+            if produced >= budget { break; }
+            if let Some(tok) = self.decode_one_for_session(id)? {
+                if let Some(s) = self.sessions.get_mut(&id) { s.pending_out.push_back(tok); produced += 1; }
+            }
+        }
+        Ok(produced)
+    }
+
+    fn decode_burst_throughput(&mut self, budget: usize) -> anyhow::Result<usize> {
+        use std::collections::HashMap;
+        let mut info: HashMap<SessionId, BatchSessionInfo> = HashMap::new();
+        for (&id, s) in &self.sessions {
+            let meta = self.session_meta.get(&id);
+            let is_dec = meta.map(|m| matches!(m.state(), SessionState::Decoding)).unwrap_or(false);
+            info.insert(id, BatchSessionInfo::new(is_dec, s.last_token.is_some(), s.next_pos));
+        }
+        let ids: Vec<SessionId> = self.sessions.keys().copied().collect();
+        let groups = self.batch_detector.detect(&ids, &info);
+        let sessions: Vec<&cellm_scheduler::Session> = self.session_meta.values().collect();
+        let _ = self.policy_exec.tick(&sessions, &[]);
+        let mut produced = 0usize;
+        for g in &groups {
+            for &id in &g.session_ids {
+                if produced >= budget { break; }
+                if let Some(tok) = self.decode_one_for_session(id)? {
+                    if let Some(s) = self.sessions.get_mut(&id) { s.pending_out.push_back(tok); produced += 1; }
+                }
+            }
+        }
+        Ok(produced)
+    }
+
+    fn pick_next_decodable_fair(&mut self) -> Option<SessionId> {
         let n = self.sessions.len().max(1);
         for _ in 0..n {
             let id = self.rr.next()?;
@@ -703,6 +788,12 @@ impl Engine {
 
             Ok(Some(next))
         })();
+
+        // Increment token counters if a token was produced.
+        if let Ok(Some(_)) = &out {
+            self.total_tokens_generated += 1;
+            self.tokens_since_snapshot += 1;
+        }
 
         self.sessions.insert(id, s);
         self.session_meta.insert(id, meta);
@@ -918,6 +1009,9 @@ pub struct EngineStats {
     pub used_kv_blocks: usize,
     pub free_kv_blocks: usize,
     pub thermal_level: ThermalLevel,
+    pub total_tokens_generated: u64,
+    pub current_tok_per_sec: f64,
+    pub scheduling_policy: SchedulingPolicy,
 }
 
 #[derive(Debug, Clone, Copy)]

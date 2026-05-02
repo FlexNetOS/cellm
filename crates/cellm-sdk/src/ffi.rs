@@ -300,6 +300,7 @@ pub extern "C" fn cellm_engine_create(
             kv_encoding: KvEncodingKind::F16,
             turboq_int8_dot: true,
             turboq_qjl_corr: true,
+            scheduling_policy: cellm_scheduler::SchedulingPolicy::Fair,
         };
         let engine = Engine::new(Path::new(model_path), cfg)
             .map_err(|e| format!("engine_create failed: {e}"))?;
@@ -350,6 +351,7 @@ pub extern "C" fn cellm_engine_create_v2(
             kv_encoding: KvEncodingKind::F16,
             turboq_int8_dot: true,
             turboq_qjl_corr: true,
+            scheduling_policy: cellm_scheduler::SchedulingPolicy::Fair,
         };
         let engine = Engine::new(Path::new(model_path), cfg)
             .map_err(|e| format!("engine_create_v2 failed: {e}"))?;
@@ -394,6 +396,7 @@ pub extern "C" fn cellm_engine_create_v3(
                 kv_encoding: KvEncodingKind::F16,
                 turboq_int8_dot: true,
                 turboq_qjl_corr: true,
+                scheduling_policy: cellm_scheduler::SchedulingPolicy::Fair,
             };
             let engine = Engine::new(Path::new(model_path), cfg)
                 .map_err(|e| format!("engine_create_v3 failed: {e}"))?;
@@ -452,6 +455,7 @@ pub extern "C" fn cellm_engine_create_v4(
                 kv_encoding,
                 turboq_int8_dot: turboq_int8_dot != 0,
                 turboq_qjl_corr: turboq_qjl_corr != 0,
+                scheduling_policy: cellm_scheduler::SchedulingPolicy::Fair,
             };
             let engine = Engine::new(Path::new(model_path), cfg)
                 .map_err(|e| format!("engine_create_v4 failed: {e}"))?;
@@ -924,6 +928,77 @@ pub extern "C" fn cellm_engine_is_litert_proxy(engine: cellm_engine_t) -> u32 {
     }
     let e = unsafe { &*(engine as *const Engine) };
     if e.is_litert_proxy() { 1 } else { 0 }
+}
+
+#[no_mangle]
+pub extern "C" fn cellm_engine_set_scheduling_policy(
+    engine: cellm_engine_t,
+    policy: u32,
+) -> i32 {
+    if engine == 0 {
+        set_last_error("set_scheduling_policy: null engine".to_string());
+        return -1;
+    }
+    let sp = match policy {
+        0 => cellm_scheduler::SchedulingPolicy::Fair,
+        1 => cellm_scheduler::SchedulingPolicy::LatencyFirst,
+        2 => cellm_scheduler::SchedulingPolicy::ThroughputFirst,
+        other => {
+            set_last_error(format!("set_scheduling_policy: invalid policy {other}"));
+            return -1;
+        }
+    };
+    let e = unsafe { &mut *(engine as *mut Engine) };
+    e.set_scheduling_policy(sp);
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn cellm_engine_scheduling_policy(engine: cellm_engine_t) -> u32 {
+    if engine == 0 {
+        return 0;
+    }
+    let e = unsafe { &*(engine as *const Engine) };
+    match e.scheduling_policy() {
+        cellm_scheduler::SchedulingPolicy::Fair => 0,
+        cellm_scheduler::SchedulingPolicy::LatencyFirst => 1,
+        cellm_scheduler::SchedulingPolicy::ThroughputFirst => 2,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cellm_engine_total_tokens(engine: cellm_engine_t) -> u64 {
+    if engine == 0 {
+        return 0;
+    }
+    let e = unsafe { &*(engine as *const Engine) };
+    e.stats().total_tokens_generated
+}
+
+#[no_mangle]
+pub extern "C" fn cellm_engine_tok_per_sec(
+    engine: cellm_engine_t,
+    out_tok_per_sec: *mut f64,
+) -> i32 {
+    if engine == 0 || out_tok_per_sec.is_null() {
+        set_last_error("tok_per_sec: null args".to_string());
+        return -1;
+    }
+    let e = unsafe { &*(engine as *const Engine) };
+    let st = e.stats();
+    unsafe { *out_tok_per_sec = st.current_tok_per_sec; }
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn cellm_engine_reset_stats_window(engine: cellm_engine_t) -> i32 {
+    if engine == 0 {
+        set_last_error("reset_stats_window: null engine".to_string());
+        return -1;
+    }
+    let e = unsafe { &mut *(engine as *mut Engine) };
+    e.reset_stats_window();
+    0
 }
 
 /// Direct text generation entrypoint for litertlm_proxy models.

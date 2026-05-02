@@ -66,6 +66,7 @@ impl LlamaRunner {
             intermediate_size: h.intermediate_size,
             rms_norm_eps: h.rms_norm_eps,
             rope_theta: h.rope_theta,
+            attention_softcap: 0.0,
         };
 
         let tensor_prefix = detect_llama_prefix(&file)?;
@@ -101,6 +102,10 @@ impl LlamaRunner {
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             f32_weight_cache: HashMap::new(),
         })
+    }
+
+    pub fn file(&self) -> &CellmFile {
+        &self.file
     }
 
     pub fn config(&self) -> &ModelConfig {
@@ -774,7 +779,7 @@ impl LlamaRunner {
         let lm_dtype_raw = lm_meta.dtype.clone();
         let lm_dtype = lm_dtype_raw.trim().to_ascii_lowercase();
         // Metal logits only supports f16 and i8; i4/i2 must use CPU path
-        let use_metal_logits = self.metal_ops.is_some() 
+        let use_metal_logits = self.metal_ops.is_some()
             && lm_dtype != "i4" && lm_dtype != "i2";
 
         if use_metal_logits {

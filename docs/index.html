@@ -1,773 +1,1161 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>cellm | Inference Projects</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:ital,wght@0,100..900;1,100..900&display=swap" rel="stylesheet">
-    <style>
-        :root {
-            --bg: #ffffff;
-            --text: #000000;
-            --text-secondary: #666666;
-            --border: #eeeeee;
-            --hover-bg: #f9f9f9;
-        }
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>cellm | Inference Projects</title>
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+        <link
+            href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:ital,wght@0,100..900;1,100..900&display=swap"
+            rel="stylesheet"
+        />
+        <style>
+            :root {
+                --bg: #ffffff;
+                --text: #000000;
+                --text-secondary: #666666;
+                --border: #eeeeee;
+                --hover-bg: #f9f9f9;
+            }
 
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
 
-        body {
-            background-color: var(--bg);
-            color: var(--text);
-            font-family: 'Hanken Grotesk', -apple-system, BlinkMacSystemFont, sans-serif;
-            line-height: 1.6;
-            -webkit-font-smoothing: antialiased;
-            -moz-osx-font-smoothing: grayscale;
-            padding: 80px 40px;
-        }
-
-        .container {
-            max-width: 800px;
-            margin: 0 auto;
-        }
-
-        header {
-            margin-bottom: 80px;
-        }
-
-        h1 {
-            font-size: 1.5rem;
-            font-weight: 600;
-            letter-spacing: -0.04em;
-            margin-bottom: 12px;
-            text-transform: lowercase;
-        }
-
-        .description {
-            color: var(--text-secondary);
-            font-size: 0.95rem;
-            font-weight: 400;
-            max-width: 500px;
-        }
-
-        .search-container {
-            margin-bottom: 60px;
-            position: sticky;
-            top: 0;
-            background: var(--bg);
-            padding: 20px 0;
-            z-index: 10;
-        }
-
-        #search {
-            width: 100%;
-            padding: 12px 0;
-            border: none;
-            border-bottom: 1px solid var(--border);
-            background: transparent;
-            font-size: 1rem;
-            outline: none;
-            transition: border-color 0.2s ease;
-            font-family: inherit;
-        }
-
-        #search:focus {
-            border-color: var(--text);
-        }
-
-        section {
-            margin-bottom: 80px;
-        }
-
-        h2 {
-            font-size: 0.75rem;
-            font-weight: 600;
-            color: var(--text-secondary);
-            text-transform: uppercase;
-            letter-spacing: 0.15em;
-            margin-bottom: 32px;
-            display: flex;
-            align-items: center;
-        }
-
-        h2::after {
-            content: '';
-            flex: 1;
-            height: 1px;
-            background: var(--border);
-            margin-left: 20px;
-        }
-
-        .project-list {
-            display: flex;
-            flex-direction: column;
-            gap: 24px;
-        }
-
-        .project-item {
-            text-decoration: none;
-            color: inherit;
-            display: block;
-            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-        }
-
-        .project-item:hover {
-            transform: translateX(8px);
-        }
-
-        .project-title {
-            font-size: 1.15rem;
-            font-weight: 500;
-            margin-bottom: 6px;
-            color: var(--text);
-            display: inline-block;
-            border-bottom: 1px solid transparent;
-            transition: border-color 0.3s ease;
-        }
-
-        .project-item:hover .project-title {
-            border-color: var(--text);
-        }
-
-        .project-meta {
-            font-size: 0.9rem;
-            color: var(--text-secondary);
-            font-weight: 400;
-        }
-
-        footer {
-            margin-top: 160px;
-            font-size: 0.85rem;
-            color: var(--text-secondary);
-            border-top: 1px solid var(--border);
-            padding-top: 40px;
-            padding-bottom: 80px;
-        }
-
-        /* Micro-animations */
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(10px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-
-        section {
-            animation: fadeIn 0.6s ease-out forwards;
-        }
-
-        /* Markdown Content Styling */
-        .markdown-body {
-            font-size: 1rem;
-            color: var(--text);
-        }
-
-        .markdown-body h1 {
-            font-size: 1.8rem;
-            margin-top: 40px;
-            margin-bottom: 24px;
-            letter-spacing: -0.04em;
-        }
-
-        .markdown-body h2 {
-            font-size: 1.3rem;
-            margin-top: 48px;
-            margin-bottom: 16px;
-            text-transform: none;
-            letter-spacing: -0.02em;
-            border-bottom: none;
-            color: var(--text);
-        }
-
-        .markdown-body h2::after {
-            display: none;
-        }
-
-        .markdown-body h3 {
-            font-size: 1.1rem;
-            margin-top: 32px;
-            margin-bottom: 12px;
-        }
-
-        .markdown-body p {
-            margin-bottom: 20px;
-        }
-
-        .markdown-body ul, .markdown-body ol {
-            margin-bottom: 20px;
-            padding-left: 24px;
-        }
-
-        .markdown-body li {
-            margin-bottom: 8px;
-        }
-
-        .markdown-body code {
-            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-            background: #f4f4f4;
-            padding: 2px 4px;
-            border-radius: 4px;
-            font-size: 0.9em;
-        }
-
-        .markdown-body pre {
-            background: #f9f9f9;
-            padding: 24px;
-            border-radius: 8px;
-            overflow-x: auto;
-            margin-bottom: 24px;
-            border: 1px solid var(--border);
-            position: relative;
-        }
-
-        .copy-btn {
-            position: absolute;
-            top: 12px;
-            right: 12px;
-            font-size: 0.7rem;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-            color: var(--text-secondary);
-            background: var(--bg);
-            border: 1px solid var(--border);
-            padding: 4px 8px;
-            border-radius: 4px;
-            cursor: pointer;
-            opacity: 0;
-            transition: opacity 0.2s ease, background 0.2s ease;
-        }
-
-        .markdown-body pre:hover .copy-btn {
-            opacity: 1;
-        }
-
-        .copy-btn:hover {
-            background: var(--hover-bg);
-            color: var(--text);
-        }
-
-        .markdown-body pre code {
-            background: transparent;
-            padding: 0;
-            font-size: 0.85rem;
-            color: var(--text);
-        }
-
-        .markdown-body blockquote {
-            border-left: 2px solid var(--text);
-            padding-left: 20px;
-            margin-left: 0;
-            font-style: italic;
-            color: var(--text-secondary);
-        }
-
-        .markdown-body a {
-            color: var(--text);
-            text-decoration: underline;
-            text-underline-offset: 4px;
-            text-decoration-color: var(--border);
-            transition: text-decoration-color 0.2s ease;
-        }
-
-        .markdown-body a:hover {
-            text-decoration-color: var(--text);
-        }
-
-        .markdown-body img {
-            max-width: 100%;
-            height: auto;
-            border-radius: 8px;
-            margin: 32px 0;
-        }
-
-        .markdown-body hr {
-            border: none;
-            border-top: 1px solid var(--border);
-            margin: 48px 0;
-        }
-
-        /* Table Styling */
-        .markdown-body table {
-            width: 100%;
-            border-collapse: collapse;
-            margin: 32px 0;
-            font-size: 0.95rem;
-        }
-
-        .markdown-body th {
-            text-align: left;
-            font-weight: 600;
-            padding: 12px 16px;
-            border-bottom: 2px solid var(--text);
-            color: var(--text);
-        }
-
-        .markdown-body td {
-            padding: 16px;
-            border-bottom: 1px solid var(--border);
-            color: var(--text-secondary);
-        }
-
-        .markdown-body tr:nth-child(even) {
-            background: rgba(0,0,0,0.02);
-        }
-
-        .markdown-body td code {
-            font-family: 'JetBrains Mono', 'Fira Code', monospace;
-            background: none;
-            padding: 0;
-            color: var(--text);
-        }
-
-        .markdown-body tr:hover td {
-            color: var(--text);
-            background: var(--hover-bg);
-        }
-
-        .mermaid-wrapper {
-            position: relative;
-            margin: 40px 0;
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            overflow: hidden;
-            background: var(--bg);
-            height: 500px; /* Fixed height for pan-zoom context */
-        }
-
-        .mermaid {
-            width: 100%;
-            height: 100%;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            cursor: grab;
-        }
-
-        .mermaid:active {
-            cursor: grabbing;
-        }
-
-        .mermaid-controls {
-            position: absolute;
-            bottom: 20px;
-            right: 20px;
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 4px;
-            z-index: 100;
-            opacity: 0;
-            transition: opacity 0.3s ease;
-        }
-
-        .mermaid-wrapper:hover .mermaid-controls {
-            opacity: 1;
-        }
-
-        .zoom-btn {
-            width: 32px;
-            height: 32px;
-            background: var(--bg);
-            border: 1px solid var(--border);
-            color: var(--text);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 1rem;
-            cursor: pointer;
-            border-radius: 4px;
-            transition: all 0.2s ease;
-        }
-
-        .zoom-btn:hover {
-            background: var(--hover-bg);
-            border-color: var(--text);
-        }
-
-        .zoom-btn svg {
-            width: 16px;
-            height: 16px;
-            fill: currentColor;
-        }
-
-        .markdown-body img {
-            max-width: 100%;
-            height: auto;
-            border-radius: 8px;
-            margin: 32px 0;
-            cursor: zoom-in;
-            transition: opacity 0.2s ease;
-        }
-
-        .markdown-body img:hover {
-            opacity: 0.8;
-        }
-
-        .markdown-body video {
-            max-width: 100%;
-            height: auto;
-            border-radius: 8px;
-            margin: 32px 0;
-            border: 1px solid var(--border);
-        }
-
-        /* Lightbox */
-        #lightbox {
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(255, 255, 255, 0.98);
-            z-index: 1000;
-            display: none;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            padding: 40px;
-            cursor: zoom-out;
-        }
-
-        #lightbox-content {
-            max-width: 95%;
-            max-height: 90%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-
-        #lightbox-content img, #lightbox-content svg {
-            max-width: 100%;
-            max-height: 100%;
-            object-fit: contain;
-            box-shadow: 0 20px 50px rgba(0,0,0,0.1);
-        }
-
-        #lightbox-close {
-            position: absolute;
-            top: 40px;
-            right: 40px;
-            font-size: 0.9rem;
-            font-weight: 500;
-            color: var(--text-secondary);
-            cursor: pointer;
-            text-transform: uppercase;
-            letter-spacing: 0.1em;
-        }
-
-        @media (max-width: 600px) {
             body {
-                padding: 60px 24px;
+                background-color: var(--bg);
+                color: var(--text);
+                font-family:
+                    "Hanken Grotesk",
+                    -apple-system,
+                    BlinkMacSystemFont,
+                    sans-serif;
+                line-height: 1.6;
+                -webkit-font-smoothing: antialiased;
+                -moz-osx-font-smoothing: grayscale;
+                padding: 80px 40px;
             }
-            header {
-                margin-bottom: 60px;
-            }
-            h1 {
-                font-size: 1.25rem;
-            }
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <header>
-            <div style="display: flex; justify-content: space-between; align-items: baseline;">
-                <h1>cellm</h1>
-                <a href="https://github.com/jeffasante/cellm" class="project-meta" target="_blank" style="text-decoration: none; border-bottom: 1px solid transparent; transition: border-color 0.2s ease;">github.com/jeffasante/cellm &rarr;</a>
-            </div>
-            <p class="description">A high-performance inference engine for small language models and vision-language models on the edge.</p>
-            <p class="description" style="margin-top: 16px; font-weight: 300; color: var(--text-secondary); max-width: 650px;">Mobile-native LLM serving engine research in Rust. Paged KV cache, multi-session scheduling, and Metal/Vulkan kernels for on-device inference under 512MB RAM.</p>
-            <p class="description" style="margin-top: 8px; font-size: 0.8rem; letter-spacing: 0.02em; color: var(--text-secondary); opacity: 0.8;">
-                <strong>CellmFFI.xcframework:</strong> 33MB total (11MB per platform: iOS, Simulator, macOS)
-            </p>
-        </header>
 
-        <div class="search-container">
-            <input type="text" id="search" placeholder="Search research, models, architecture..." autocomplete="off">
+            .container {
+                max-width: 800px;
+                margin: 0 auto;
+            }
+
+            header {
+                margin-bottom: 80px;
+            }
+
+            h1 {
+                font-size: 1.5rem;
+                font-weight: 600;
+                letter-spacing: -0.04em;
+                margin-bottom: 12px;
+                text-transform: lowercase;
+            }
+
+            .description {
+                color: var(--text-secondary);
+                font-size: 0.95rem;
+                font-weight: 400;
+                max-width: 500px;
+            }
+
+            .search-container {
+                margin-bottom: 60px;
+                position: sticky;
+                top: 0;
+                background: var(--bg);
+                padding: 20px 0;
+                z-index: 10;
+            }
+
+            #search {
+                width: 100%;
+                padding: 12px 0;
+                border: none;
+                border-bottom: 1px solid var(--border);
+                background: transparent;
+                font-size: 1rem;
+                outline: none;
+                transition: border-color 0.2s ease;
+                font-family: inherit;
+            }
+
+            #search:focus {
+                border-color: var(--text);
+            }
+
+            section {
+                margin-bottom: 80px;
+            }
+
+            h2 {
+                font-size: 0.75rem;
+                font-weight: 600;
+                color: var(--text-secondary);
+                text-transform: uppercase;
+                letter-spacing: 0.15em;
+                margin-bottom: 32px;
+                display: flex;
+                align-items: center;
+            }
+
+            h2::after {
+                content: "";
+                flex: 1;
+                height: 1px;
+                background: var(--border);
+                margin-left: 20px;
+            }
+
+            .project-list {
+                display: flex;
+                flex-direction: column;
+                gap: 24px;
+            }
+
+            .project-item {
+                text-decoration: none;
+                color: inherit;
+                display: block;
+                transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            }
+
+            .project-item:hover {
+                transform: translateX(8px);
+            }
+
+            .project-title {
+                font-size: 1.15rem;
+                font-weight: 500;
+                margin-bottom: 6px;
+                color: var(--text);
+                display: inline-block;
+                border-bottom: 1px solid transparent;
+                transition: border-color 0.3s ease;
+            }
+
+            .project-item:hover .project-title {
+                border-color: var(--text);
+            }
+
+            .project-meta {
+                font-size: 0.9rem;
+                color: var(--text-secondary);
+                font-weight: 400;
+            }
+
+            footer {
+                margin-top: 160px;
+                font-size: 0.85rem;
+                color: var(--text-secondary);
+                border-top: 1px solid var(--border);
+                padding-top: 40px;
+                padding-bottom: 80px;
+            }
+
+            /* Micro-animations */
+            @keyframes fadeIn {
+                from {
+                    opacity: 0;
+                    transform: translateY(10px);
+                }
+                to {
+                    opacity: 1;
+                    transform: translateY(0);
+                }
+            }
+
+            section {
+                animation: fadeIn 0.6s ease-out forwards;
+            }
+
+            /* Markdown Content Styling */
+            .markdown-body {
+                font-size: 1rem;
+                color: var(--text);
+            }
+
+            .markdown-body h1 {
+                font-size: 1.8rem;
+                margin-top: 40px;
+                margin-bottom: 24px;
+                letter-spacing: -0.04em;
+            }
+
+            .markdown-body h2 {
+                font-size: 1.3rem;
+                margin-top: 48px;
+                margin-bottom: 16px;
+                text-transform: none;
+                letter-spacing: -0.02em;
+                border-bottom: none;
+                color: var(--text);
+            }
+
+            .markdown-body h2::after {
+                display: none;
+            }
+
+            .markdown-body h3 {
+                font-size: 1.1rem;
+                margin-top: 32px;
+                margin-bottom: 12px;
+            }
+
+            .markdown-body p {
+                margin-bottom: 20px;
+            }
+
+            .markdown-body ul,
+            .markdown-body ol {
+                margin-bottom: 20px;
+                padding-left: 24px;
+            }
+
+            .markdown-body li {
+                margin-bottom: 8px;
+            }
+
+            .markdown-body code {
+                font-family:
+                    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+                    monospace;
+                background: #f4f4f4;
+                padding: 2px 4px;
+                border-radius: 4px;
+                font-size: 0.9em;
+            }
+
+            .markdown-body pre {
+                background: #f9f9f9;
+                padding: 24px;
+                border-radius: 8px;
+                overflow-x: auto;
+                margin-bottom: 24px;
+                border: 1px solid var(--border);
+                position: relative;
+            }
+
+            .copy-btn {
+                position: absolute;
+                top: 12px;
+                right: 12px;
+                font-size: 0.7rem;
+                text-transform: uppercase;
+                letter-spacing: 0.05em;
+                color: var(--text-secondary);
+                background: var(--bg);
+                border: 1px solid var(--border);
+                padding: 4px 8px;
+                border-radius: 4px;
+                cursor: pointer;
+                opacity: 0;
+                transition:
+                    opacity 0.2s ease,
+                    background 0.2s ease;
+            }
+
+            .markdown-body pre:hover .copy-btn {
+                opacity: 1;
+            }
+
+            .copy-btn:hover {
+                background: var(--hover-bg);
+                color: var(--text);
+            }
+
+            .markdown-body pre code {
+                background: transparent;
+                padding: 0;
+                font-size: 0.85rem;
+                color: var(--text);
+            }
+
+            .markdown-body blockquote {
+                border-left: 2px solid var(--text);
+                padding-left: 20px;
+                margin-left: 0;
+                font-style: italic;
+                color: var(--text-secondary);
+            }
+
+            .markdown-body a {
+                color: var(--text);
+                text-decoration: underline;
+                text-underline-offset: 4px;
+                text-decoration-color: var(--border);
+                transition: text-decoration-color 0.2s ease;
+            }
+
+            .markdown-body a:hover {
+                text-decoration-color: var(--text);
+            }
+
+            .markdown-body img {
+                max-width: 100%;
+                height: auto;
+                border-radius: 8px;
+                margin: 32px 0;
+            }
+
+            .markdown-body hr {
+                border: none;
+                border-top: 1px solid var(--border);
+                margin: 48px 0;
+            }
+
+            /* Table Styling */
+            .markdown-body table {
+                width: 100%;
+                border-collapse: collapse;
+                margin: 32px 0;
+                font-size: 0.95rem;
+            }
+
+            .markdown-body th {
+                text-align: left;
+                font-weight: 600;
+                padding: 12px 16px;
+                border-bottom: 2px solid var(--text);
+                color: var(--text);
+            }
+
+            .markdown-body td {
+                padding: 16px;
+                border-bottom: 1px solid var(--border);
+                color: var(--text-secondary);
+            }
+
+            .markdown-body tr:nth-child(even) {
+                background: rgba(0, 0, 0, 0.02);
+            }
+
+            .markdown-body td code {
+                font-family: "JetBrains Mono", "Fira Code", monospace;
+                background: none;
+                padding: 0;
+                color: var(--text);
+            }
+
+            .markdown-body tr:hover td {
+                color: var(--text);
+                background: var(--hover-bg);
+            }
+
+            .mermaid-wrapper {
+                position: relative;
+                margin: 40px 0;
+                border: 1px solid var(--border);
+                border-radius: 8px;
+                overflow: hidden;
+                background: var(--bg);
+                height: 500px; /* Fixed height for pan-zoom context */
+            }
+
+            .mermaid {
+                width: 100%;
+                height: 100%;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                cursor: grab;
+            }
+
+            .mermaid:active {
+                cursor: grabbing;
+            }
+
+            .mermaid-controls {
+                position: absolute;
+                bottom: 20px;
+                right: 20px;
+                display: grid;
+                grid-template-columns: repeat(3, 1fr);
+                gap: 4px;
+                z-index: 100;
+                opacity: 0;
+                transition: opacity 0.3s ease;
+            }
+
+            .mermaid-wrapper:hover .mermaid-controls {
+                opacity: 1;
+            }
+
+            .zoom-btn {
+                width: 32px;
+                height: 32px;
+                background: var(--bg);
+                border: 1px solid var(--border);
+                color: var(--text);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 1rem;
+                cursor: pointer;
+                border-radius: 4px;
+                transition: all 0.2s ease;
+            }
+
+            .zoom-btn:hover {
+                background: var(--hover-bg);
+                border-color: var(--text);
+            }
+
+            .zoom-btn svg {
+                width: 16px;
+                height: 16px;
+                fill: currentColor;
+            }
+
+            .markdown-body img {
+                max-width: 100%;
+                height: auto;
+                border-radius: 8px;
+                margin: 32px 0;
+                cursor: zoom-in;
+                transition: opacity 0.2s ease;
+            }
+
+            .markdown-body img:hover {
+                opacity: 0.8;
+            }
+
+            .markdown-body video {
+                max-width: 100%;
+                height: auto;
+                border-radius: 8px;
+                margin: 32px 0;
+                border: 1px solid var(--border);
+            }
+
+            /* Lightbox */
+            #lightbox {
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                background: rgba(255, 255, 255, 0.98);
+                z-index: 1000;
+                display: none;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                padding: 40px;
+                cursor: zoom-out;
+            }
+
+            #lightbox-content {
+                max-width: 95%;
+                max-height: 90%;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }
+
+            #lightbox-content img,
+            #lightbox-content svg {
+                max-width: 100%;
+                max-height: 100%;
+                object-fit: contain;
+                box-shadow: 0 20px 50px rgba(0, 0, 0, 0.1);
+            }
+
+            #lightbox-close {
+                position: absolute;
+                top: 40px;
+                right: 40px;
+                font-size: 0.9rem;
+                font-weight: 500;
+                color: var(--text-secondary);
+                cursor: pointer;
+                text-transform: uppercase;
+                letter-spacing: 0.1em;
+            }
+
+            @media (max-width: 600px) {
+                body {
+                    padding: 60px 24px;
+                }
+                header {
+                    margin-bottom: 60px;
+                }
+                h1 {
+                    font-size: 1.25rem;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <header>
+                <div
+                    style="
+                        display: flex;
+                        justify-content: space-between;
+                        align-items: baseline;
+                    "
+                >
+                    <h1>cellm</h1>
+                    <a
+                        href="https://github.com/jeffasante/cellm"
+                        class="project-meta"
+                        target="_blank"
+                        style="
+                            text-decoration: none;
+                            border-bottom: 1px solid transparent;
+                            transition: border-color 0.2s ease;
+                        "
+                        >github.com/jeffasante/cellm &rarr;</a
+                    >
+                </div>
+                <p class="description">
+                    A high-performance inference engine for small language
+                    models and vision-language models on the edge.
+                </p>
+                <p
+                    class="description"
+                    style="
+                        margin-top: 16px;
+                        font-weight: 300;
+                        color: var(--text-secondary);
+                        max-width: 650px;
+                    "
+                >
+                    Mobile-native LLM serving engine research in Rust. Paged KV
+                    cache, multi-session scheduling, and Metal/Vulkan kernels
+                    for on-device inference under 512MB RAM.
+                </p>
+                <p
+                    class="description"
+                    style="
+                        margin-top: 8px;
+                        font-size: 0.8rem;
+                        letter-spacing: 0.02em;
+                        color: var(--text-secondary);
+                        opacity: 0.8;
+                    "
+                >
+                    <strong>CellmFFI.xcframework:</strong> 33MB total (11MB per
+                    platform: iOS, Simulator, macOS)
+                </p>
+            </header>
+
+            <div class="search-container">
+                <input
+                    type="text"
+                    id="search"
+                    placeholder="Search research, models, architecture..."
+                    autocomplete="off"
+                />
+            </div>
+
+            <section id="overview">
+                <h2>Project Overview</h2>
+                <div class="project-list">
+                    <a href="README.md" class="project-item">
+                        <div class="project-title">Main README & Demos</div>
+                        <div class="project-meta">
+                            Primary project overview, installation, and video
+                            demonstrations.
+                        </div>
+                    </a>
+                    <a href="paper.md" class="project-item">
+                        <div class="project-title">Research Paper</div>
+                        <div class="project-meta">
+                            Technical whitepaper on cellm's architecture and
+                            performance.
+                        </div>
+                    </a>
+                    <a
+                        href="#"
+                        class="project-item"
+                        style="pointer-events: none"
+                    >
+                        <div class="project-title">Binary Footprint</div>
+                        <div class="project-meta">
+                            11MB per platform (iOS/macOS). 33MB total
+                            XCFramework includes full engine & backends.
+                        </div>
+                    </a>
+                </div>
+            </section>
+
+            <section id="architecture">
+                <h2>Core Architecture</h2>
+                <div class="project-list">
+                    <a href="project_architecture.md" class="project-item">
+                        <div class="project-title">System Design</div>
+                        <div class="project-meta">
+                            High-level architectural overview of the cellm
+                            inference pipeline.
+                        </div>
+                    </a>
+                    <a href="data_flow.md" class="project-item">
+                        <div class="project-title">Execution Dataflow</div>
+                        <div class="project-meta">
+                            Internal data movement between host and accelerator
+                            backends.
+                        </div>
+                    </a>
+                    <a href="inference_graph.md" class="project-item">
+                        <div class="project-title">Inference Graph</div>
+                        <div class="project-meta">
+                            Computational graph structure and optimized
+                            execution paths.
+                        </div>
+                    </a>
+                    <a href="quantization_architecture.md" class="project-item">
+                        <div class="project-title">Quantization Strategy</div>
+                        <div class="project-meta">
+                            Implementing Int4, Int8, and mixed-precision for
+                            edge devices.
+                        </div>
+                    </a>
+                    <a href="mobile-dataflow.md" class="project-item">
+                        <div class="project-title">Mobile Dataflow</div>
+                        <div class="project-meta">
+                            Optimized data movement for mobile-first inference.
+                        </div>
+                    </a>
+                    <a href="phase2-foundation.md" class="project-item">
+                        <div class="project-title">Phase 2 Foundation</div>
+                        <div class="project-meta">
+                            Strategic roadmap and architectural enhancements for
+                            cellm v2.
+                        </div>
+                    </a>
+                    <a href="scheduler.md" class="project-item">
+                        <div class="project-title">Task Scheduler</div>
+                        <div class="project-meta">
+                            Low-level scheduling of compute kernels and async
+                            operations.
+                        </div>
+                    </a>
+                    <a
+                        href="phase4-continuous-batching.md"
+                        class="project-item"
+                    >
+                        <div
+                            style="
+                                display: flex;
+                                justify-content: space-between;
+                                align-items: baseline;
+                            "
+                        >
+                            <div class="project-title">
+                                Phase 4: Continuous Batching
+                                <span
+                                    style="
+                                        font-size: 0.65rem;
+                                        background: #000;
+                                        color: #fff;
+                                        padding: 2px 6px;
+                                        border-radius: 10px;
+                                        margin-left: 8px;
+                                        vertical-align: middle;
+                                    ">
+                                    NEW</span>
+                                                                </div>
+                                                                <div style="font-size: 0.85rem; color: var(--text-secondary);">May 1, 2026</div>
+                                                            </div>
+                        <div class="project-meta">
+                            Continuous batching lite, SchedulingPolicy, Q4_K
+                            dtype, and expanded engine stats.
+                        </div>
+                    </a>
+                </div>
+            </section>
+
+            <section id="optimizations">
+                <h2>Performance & Memory</h2>
+                <div class="project-list">
+                    <a
+                        href="q1_0_g128_cpu_optimization.md"
+                        class="project-item"
+                    >
+                        <div
+                            style="
+                                display: flex;
+                                justify-content: space-between;
+                                align-items: baseline;
+                            "
+                        >
+                            <div class="project-title">
+                                Q1_0 CPU Optimization
+                            </div>
+                            <div
+                                style="
+                                    font-size: 0.85rem;
+                                    color: var(--text-secondary);
+                                "
+                            >
+                                April 26, 2026
+                            </div>
+                        </div>
+                        <div class="project-meta">
+                            Resolving extreme latency on quantized CPU
+                            fallbacks.
+                        </div>
+                    </a>
+                    <a href="inference_optimizations.md" class="project-item">
+                        <div class="project-title">Inference Optimizations</div>
+                        <div class="project-meta">
+                            Low-latency techniques for SLM execution on Apple
+                            Silicon and CPU.
+                        </div>
+                    </a>
+                    <a href="paged-kv-cache-foundation.md" class="project-item">
+                        <div class="project-title">Paged KV Cache</div>
+                        <div class="project-meta">
+                            Dynamic memory management for efficient long-context
+                            handling.
+                        </div>
+                    </a>
+                    <a href="turboquant_dataflow.md" class="project-item">
+                        <div class="project-title">TurboQuant</div>
+                        <div class="project-meta">
+                            High-performance quantization kernel dataflow and
+                            register usage.
+                        </div>
+                    </a>
+                    <a
+                        href="gemma3_mixed_quantization_rationale.md"
+                        class="project-item"
+                    >
+                        <div class="project-title">
+                            Mixed-Precision Rationale
+                        </div>
+                        <div class="project-meta">
+                            Balancing accuracy and speed with hybrid bit-depths.
+                        </div>
+                    </a>
+                    <a href="LFM_Metal_Acceleration.md" class="project-item">
+                        <div class="project-title">
+                            LFM Metal Acceleration
+                            <span
+                                style="
+                                    font-size: 0.65rem;
+                                    background: #000;
+                                    color: #fff;
+                                    padding: 2px 6px;
+                                    border-radius: 10px;
+                                    margin-left: 8px;
+                                    vertical-align: middle;
+                                "
+                                >NEW</span
+                            >
+                        </div>
+                        <div class="project-meta">
+                            Deep-dive into Metal kernels and performance for
+                            Liquid Foundation Models.
+                        </div>
+                    </a>
+                    <a href="vlm_metal_optimization.md" class="project-item">
+                        <div
+                            style="
+                                display: flex;
+                                justify-content: space-between;
+                                align-items: baseline;
+                            "
+                        >
+                            <div class="project-title">
+                                VLM Metal Optimization
+                                <span
+                                    style="
+                                        font-size: 0.65rem;
+                                        background: #000;
+                                        color: #fff;
+                                        padding: 2px 6px;
+                                        border-radius: 10px;
+                                        margin-left: 8px;
+                                        vertical-align: middle;
+                                    "
+                                    >NEW</span
+                                >
+                            </div>
+                            <div
+                                style="
+                                    font-size: 0.85rem;
+                                    color: var(--text-secondary);
+                                "
+                            >
+                                April 28, 2026
+                            </div>
+                        </div>
+                        <div class="project-meta">
+                            Eliminating redundant logits/topk during VLM prefill
+                            on Apple Silicon.
+                        </div>
+                    </a>
+                    <a href="gemma_metal_nan_fix.md" class="project-item">
+                        <div
+                            style="
+                                display: flex;
+                                justify-content: space-between;
+                                align-items: baseline;
+                            "
+                        >
+                            <div class="project-title">
+                                Gemma Metal NaN Fix
+                                <span
+                                    style="
+                                        font-size: 0.65rem;
+                                        background: #000;
+                                        color: #fff;
+                                        padding: 2px 6px;
+                                        border-radius: 10px;
+                                        margin-left: 8px;
+                                        vertical-align: middle;
+                                    "
+                                    >NEW</span
+                                >
+                            </div>
+                            <div
+                                style="
+                                    font-size: 0.85rem;
+                                    color: var(--text-secondary);
+                                "
+                            >
+                                April 30, 2026
+                            </div>
+                        </div>
+                        <div class="project-meta">
+                            Tracing fused graph NaNs to Metal fast-math and
+                            restoring Gemma GPU inference.
+                        </div>
+                    </a>
+                    <a href="gemma4-metal-bug.md" class="project-item">
+                        <div
+                            style="
+                                display: flex;
+                                justify-content: space-between;
+                                align-items: baseline;
+                            "
+                        >
+                            <div class="project-title">
+                                Gemma4 Metal Unused33 Fix
+                                <span
+                                    style="
+                                        font-size: 0.65rem;
+                                        background: #000;
+                                        color: #fff;
+                                        padding: 2px 6px;
+                                        border-radius: 10px;
+                                        margin-left: 8px;
+                                        vertical-align: middle;
+                                    "
+                                    >NEW</span
+                                >
+                            </div>
+                            <div
+                                style="
+                                    font-size: 0.85rem;
+                                    color: var(--text-secondary);
+                                "
+                            >
+                                May 2, 2026
+                            </div>
+                        </div>
+                        <div class="project-meta">
+                            Fixing degenerate logits from an empty persistent
+                            GPU KV cache in the per-layer Metal decode path.
+                        </div>
+                    </a>
+                    <a href="metal_inference_fix.md" class="project-item">
+                        <div class="project-title">Metal Backend Fixes</div>
+                        <div class="project-meta">
+                            Resolving stability issues in the Metal execution
+                            path.
+                        </div>
+                    </a>
+                </div>
+            </section>
+
+            <section id="models">
+                <h2>Model Research</h2>
+                <div class="project-list">
+                    <a href="models.md" class="project-item">
+                        <div class="project-title">Model Repository</div>
+                        <div class="project-meta">
+                            Browse all hosted cellm models and weights on
+                            Hugging Face.
+                        </div>
+                    </a>
+                    <a href="qwen25_cellm_working.md" class="project-item">
+                        <div class="project-title">Qwen 2.5 Implementation</div>
+                        <div class="project-meta">
+                            Full support for the Qwen 2.5 family of models.
+                        </div>
+                    </a>
+                    <a href="qwen3_5-deltanet.md" class="project-item">
+                        <div class="project-title">Qwen 3.5 DeltaNet</div>
+                        <div class="project-meta">
+                            Hybrid linear and full attention architecture
+                            support.
+                        </div>
+                    </a>
+                    <a
+                        href="research/qwen3.5-quantization.md"
+                        class="project-item"
+                    >
+                        <div class="project-title">Qwen 3.5 Quantization</div>
+                        <div class="project-meta">
+                            Deep-dive into Int4 and 1-bit quantization for Qwen
+                            3.5 models.
+                        </div>
+                    </a>
+                    <a href="cellm-vlm-sequence.md" class="project-item">
+                        <div class="project-title">VLM Sequences</div>
+                        <div class="project-meta">
+                            Handling multi-modal sequence generation and
+                            attention.
+                        </div>
+                    </a>
+                    <a
+                        href="gemma4_10gb_to_3_4gb_mobile_journey.md"
+                        class="project-item"
+                    >
+                        <div class="project-title">Gemma 4 Mobile Journey</div>
+                        <div class="project-meta">
+                            The technical challenge of squeezing 10GB models
+                            into 3.4GB.
+                        </div>
+                    </a>
+                    <a href="bonsai_1bit_analysis.md" class="project-item">
+                        <div class="project-title">Bonsai 1-bit Analysis</div>
+                        <div class="project-meta">
+                            Investigating incoherence in extreme 1-bit
+                            quantization.
+                        </div>
+                    </a>
+                    <a href="vlm-smolvlm-onnx.md" class="project-item">
+                        <div class="project-title">SmolVLM & Vision</div>
+                        <div class="project-meta">
+                            Vision-Language Model integration and inference
+                            benchmarks.
+                        </div>
+                    </a>
+                    <a href="audio-inference.md" class="project-item">
+                        <div class="project-title">Audio Modalities</div>
+                        <div class="project-meta">
+                            Direct audio-to-text inference with optimized
+                            encoders.
+                        </div>
+                    </a>
+                    <a
+                        href="gemma-4-E2B-it-int4-aggr-v2-README.md"
+                        class="project-item"
+                    >
+                        <div class="project-title">Gemma 4 Multimodal INT4</div>
+                        <div class="project-meta">
+                            Aggressive 4-bit quantization for full
+                            text/vision/audio stacks.
+                        </div>
+                    </a>
+                </div>
+            </section>
+
+            <section id="guides">
+                <h2>Development</h2>
+                <div class="project-list">
+                    <a href="format.md" class="project-item">
+                        <div class="project-title">The .cellm Format</div>
+                        <div class="project-meta">
+                            Binary specification for the optimized model
+                            serialization.
+                        </div>
+                    </a>
+                    <a href="convert-quantized-models.md" class="project-item">
+                        <div class="project-title">Quantization Guide</div>
+                        <div class="project-meta">
+                            Workflow for converting HuggingFace weights to
+                            cellm.
+                        </div>
+                    </a>
+                    <a href="lessons/kernel_concepts.md" class="project-item">
+                        <div class="project-title">Kernel Concepts</div>
+                        <div class="project-meta">
+                            Fundamental primitives for writing high-performance
+                            ML kernels.
+                        </div>
+                    </a>
+                    <a href="lessons/lesson.group-qk.md" class="project-item">
+                        <div class="project-title">Attention: GQA & MQA</div>
+                        <div class="project-meta">
+                            Reducing memory footprint with Grouped Query
+                            Attention.
+                        </div>
+                    </a>
+                    <a href="benchmarks/README.md" class="project-item">
+                        <div class="project-title">Benchmarks</div>
+                        <div class="project-meta">
+                            Current performance metrics across various backends.
+                        </div>
+                    </a>
+                    <a href="benchmarks/history.md" class="project-item">
+                        <div class="project-title">Benchmark History</div>
+                        <div class="project-meta">
+                            Browse specific profiling runs and performance logs.
+                        </div>
+                    </a>
+                </div>
+            </section>
+
+            <section id="bindings">
+                <h2>Mobile & Bindings</h2>
+                <div class="project-list">
+                    <a
+                        href="../bindings/ios/CellmDemo/README.md"
+                        class="project-item"
+                    >
+                        <div class="project-title">iOS Demo App</div>
+                        <div class="project-meta">
+                            SwiftUI test app for LLM and VLM inference via cellm
+                            FFI on iPhone.
+                        </div>
+                    </a>
+                </div>
+            </section>
+
+            <footer>
+                <p>
+                    &copy; 2026 cellm research.
+                    <a
+                        href="https://jeffasante.github.io/"
+                        style="
+                            color: inherit;
+                            text-decoration: none;
+                            border-bottom: 1px solid var(--border);
+                            transition: border-color 0.2s ease;
+                        "
+                        >jeff asante</a
+                    >. minimalist technical documentation.
+                </p>
+            </footer>
         </div>
 
-        <section id="overview">
-            <h2>Project Overview</h2>
-            <div class="project-list">
-                <a href="README.md" class="project-item">
-                    <div class="project-title">Main README & Demos</div>
-                    <div class="project-meta">Primary project overview, installation, and video demonstrations.</div>
-                </a>
-                <a href="paper.md" class="project-item">
-                    <div class="project-title">Research Paper</div>
-                    <div class="project-meta">Technical whitepaper on cellm's architecture and performance.</div>
-                </a>
-                <a href="#" class="project-item" style="pointer-events: none;">
-                    <div class="project-title">Binary Footprint</div>
-                    <div class="project-meta">11MB per platform (iOS/macOS). 33MB total XCFramework includes full engine & backends.</div>
-                </a>
-            </div>
-        </section>
+        <!-- Markdown Viewer -->
+        <div id="viewer" class="container" style="display: none">
+            <nav style="margin-bottom: 40px">
+                <a
+                    href="#"
+                    id="back-btn"
+                    class="project-item"
+                    style="
+                        display: inline-block;
+                        font-size: 0.9rem;
+                        font-weight: 500;
+                    "
+                    >&larr; Back to Index</a
+                >
+            </nav>
+            <div id="content" class="markdown-body"></div>
+            <footer style="margin-top: 80px">
+                <p>
+                    &copy; 2026
+                    <a
+                        href="https://jeffasante.github.io/"
+                        style="
+                            color: inherit;
+                            text-decoration: none;
+                            border-bottom: 1px solid var(--border);
+                            transition: border-color 0.2s ease;
+                        "
+                        >jeff asante</a
+                    >. minimalist technical documentation.
+                </p>
+            </footer>
+        </div>
 
-        <section id="architecture">
-            <h2>Core Architecture</h2>
-            <div class="project-list">
-                <a href="project_architecture.md" class="project-item">
-                    <div class="project-title">System Design</div>
-                    <div class="project-meta">High-level architectural overview of the cellm inference pipeline.</div>
-                </a>
-                <a href="data_flow.md" class="project-item">
-                    <div class="project-title">Execution Dataflow</div>
-                    <div class="project-meta">Internal data movement between host and accelerator backends.</div>
-                </a>
-                <a href="inference_graph.md" class="project-item">
-                    <div class="project-title">Inference Graph</div>
-                    <div class="project-meta">Computational graph structure and optimized execution paths.</div>
-                </a>
-                <a href="quantization_architecture.md" class="project-item">
-                    <div class="project-title">Quantization Strategy</div>
-                    <div class="project-meta">Implementing Int4, Int8, and mixed-precision for edge devices.</div>
-                </a>
-                <a href="mobile-dataflow.md" class="project-item">
-                    <div class="project-title">Mobile Dataflow</div>
-                    <div class="project-meta">Optimized data movement for mobile-first inference.</div>
-                </a>
-                <a href="phase2-foundation.md" class="project-item">
-                    <div class="project-title">Phase 2 Foundation</div>
-                    <div class="project-meta">Strategic roadmap and architectural enhancements for cellm v2.</div>
-                </a>
-                <a href="scheduler.md" class="project-item">
-                    <div class="project-title">Task Scheduler</div>
-                    <div class="project-meta">Low-level scheduling of compute kernels and async operations.</div>
-                </a>
-            </div>
-        </section>
+        <!-- Lightbox -->
+        <div id="lightbox">
+            <div id="lightbox-close">Close</div>
+            <div id="lightbox-content"></div>
+        </div>
 
-        <section id="optimizations">
-            <h2>Performance & Memory</h2>
-            <div class="project-list">
-                <a href="q1_0_g128_cpu_optimization.md" class="project-item">
-                    <div style="display: flex; justify-content: space-between; align-items: baseline;">
-                        <div class="project-title">Q1_0 CPU Optimization</div>
-                        <div style="font-size: 0.85rem; color: var(--text-secondary);">April 26, 2026</div>
-                    </div>
-                    <div class="project-meta">Resolving extreme latency on quantized CPU fallbacks.</div>
-                </a>
-                <a href="inference_optimizations.md" class="project-item">
-                    <div class="project-title">Inference Optimizations</div>
-                    <div class="project-meta">Low-latency techniques for SLM execution on Apple Silicon and CPU.</div>
-                </a>
-                <a href="paged-kv-cache-foundation.md" class="project-item">
-                    <div class="project-title">Paged KV Cache</div>
-                    <div class="project-meta">Dynamic memory management for efficient long-context handling.</div>
-                </a>
-                <a href="turboquant_dataflow.md" class="project-item">
-                    <div class="project-title">TurboQuant</div>
-                    <div class="project-meta">High-performance quantization kernel dataflow and register usage.</div>
-                </a>
-                <a href="gemma3_mixed_quantization_rationale.md" class="project-item">
-                    <div class="project-title">Mixed-Precision Rationale</div>
-                    <div class="project-meta">Balancing accuracy and speed with hybrid bit-depths.</div>
-                </a>
-                <a href="LFM_Metal_Acceleration.md" class="project-item">
-                    <div class="project-title">LFM Metal Acceleration <span style="font-size: 0.65rem; background: #000; color: #fff; padding: 2px 6px; border-radius: 10px; margin-left: 8px; vertical-align: middle;">NEW</span></div>
-                    <div class="project-meta">Deep-dive into Metal kernels and performance for Liquid Foundation Models.</div>
-                </a>
-                <a href="vlm_metal_optimization.md" class="project-item">
-                    <div style="display: flex; justify-content: space-between; align-items: baseline;">
-                        <div class="project-title">VLM Metal Optimization <span style="font-size: 0.65rem; background: #000; color: #fff; padding: 2px 6px; border-radius: 10px; margin-left: 8px; vertical-align: middle;">NEW</span></div>
-                        <div style="font-size: 0.85rem; color: var(--text-secondary);">April 28, 2026</div>
-                    </div>
-                    <div class="project-meta">Eliminating redundant logits/topk during VLM prefill on Apple Silicon.</div>
-                </a>
-                <a href="gemma_metal_nan_fix.md" class="project-item">
-                    <div style="display: flex; justify-content: space-between; align-items: baseline;">
-                        <div class="project-title">Gemma Metal NaN Fix <span style="font-size: 0.65rem; background: #000; color: #fff; padding: 2px 6px; border-radius: 10px; margin-left: 8px; vertical-align: middle;">NEW</span></div>
-                        <div style="font-size: 0.85rem; color: var(--text-secondary);">April 30, 2026</div>
-                    </div>
-                    <div class="project-meta">Tracing fused graph NaNs to Metal fast-math and restoring Gemma GPU inference.</div>
-                </a>
-                <a href="metal_inference_fix.md" class="project-item">
-                    <div class="project-title">Metal Backend Fixes</div>
-                    <div class="project-meta">Resolving stability issues in the Metal execution path.</div>
-                </a>
-            </div>
-        </section>
+        <!-- Mermaid & KaTeX -->
+        <link
+            rel="stylesheet"
+            href="https://cdn.jsdelivr.net/npm/katex/dist/katex.min.css"
+        />
+        <script src="https://cdn.jsdelivr.net/npm/katex/dist/katex.min.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/katex/dist/contrib/auto-render.min.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/svg-pan-zoom/dist/svg-pan-zoom.min.js"></script>
 
-        <section id="models">
-            <h2>Model Research</h2>
-            <div class="project-list">
-                <a href="models.md" class="project-item">
-                    <div class="project-title">Model Repository</div>
-                    <div class="project-meta">Browse all hosted cellm models and weights on Hugging Face.</div>
-                </a>
-                <a href="qwen25_cellm_working.md" class="project-item">
-                    <div class="project-title">Qwen 2.5 Implementation</div>
-                    <div class="project-meta">Full support for the Qwen 2.5 family of models.</div>
-                </a>
-                <a href="qwen3_5-deltanet.md" class="project-item">
-                    <div class="project-title">Qwen 3.5 DeltaNet</div>
-                    <div class="project-meta">Hybrid linear and full attention architecture support.</div>
-                </a>
-                <a href="research/qwen3.5-quantization.md" class="project-item">
-                    <div class="project-title">Qwen 3.5 Quantization</div>
-                    <div class="project-meta">Deep-dive into Int4 and 1-bit quantization for Qwen 3.5 models.</div>
-                </a>
-                <a href="cellm-vlm-sequence.md" class="project-item">
-                    <div class="project-title">VLM Sequences</div>
-                    <div class="project-meta">Handling multi-modal sequence generation and attention.</div>
-                </a>
-                <a href="gemma4_10gb_to_3_4gb_mobile_journey.md" class="project-item">
-                    <div class="project-title">Gemma 4 Mobile Journey</div>
-                    <div class="project-meta">The technical challenge of squeezing 10GB models into 3.4GB.</div>
-                </a>
-                <a href="bonsai_1bit_analysis.md" class="project-item">
-                    <div class="project-title">Bonsai 1-bit Analysis</div>
-                    <div class="project-meta">Investigating incoherence in extreme 1-bit quantization.</div>
-                </a>
-                <a href="vlm-smolvlm-onnx.md" class="project-item">
-                    <div class="project-title">SmolVLM & Vision</div>
-                    <div class="project-meta">Vision-Language Model integration and inference benchmarks.</div>
-                </a>
-                <a href="audio-inference.md" class="project-item">
-                    <div class="project-title">Audio Modalities</div>
-                    <div class="project-meta">Direct audio-to-text inference with optimized encoders.</div>
-                </a>
-                <a href="gemma-4-E2B-it-int4-aggr-v2-README.md" class="project-item">
-                    <div class="project-title">Gemma 4 Multimodal INT4</div>
-                    <div class="project-meta">Aggressive 4-bit quantization for full text/vision/audio stacks.</div>
-                </a>
-            </div>
-        </section>
+        <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+        <script>
+            // Mermaid initialization
+            mermaid.initialize({
+                startOnLoad: false,
+                theme: "base",
+                themeVariables: {
+                    primaryColor: "#ffffff",
+                    primaryTextColor: "#000000",
+                    primaryBorderColor: "#000000",
+                    lineColor: "#000000",
+                    secondaryColor: "#f9f9f9",
+                    tertiaryColor: "#ffffff",
+                    fontSize: "14px",
+                    fontFamily: "Inter",
+                },
+            });
 
-        <section id="guides">
-            <h2>Development</h2>
-            <div class="project-list">
-                <a href="format.md" class="project-item">
-                    <div class="project-title">The .cellm Format</div>
-                    <div class="project-meta">Binary specification for the optimized model serialization.</div>
-                </a>
-                <a href="convert-quantized-models.md" class="project-item">
-                    <div class="project-title">Quantization Guide</div>
-                    <div class="project-meta">Workflow for converting HuggingFace weights to cellm.</div>
-                </a>
-                <a href="lessons/kernel_concepts.md" class="project-item">
-                    <div class="project-title">Kernel Concepts</div>
-                    <div class="project-meta">Fundamental primitives for writing high-performance ML kernels.</div>
-                </a>
-                <a href="lessons/lesson.group-qk.md" class="project-item">
-                    <div class="project-title">Attention: GQA & MQA</div>
-                    <div class="project-meta">Reducing memory footprint with Grouped Query Attention.</div>
-                </a>
-                <a href="benchmarks/README.md" class="project-item">
-                    <div class="project-title">Benchmarks</div>
-                    <div class="project-meta">Current performance metrics across various backends.</div>
-                </a>
-                <a href="benchmarks/history.md" class="project-item">
-                    <div class="project-title">Benchmark History</div>
-                    <div class="project-meta">Browse specific profiling runs and performance logs.</div>
-                </a>
-            </div>
-        </section>
+            const searchInput = document.getElementById("search");
+            const sections = document.querySelectorAll("section");
+            const indexView = document.querySelector(".container:not(#viewer)");
+            const viewerView = document.getElementById("viewer");
+            const contentView = document.getElementById("content");
+            const backBtn = document.getElementById("back-btn");
+            const lightbox = document.getElementById("lightbox");
+            const lightboxContent = document.getElementById("lightbox-content");
+            const lightboxClose = document.getElementById("lightbox-close");
 
-        <section id="bindings">
-            <h2>Mobile & Bindings</h2>
-            <div class="project-list">
-                <a href="../bindings/ios/CellmDemo/README.md" class="project-item">
-                    <div class="project-title">iOS Demo App</div>
-                    <div class="project-meta">SwiftUI test app for LLM and VLM inference via cellm FFI on iPhone.</div>
-                </a>
-            </div>
-        </section>
+            const panZoomInstances = new Map();
 
-        <footer>
-            <p>&copy; 2026  cellm research. <a href="https://jeffasante.github.io/" style="color: inherit; text-decoration: none; border-bottom: 1px solid var(--border); transition: border-color 0.2s ease;">jeff asante</a>. minimalist technical documentation.</p>
-        </footer>
-    </div>
-
-    <!-- Markdown Viewer -->
-    <div id="viewer" class="container" style="display: none;">
-        <nav style="margin-bottom: 40px;">
-            <a href="#" id="back-btn" class="project-item" style="display: inline-block; font-size: 0.9rem; font-weight: 500;">&larr; Back to Index</a>
-        </nav>
-        <div id="content" class="markdown-body"></div>
-        <footer style="margin-top: 80px;">
-            <p>&copy; 2026 <a href="https://jeffasante.github.io/" style="color: inherit; text-decoration: none; border-bottom: 1px solid var(--border); transition: border-color 0.2s ease;">jeff asante</a>. minimalist technical documentation.</p>
-        </footer>
-    </div>
-
-    <!-- Lightbox -->
-    <div id="lightbox">
-        <div id="lightbox-close">Close</div>
-        <div id="lightbox-content"></div>
-    </div>
-
-    <!-- Mermaid & KaTeX -->
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex/dist/katex.min.css">
-    <script src="https://cdn.jsdelivr.net/npm/katex/dist/katex.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/katex/dist/contrib/auto-render.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/svg-pan-zoom/dist/svg-pan-zoom.min.js"></script>
-
-    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-    <script>
-        // Mermaid initialization
-        mermaid.initialize({ 
-            startOnLoad: false,
-            theme: 'base',
-            themeVariables: {
-                primaryColor: '#ffffff',
-                primaryTextColor: '#000000',
-                primaryBorderColor: '#000000',
-                lineColor: '#000000',
-                secondaryColor: '#f9f9f9',
-                tertiaryColor: '#ffffff',
-                fontSize: '14px',
-                fontFamily: 'Inter'
+            // Lightbox logic
+            function openLightbox(element) {
+                lightboxContent.innerHTML = "";
+                const clone = element.cloneNode(true);
+                lightboxContent.appendChild(clone);
+                lightbox.style.display = "flex";
+                document.body.style.overflow = "hidden";
             }
-        });
 
-        const searchInput = document.getElementById('search');
-        const sections = document.querySelectorAll('section');
-        const indexView = document.querySelector('.container:not(#viewer)');
-        const viewerView = document.getElementById('viewer');
-        const contentView = document.getElementById('content');
-        const backBtn = document.getElementById('back-btn');
-        const lightbox = document.getElementById('lightbox');
-        const lightboxContent = document.getElementById('lightbox-content');
-        const lightboxClose = document.getElementById('lightbox-close');
+            function closeLightbox() {
+                lightbox.style.display = "none";
+                document.body.style.overflow = "";
+            }
 
-        const panZoomInstances = new Map();
+            lightbox.addEventListener("click", closeLightbox);
+            lightboxClose.addEventListener("click", closeLightbox);
+            document.addEventListener("keydown", (e) => {
+                if (e.key === "Escape") closeLightbox();
+            });
 
-        // Lightbox logic
-        function openLightbox(element) {
-            lightboxContent.innerHTML = '';
-            const clone = element.cloneNode(true);
-            lightboxContent.appendChild(clone);
-            lightbox.style.display = 'flex';
-            document.body.style.overflow = 'hidden';
-        }
+            // Modern Marked configuration
+            marked.use({
+                renderer: {
+                    code(code, lang) {
+                        const text =
+                            typeof code === "object" ? code.text : code;
+                        const info =
+                            typeof code === "object" ? code.lang : lang;
+                        const language = (info || "").toLowerCase().trim();
 
-        function closeLightbox() {
-            lightbox.style.display = 'none';
-            document.body.style.overflow = '';
-        }
-
-        lightbox.addEventListener('click', closeLightbox);
-        lightboxClose.addEventListener('click', closeLightbox);
-        document.addEventListener('keydown', (e) => {
-            if (e.key === 'Escape') closeLightbox();
-        });
-
-        // Modern Marked configuration
-        marked.use({
-            renderer: {
-                code(code, lang) {
-                    const text = typeof code === 'object' ? code.text : code;
-                    const info = typeof code === 'object' ? code.lang : lang;
-                    const language = (info || '').toLowerCase().trim();
-                    
-                    if (language === 'mermaid' || language === 'language-mermaid') {
-                        const id = 'mermaid-' + Math.random().toString(36).substr(2, 9);
-                        return `
+                        if (
+                            language === "mermaid" ||
+                            language === "language-mermaid"
+                        ) {
+                            const id =
+                                "mermaid-" +
+                                Math.random().toString(36).substr(2, 9);
+                            return `
                         <div class="mermaid-wrapper" id="wrapper-${id}">
                             <div class="mermaid" id="${id}">${text}</div>
                             <div class="mermaid-controls">
@@ -776,200 +1164,245 @@
                                 <button class="zoom-btn" onclick="handleZoom('${id}', 'reset')" title="Reset">↺</button>
                             </div>
                         </div>`;
-                    }
-                    
-                    return `<pre><code>${text}</code><button class="copy-btn" onclick="copyCode(this)">Copy</button></pre>`;
-                }
-            }
-        });
-
-        function handleZoom(id, action) {
-            const instance = panZoomInstances.get(id);
-            if (!instance) return;
-            if (action === 'in') instance.zoomIn();
-            if (action === 'out') instance.zoomOut();
-            if (action === 'reset') {
-                instance.resetZoom();
-                instance.center();
-            }
-        }
-
-        async function copyCode(btn) {
-            const code = btn.previousElementSibling.innerText;
-            try {
-                await navigator.clipboard.writeText(code);
-                const originalText = btn.innerText;
-                btn.innerText = 'Copied';
-                setTimeout(() => btn.innerText = originalText, 2000);
-            } catch (err) {
-                console.error('Failed to copy', err);
-            }
-        }
-
-        // Search logic
-        searchInput.addEventListener('input', (e) => {
-            const query = e.target.value.toLowerCase();
-            sections.forEach(section => {
-                let sectionVisible = false;
-                const items = section.querySelectorAll('.project-item');
-                items.forEach(item => {
-                    const text = item.textContent.toLowerCase();
-                    if (text.includes(query)) {
-                        item.style.display = 'block';
-                        sectionVisible = true;
-                    } else {
-                        item.style.display = 'none';
-                    }
-                });
-                section.style.display = sectionVisible ? 'block' : 'none';
-            });
-        });
-
-        // Routing logic
-        async function navigate() {
-            const hash = window.location.hash.substring(1);
-            if (hash && hash.endsWith('.md')) {
-                indexView.style.display = 'none';
-                viewerView.style.display = 'block';
-                contentView.innerHTML = '<p style="color: #666;">Loading document...</p>';
-                
-                try {
-                    let fetchUrl = hash;
-                    // Enhanced fallback for Main README to handle various hosting environments
-                    const isMainReadme = hash === 'README.md' || hash === '../README.md';
-                    
-                    let response = await fetch(fetchUrl);
-                    
-                    // Fallback to GitHub Raw if local fetch fails for the main README
-                    if (!response.ok && isMainReadme) {
-                        console.log("Local README fetch failed, trying GitHub raw fallback...");
-                        fetchUrl = 'https://raw.githubusercontent.com/jeffasante/cellm/main/README.md';
-                        response = await fetch(fetchUrl);
-                    }
-
-                    if (!response.ok) throw new Error(`File not found: ${fetchUrl}`);
-                    let text = await response.text();
-                    
-                    // Remove status emojis for minimalist look
-                    text = text.replace(/✅|❌|⚠️|🚀/g, '');
-                    
-                    // Render Markdown
-                    const html = marked.parse(text);
-                    contentView.innerHTML = html;
-
-                    // Determine base directory for relative assets
-                    let baseDir = '';
-                    if (hash === 'README.md') {
-                        baseDir = ''; // Main README is local to docs/ with local assets/
-                    } else if (hash.includes('/')) {
-                        baseDir = hash.substring(0, hash.lastIndexOf('/') + 1);
-                    }
-
-                    if (baseDir) {
-                        const fixPath = (attr) => {
-                            contentView.querySelectorAll(`[${attr}]`).forEach(el => {
-                                const val = el.getAttribute(attr);
-                                if (val && !val.startsWith('http') && !val.startsWith('/') && !val.startsWith('#') && !val.startsWith('data:')) {
-                                    // For links, we want them to stay relative to the root for navigation
-                                    // unless they are internal anchors
-                                    if (attr === 'href' && val.endsWith('.md')) {
-                                        // Only prefix if it doesn't already start with the baseDir
-                                        if (!val.startsWith(baseDir)) {
-                                            el.setAttribute(attr, baseDir + val);
-                                        }
-                                    } else if (attr !== 'href') {
-                                        el.setAttribute(attr, baseDir + val);
-                                    }
-                                }
-                            });
-                        };
-
-                        fixPath('src');
-                        fixPath('href');
-                    }
-
-                    // Render LaTeX
-                    if (window.renderMathInElement) {
-                        renderMathInElement(contentView, {
-                            delimiters: [
-                                {left: '$$', right: '$$', display: true},
-                                {left: '$', right: '$', display: false},
-                                {left: '\\(', right: '\\)', display: false},
-                                {left: '\\[', right: '\\]', display: true}
-                            ],
-                            throwOnError: false
-                        });
-                    }
-
-                    // Render Mermaid
-                    const mermaidBlocks = contentView.querySelectorAll('.mermaid');
-                    if (mermaidBlocks.length > 0 && window.mermaid) {
-                        try {
-                            await mermaid.run({
-                                nodes: mermaidBlocks,
-                            });
-
-                            // Initialize Pan-Zoom for each block
-                            mermaidBlocks.forEach(block => {
-                                const svg = block.querySelector('svg');
-                                if (svg) {
-                                    svg.style.width = '100%';
-                                    svg.style.height = '100%';
-                                    const instance = svgPanZoom(svg, {
-                                        zoomEnabled: true,
-                                        controlIconsEnabled: false,
-                                        fit: true,
-                                        center: true,
-                                        minZoom: 0.1,
-                                        maxZoom: 10
-                                    });
-                                    panZoomInstances.set(block.id, instance);
-                                }
-                            });
-                        } catch (mErr) {
-                            console.warn("Mermaid run failed, trying init", mErr);
-                            mermaid.init(undefined, mermaidBlocks);
                         }
-                    }
 
-                    window.scrollTo(0, 0);
-                } catch (err) {
-                    contentView.innerHTML = `<p style="color: red;">Error: Could not load ${hash}. ${err.message}</p>`;
-                    console.error(err);
+                        return `<pre><code>${text}</code><button class="copy-btn" onclick="copyCode(this)">Copy</button></pre>`;
+                    },
+                },
+            });
+
+            function handleZoom(id, action) {
+                const instance = panZoomInstances.get(id);
+                if (!instance) return;
+                if (action === "in") instance.zoomIn();
+                if (action === "out") instance.zoomOut();
+                if (action === "reset") {
+                    instance.resetZoom();
+                    instance.center();
                 }
-            } else {
-                // Clear instances when leaving
-                panZoomInstances.forEach(instance => instance.destroy());
-                panZoomInstances.clear();
-                indexView.style.display = 'block';
-                viewerView.style.display = 'none';
-                window.scrollTo(0, 0);
             }
-        }
 
-        // Intercept link clicks and zoomable images
-        document.addEventListener('click', (e) => {
-            const link = e.target.closest('a');
-            if (link && link.getAttribute('href') && link.getAttribute('href').endsWith('.md')) {
+            async function copyCode(btn) {
+                const code = btn.previousElementSibling.innerText;
+                try {
+                    await navigator.clipboard.writeText(code);
+                    const originalText = btn.innerText;
+                    btn.innerText = "Copied";
+                    setTimeout(() => (btn.innerText = originalText), 2000);
+                } catch (err) {
+                    console.error("Failed to copy", err);
+                }
+            }
+
+            // Search logic
+            searchInput.addEventListener("input", (e) => {
+                const query = e.target.value.toLowerCase();
+                sections.forEach((section) => {
+                    let sectionVisible = false;
+                    const items = section.querySelectorAll(".project-item");
+                    items.forEach((item) => {
+                        const text = item.textContent.toLowerCase();
+                        if (text.includes(query)) {
+                            item.style.display = "block";
+                            sectionVisible = true;
+                        } else {
+                            item.style.display = "none";
+                        }
+                    });
+                    section.style.display = sectionVisible ? "block" : "none";
+                });
+            });
+
+            // Routing logic
+            async function navigate() {
+                const hash = window.location.hash.substring(1);
+                if (hash && hash.endsWith(".md")) {
+                    indexView.style.display = "none";
+                    viewerView.style.display = "block";
+                    contentView.innerHTML =
+                        '<p style="color: #666;">Loading document...</p>';
+
+                    try {
+                        let fetchUrl = hash;
+                        // Enhanced fallback for Main README to handle various hosting environments
+                        const isMainReadme =
+                            hash === "README.md" || hash === "../README.md";
+
+                        let response = await fetch(fetchUrl);
+
+                        // Fallback to GitHub Raw if local fetch fails for the main README
+                        if (!response.ok && isMainReadme) {
+                            console.log(
+                                "Local README fetch failed, trying GitHub raw fallback...",
+                            );
+                            fetchUrl =
+                                "https://raw.githubusercontent.com/jeffasante/cellm/main/README.md";
+                            response = await fetch(fetchUrl);
+                        }
+
+                        if (!response.ok)
+                            throw new Error(`File not found: ${fetchUrl}`);
+                        let text = await response.text();
+
+                        // Remove status emojis for minimalist look
+                        text = text.replace(/✅|❌|⚠️|🚀/g, "");
+
+                        // Render Markdown
+                        const html = marked.parse(text);
+                        contentView.innerHTML = html;
+
+                        // Determine base directory for relative assets
+                        let baseDir = "";
+                        if (hash === "README.md") {
+                            baseDir = ""; // Main README is local to docs/ with local assets/
+                        } else if (hash.includes("/")) {
+                            baseDir = hash.substring(
+                                0,
+                                hash.lastIndexOf("/") + 1,
+                            );
+                        }
+
+                        if (baseDir) {
+                            const fixPath = (attr) => {
+                                contentView
+                                    .querySelectorAll(`[${attr}]`)
+                                    .forEach((el) => {
+                                        const val = el.getAttribute(attr);
+                                        if (
+                                            val &&
+                                            !val.startsWith("http") &&
+                                            !val.startsWith("/") &&
+                                            !val.startsWith("#") &&
+                                            !val.startsWith("data:")
+                                        ) {
+                                            // For links, we want them to stay relative to the root for navigation
+                                            // unless they are internal anchors
+                                            if (
+                                                attr === "href" &&
+                                                val.endsWith(".md")
+                                            ) {
+                                                // Only prefix if it doesn't already start with the baseDir
+                                                if (!val.startsWith(baseDir)) {
+                                                    el.setAttribute(
+                                                        attr,
+                                                        baseDir + val,
+                                                    );
+                                                }
+                                            } else if (attr !== "href") {
+                                                el.setAttribute(
+                                                    attr,
+                                                    baseDir + val,
+                                                );
+                                            }
+                                        }
+                                    });
+                            };
+
+                            fixPath("src");
+                            fixPath("href");
+                        }
+
+                        // Render LaTeX
+                        if (window.renderMathInElement) {
+                            renderMathInElement(contentView, {
+                                delimiters: [
+                                    { left: "$$", right: "$$", display: true },
+                                    { left: "$", right: "$", display: false },
+                                    {
+                                        left: "\\(",
+                                        right: "\\)",
+                                        display: false,
+                                    },
+                                    {
+                                        left: "\\[",
+                                        right: "\\]",
+                                        display: true,
+                                    },
+                                ],
+                                throwOnError: false,
+                            });
+                        }
+
+                        // Render Mermaid
+                        const mermaidBlocks =
+                            contentView.querySelectorAll(".mermaid");
+                        if (mermaidBlocks.length > 0 && window.mermaid) {
+                            try {
+                                await mermaid.run({
+                                    nodes: mermaidBlocks,
+                                });
+
+                                // Initialize Pan-Zoom for each block
+                                mermaidBlocks.forEach((block) => {
+                                    const svg = block.querySelector("svg");
+                                    if (svg) {
+                                        svg.style.width = "100%";
+                                        svg.style.height = "100%";
+                                        const instance = svgPanZoom(svg, {
+                                            zoomEnabled: true,
+                                            controlIconsEnabled: false,
+                                            fit: true,
+                                            center: true,
+                                            minZoom: 0.1,
+                                            maxZoom: 10,
+                                        });
+                                        panZoomInstances.set(
+                                            block.id,
+                                            instance,
+                                        );
+                                    }
+                                });
+                            } catch (mErr) {
+                                console.warn(
+                                    "Mermaid run failed, trying init",
+                                    mErr,
+                                );
+                                mermaid.init(undefined, mermaidBlocks);
+                            }
+                        }
+
+                        window.scrollTo(0, 0);
+                    } catch (err) {
+                        contentView.innerHTML = `<p style="color: red;">Error: Could not load ${hash}. ${err.message}</p>`;
+                        console.error(err);
+                    }
+                } else {
+                    // Clear instances when leaving
+                    panZoomInstances.forEach((instance) => instance.destroy());
+                    panZoomInstances.clear();
+                    indexView.style.display = "block";
+                    viewerView.style.display = "none";
+                    window.scrollTo(0, 0);
+                }
+            }
+
+            // Intercept link clicks and zoomable images
+            document.addEventListener("click", (e) => {
+                const link = e.target.closest("a");
+                if (
+                    link &&
+                    link.getAttribute("href") &&
+                    link.getAttribute("href").endsWith(".md")
+                ) {
+                    e.preventDefault();
+                    window.location.hash = link.getAttribute("href");
+                    return;
+                }
+
+                const img = e.target.closest(".markdown-body img");
+                if (img && !e.target.closest(".mermaid")) {
+                    openLightbox(img);
+                    return;
+                }
+            });
+
+            window.addEventListener("hashchange", navigate);
+            window.addEventListener("load", navigate);
+
+            backBtn.addEventListener("click", (e) => {
                 e.preventDefault();
-                window.location.hash = link.getAttribute('href');
-                return;
-            }
-
-            const img = e.target.closest('.markdown-body img');
-            if (img && !e.target.closest('.mermaid')) {
-                openLightbox(img);
-                return;
-            }
-        });
-
-        window.addEventListener('hashchange', navigate);
-        window.addEventListener('load', navigate);
-
-        backBtn.addEventListener('click', (e) => {
-            e.preventDefault();
-            window.location.hash = '';
-        });
-    </script>
-</body>
+                window.location.hash = "";
+            });
+        </script>
+    </body>
 </html>

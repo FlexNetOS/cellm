@@ -11,6 +11,9 @@ use cellm_kernels::MetalKernels;
 use half::f16;
 use rayon::prelude::*;
 
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use objc::rc::autoreleasepool;
+
 use crate::{CellmFile, ModelConfig};
 use crate::gemma_graph::{GemmaGraphLayerSpec, GemmaGraphState};
 use serde_json::Value;
@@ -92,6 +95,7 @@ impl GemmaRunner {
             rms_norm_eps: h.rms_norm_eps,
             rope_theta: h.rope_theta,
             head_dim: h.head_dim.unwrap_or(0),
+            attention_softcap: 0.0,
         };
 
         let tensor_prefix = detect_gemma_prefix(&file)?;
@@ -213,6 +217,10 @@ impl GemmaRunner {
         })
     }
 
+    pub fn file(&self) -> &CellmFile {
+        &self.file
+    }
+
     pub fn config(&self) -> &ModelConfig {
         &self.cfg
     }
@@ -318,6 +326,11 @@ impl GemmaRunner {
                 self.linear_backend = GemmaLinearBackend::Metal { ctx };
                 self.metal_ops = Some(ops);
                 self.metal_strict = true;
+                // Metal norms/rope are disabled on the non-graph path because the
+                // current implementations round-trip tiny vectors to/from GPU per
+                // head/layer; the copy/sync overhead is larger than the in-place
+                // CPU work for decode batch=1.  The fused graph path handles
+                // them internally on-GPU with no round-trips.
                 self.use_metal_norm = false;
                 self.use_metal_rope = false;
                 self.use_metal_logits = true;
@@ -383,6 +396,373 @@ impl GemmaRunner {
         self.step_topk_from_hidden_inner(x0, per_layer_input.as_deref(), pos, page_table, kv_cache, top_k)
     }
 
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    fn step_topk_batched(
+        &mut self,
+        _x0: &[f32],
+        _per_layer_input: Option<&[f32]>,
+        _pos: usize,
+        _page_table: &mut PageTable,
+        _kv_cache: &mut KVCache,
+    ) -> Result<Option<Vec<f32>>, CoreError> {
+        Ok(None)
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn step_topk_batched(
+        &mut self,
+        x0: &[f32],
+        _per_layer_input: Option<&[f32]>,
+        pos: usize,
+        page_table: &mut PageTable,
+        kv_cache: &mut KVCache,
+    ) -> Result<Option<Vec<f32>>, CoreError> {
+        let ops = match self.metal_ops.as_ref() {
+            Some(o) => o,
+            None => return Ok(None),
+        };
+        let cfg = self.cfg.clone();
+        let hidden = cfg.hidden_size;
+        let vocab = cfg.vocab_size;
+        let add_one = self.rmsnorm_weight_is_offset;
+
+        // Unsupported configs fall back
+        if self.is_gemma3_text && self.sliding_window_pattern != 0 {
+            return Ok(None);
+        }
+        if self.is_gemma4_text && self.gemma4_shared_kv_layers > 0 {
+            return Ok(None);
+        }
+        if !self.gemma4_disable_per_layer_input && self.per_layer_input.is_some() {
+            return Ok(None);
+        }
+        if kv_cache.encoding() == cellm_cache::KvEncodingKind::TurboQuant {
+            return Ok(None);
+        }
+
+        // Page table
+        if pos == page_table.token_count() {
+            page_table.append_token(kv_cache.allocator_mut()).map_err(|e| {
+                CoreError::Backend(format!("batched step: page_table append failed: {e}"))
+            })?;
+        } else if pos > page_table.token_count() {
+            return Err(CoreError::Backend(format!(
+                "batched step: non-contiguous pos {pos} (token_count={})",
+                page_table.token_count()
+            )));
+        }
+        let seq_len = pos + 1;
+        let layout_kv_dim = kv_cache.view().layout.kv_dim();
+        let max_tokens = kv_cache.max_seq_len();
+
+        // Ensure persistent KV cache for all layers
+        for layer in 0..self.max_layers {
+            let spec = self.layer_attn.get(layer).ok_or_else(|| {
+                CoreError::Backend(format!("batched step: missing layer {layer} spec"))
+            })?;
+            ops.ensure_layer_kv_cache(layer, spec.kv_dim, max_tokens)
+                .map_err(|e| CoreError::Backend(e.to_string()))?;
+        }
+
+        // Ensure intermediate buffers
+        let _ = ops.ensure_named_buf("batched_x", hidden);
+        let _ = ops.ensure_named_buf("batched_x_norm", hidden);
+        let _ = ops.ensure_named_buf("batched_q", self.max_q_dim);
+        let _ = ops.ensure_named_buf("batched_k", self.max_kv_dim);
+        let _ = ops.ensure_named_buf("batched_v", self.max_kv_dim);
+        let _ = ops.ensure_named_buf("batched_attn_out", self.max_q_dim);
+        let _ = ops.ensure_named_buf("batched_attn_proj", hidden);
+        let _ = ops.ensure_named_buf("batched_mlp_in", hidden);
+        let _ = ops.ensure_named_buf("batched_gate", self.max_ffn_dim);
+        let _ = ops.ensure_named_buf("batched_up", self.max_ffn_dim);
+        let _ = ops.ensure_named_buf("batched_down", hidden);
+        let _ = ops.ensure_named_buf("batched_final_norm", hidden);
+        let _ = ops.ensure_named_buf("batched_logits", vocab);
+
+        ops.write_named_buf("batched_x", x0).map_err(|e| CoreError::Backend(e.to_string()))?;
+
+        // Pre-cache all weights (one-time, then reused)
+        for layer in 0..self.max_layers {
+            let spec = self.layer_attn.get(layer).unwrap();
+            let ffn_dim = spec.ffn_dim;
+            let kv_dim = spec.kv_dim;
+            let q_dim = spec.q_dim;
+
+            macro_rules! cache_i4 {
+                ($base:expr, $suffix:expr, $rows:expr, $cols:expr) => {{
+                    let name = format!("model.layers.{}.{}", layer, $base);
+                    let w_name = format!("batched.{}_{}.w", layer, $suffix);
+                    let s_name = format!("batched.{}_{}.s", layer, $suffix);
+                    let resolved = self.resolve_name(&name).map_err(|e| CoreError::Backend(e.to_string()))?;
+                    let meta = self.tensor_meta_by_exact_name(&resolved).ok_or_else(|| CoreError::Backend(format!("batched step: unknown tensor {resolved}")))?;
+                    if meta.dtype != "i4" { return Ok(None); }
+                    let w = self.tensor_u8_by_exact_name(&resolved)?;
+                    let s = self.tensor_f16_by_exact_name(&format!("{resolved}.qscale"))?;
+                    ops.ensure_tensor_cached_i4(&w_name, w, &s_name, s).map_err(|e| CoreError::Backend(e.to_string()))?;
+                }};
+            }
+
+            macro_rules! cache_f16 {
+                ($base:expr, $suffix:expr) => {{
+                    let name = format!("model.layers.{}.{}", layer, $base);
+                    let w_name = format!("batched.{}_{}.w", layer, $suffix);
+                    let resolved = self.resolve_name(&name).map_err(|e| CoreError::Backend(e.to_string()))?;
+                    let w = self.tensor_f16(&resolved).map_err(|e| CoreError::Backend(e.to_string()))?;
+                    let slice = unsafe { std::slice::from_raw_parts(w.as_ptr(), w.len()) };
+                    ops.ensure_tensor_cached(&w_name, slice).map_err(|e| CoreError::Backend(e.to_string()))?;
+                }};
+            }
+
+            cache_i4!("self_attn.q_proj.weight", "q", q_dim, hidden);
+            cache_i4!("self_attn.k_proj.weight", "k", kv_dim, hidden);
+            cache_i4!("self_attn.v_proj.weight", "v", kv_dim, hidden);
+            cache_i4!("self_attn.o_proj.weight", "o", hidden, q_dim);
+            cache_i4!("mlp.gate_proj.weight", "gate", ffn_dim, hidden);
+            cache_i4!("mlp.up_proj.weight", "up", ffn_dim, hidden);
+            cache_i4!("mlp.down_proj.weight", "down", hidden, ffn_dim);
+
+            cache_f16!("input_layernorm.weight", "in_norm");
+            cache_f16!("post_attention_layernorm.weight", "post_attn_norm");
+            cache_f16!("pre_feedforward_layernorm.weight", "pre_ffn_norm");
+
+            // Optional norms
+            let q_norm_name = format!("model.layers.{layer}.self_attn.q_norm.weight");
+            if let Ok(w) = self.tensor_f16(&q_norm_name) {
+                let slice = unsafe { std::slice::from_raw_parts(w.as_ptr(), w.len()) };
+                let _ = ops.ensure_tensor_cached(&format!("batched.{}_q_norm.w", layer), slice);
+            }
+            let k_norm_name = format!("model.layers.{layer}.self_attn.k_norm.weight");
+            if let Ok(w) = self.tensor_f16(&k_norm_name) {
+                let slice = unsafe { std::slice::from_raw_parts(w.as_ptr(), w.len()) };
+                let _ = ops.ensure_tensor_cached(&format!("batched.{}_k_norm.w", layer), slice);
+            }
+            let post_ffn_name = format!("model.layers.{layer}.post_feedforward_layernorm.weight");
+            if let Ok(w) = self.tensor_f16(&post_ffn_name) {
+                let slice = unsafe { std::slice::from_raw_parts(w.as_ptr(), w.len()) };
+                let _ = ops.ensure_tensor_cached(&format!("batched.{}_post_ffn_norm.w", layer), slice);
+            }
+        }
+
+        // Cache final norm + LM head
+        let final_norm_name = "model.norm.weight";
+        let final_norm_res = self.resolve_name(final_norm_name).map_err(|e| CoreError::Backend(e.to_string()))?;
+        let final_norm_w = self.tensor_f16(&final_norm_res).map_err(|e| CoreError::Backend(e.to_string()))?;
+        let final_norm_slice = unsafe { std::slice::from_raw_parts(final_norm_w.as_ptr(), final_norm_w.len()) };
+        ops.ensure_tensor_cached("batched.final_norm", final_norm_slice).map_err(|e| CoreError::Backend(e.to_string()))?;
+
+        let lm_head_name = self.resolve_name("lm_head.weight").ok();
+        let lm_src_name = match lm_head_name.as_ref() {
+            Some(n) if self.file.tensor_index(n).is_some() => n.clone(),
+            _ => "model.embed_tokens.weight".to_string(),
+        };
+        let lm_resolved = self.resolve_name(&lm_src_name).map_err(|e| CoreError::Backend(e.to_string()))?;
+        let lm_meta = self.tensor_meta_by_exact_name(&lm_resolved).ok_or_else(|| CoreError::Backend(format!("batched step: unknown lm tensor {lm_resolved}")))?;
+        let lm_dtype = lm_meta.dtype.clone();
+        match lm_dtype.as_str() {
+            "f16" => {
+                let w = self.tensor_f16_by_exact_name(&lm_resolved)?;
+                let slice = unsafe { std::slice::from_raw_parts(w.as_ptr(), w.len()) };
+                ops.ensure_tensor_cached("batched.lm_w", slice).map_err(|e| CoreError::Backend(e.to_string()))?;
+            }
+            "i8" => {
+                let w = self.tensor_i8_by_exact_name(&lm_resolved)?;
+                let s = self.tensor_f16_by_exact_name(&format!("{lm_resolved}.qscale"))?;
+                let w_slice = unsafe { std::slice::from_raw_parts(w.as_ptr(), w.len()) };
+                let s_slice = unsafe { std::slice::from_raw_parts(s.as_ptr(), s.len()) };
+                ops.ensure_tensor_cached_i8("batched.lm_w", w_slice).map_err(|e| CoreError::Backend(e.to_string()))?;
+                ops.ensure_tensor_cached("batched.lm_s", s_slice).map_err(|e| CoreError::Backend(e.to_string()))?;
+            }
+            "i4" => {
+                let w = self.tensor_u8_by_exact_name(&lm_resolved)?;
+                let s = self.tensor_f16_by_exact_name(&format!("{lm_resolved}.qscale"))?;
+                ops.ensure_tensor_cached_i4("batched.lm_w", w, "batched.lm_s", s).map_err(|e| CoreError::Backend(e.to_string()))?;
+            }
+            _ => return Ok(None),
+        }
+
+        // Single command buffer for all layers + final norm + logits
+        let lm_dtype_str = lm_dtype.clone();
+        let all_logits: Option<Vec<f32>> = autoreleasepool(|| {
+            let cb = ops.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+
+            let x_buf = ops.get_named_buf("batched_x").ok()?;
+            let x_norm_buf = ops.get_named_buf("batched_x_norm").ok()?;
+            let q_buf = ops.get_named_buf("batched_q").ok()?;
+            let k_buf = ops.get_named_buf("batched_k").ok()?;
+            let v_buf = ops.get_named_buf("batched_v").ok()?;
+            let attn_out_buf = ops.get_named_buf("batched_attn_out").ok()?;
+            let attn_proj_buf = ops.get_named_buf("batched_attn_proj").ok()?;
+            let mlp_in_buf = ops.get_named_buf("batched_mlp_in").ok()?;
+            let gate_buf = ops.get_named_buf("batched_gate").ok()?;
+            let up_buf = ops.get_named_buf("batched_up").ok()?;
+            let down_buf = ops.get_named_buf("batched_down").ok()?;
+            let final_norm_buf = ops.get_named_buf("batched_final_norm").ok()?;
+            let logits_buf = ops.get_named_buf("batched_logits").ok()?;
+
+            for layer in 0..self.max_layers {
+                let spec = self.layer_attn.get(layer)?;
+                let n_heads = spec.n_heads;
+                let n_kv_heads = spec.n_kv_heads;
+                let head_dim = spec.head_dim;
+                let kv_head_dim = spec.kv_head_dim;
+                let q_dim = spec.q_dim;
+                let kv_dim = spec.kv_dim;
+                let ffn_dim = spec.ffn_dim;
+                let kv_stride = kv_dim;
+
+                let layer_rope_theta = cfg.rope_theta;
+                let attn_scale = if self.is_gemma4_text && !self.gemma4_disable_q_prescale {
+                    1.0f32
+                } else {
+                    1.0f32 / (head_dim as f32).sqrt()
+                };
+                let soft_cap = cfg.attention_softcap;
+
+                let in_norm_w = ops.get_cached_tensor(&format!("batched.{}_in_norm.w", layer))?;
+                let post_attn_norm_w = ops.get_cached_tensor(&format!("batched.{}_post_attn_norm.w", layer))?;
+                let pre_ffn_norm_w = ops.get_cached_tensor(&format!("batched.{}_pre_ffn_norm.w", layer))?;
+                let q_w = ops.get_cached_tensor(&format!("batched.{}_q.w", layer))?;
+                let q_s = ops.get_cached_tensor(&format!("batched.{}_q.s", layer))?;
+                let k_w = ops.get_cached_tensor(&format!("batched.{}_k.w", layer))?;
+                let k_s = ops.get_cached_tensor(&format!("batched.{}_k.s", layer))?;
+                let v_w = ops.get_cached_tensor(&format!("batched.{}_v.w", layer))?;
+                let v_s = ops.get_cached_tensor(&format!("batched.{}_v.s", layer))?;
+                let o_w = ops.get_cached_tensor(&format!("batched.{}_o.w", layer))?;
+                let o_s = ops.get_cached_tensor(&format!("batched.{}_o.s", layer))?;
+                let gate_w = ops.get_cached_tensor(&format!("batched.{}_gate.w", layer))?;
+                let gate_s = ops.get_cached_tensor(&format!("batched.{}_gate.s", layer))?;
+                let up_w = ops.get_cached_tensor(&format!("batched.{}_up.w", layer))?;
+                let up_s = ops.get_cached_tensor(&format!("batched.{}_up.s", layer))?;
+                let down_w = ops.get_cached_tensor(&format!("batched.{}_down.w", layer))?;
+                let down_s = ops.get_cached_tensor(&format!("batched.{}_down.s", layer))?;
+
+                let q_norm_w = ops.get_cached_tensor(&format!("batched.{}_q_norm.w", layer));
+                let k_norm_w = ops.get_cached_tensor(&format!("batched.{}_k_norm.w", layer));
+                let post_ffn_norm_w = ops.get_cached_tensor(&format!("batched.{}_post_ffn_norm.w", layer));
+
+                let (k_cache_buf, v_cache_buf) = ops.get_kv_cache_buffers(layer)?;
+
+                // 1. Input RMSNorm
+                ops.encode_rms_norm_f16w(enc, &x_buf, &in_norm_w, &x_norm_buf, hidden, cfg.rms_norm_eps, add_one);
+                // 2. QKV projection
+                ops.encode_mv_i4(enc, &q_w, &q_s, &x_norm_buf, &q_buf, q_dim, hidden, hidden);
+                ops.encode_mv_i4(enc, &k_w, &k_s, &x_norm_buf, &k_buf, kv_dim, hidden, hidden);
+                ops.encode_mv_i4(enc, &v_w, &v_s, &x_norm_buf, &v_buf, kv_dim, hidden, hidden);
+                // 3. Optional Q/K per-head norms
+                if let Some(ref qw) = q_norm_w {
+                    for hidx in 0..n_heads {
+                        let off = (hidx * head_dim * 4) as u64;
+                        ops.encode_rms_norm_f16w_at(enc, &q_buf, off, qw, 0, &q_buf, off, head_dim, cfg.rms_norm_eps, false);
+                    }
+                }
+                if let Some(ref kw) = k_norm_w {
+                    for hidx in 0..n_kv_heads {
+                        let off = (hidx * kv_head_dim * 4) as u64;
+                        ops.encode_rms_norm_f16w_at(enc, &k_buf, off, kw, 0, &k_buf, off, kv_head_dim, cfg.rms_norm_eps, false);
+                    }
+                }
+                // 4. RoPE
+                ops.encode_rope_half_f32(enc, &q_buf, n_heads, head_dim, head_dim, pos, layer_rope_theta);
+                ops.encode_rope_half_f32(enc, &k_buf, n_kv_heads, kv_head_dim, kv_head_dim, pos, layer_rope_theta);
+                // 5. Scatter K/V to persistent cache
+                ops.encode_scatter_f32(enc, &k_buf, &k_cache_buf, pos * kv_stride, kv_dim);
+                ops.encode_scatter_f32(enc, &v_buf, &v_cache_buf, pos * kv_stride, kv_dim);
+                // 6. Attention
+                ops.encode_attention_gqa_f32(enc, &q_buf, &k_cache_buf, &v_cache_buf, &attn_out_buf,
+                    n_heads, n_kv_heads, head_dim, seq_len, attn_scale, soft_cap, kv_stride);
+                // 7. O_proj
+                ops.encode_mv_i4(enc, &o_w, &o_s, &attn_out_buf, &attn_proj_buf, hidden, q_dim, q_dim);
+                // 8. Post-attn norm + residual (in-place into x_buf)
+                ops.encode_rms_norm_f16w(enc, &attn_proj_buf, &post_attn_norm_w, &mlp_in_buf, hidden, cfg.rms_norm_eps, add_one);
+                ops.encode_add_f32_inplace(enc, &x_buf, &mlp_in_buf, hidden);
+                // 9. Pre-FFN norm
+                ops.encode_rms_norm_f16w(enc, &x_buf, &pre_ffn_norm_w, &mlp_in_buf, hidden, cfg.rms_norm_eps, add_one);
+                // 10. Gate + Up
+                ops.encode_mv_i4(enc, &gate_w, &gate_s, &mlp_in_buf, &gate_buf, ffn_dim, hidden, hidden);
+                ops.encode_mv_i4(enc, &up_w, &up_s, &mlp_in_buf, &up_buf, ffn_dim, hidden, hidden);
+                // 11. GELU(gate) * up
+                ops.encode_gelu_tanh_mul_f32_inplace(enc, &gate_buf, &up_buf, ffn_dim);
+                // 12. Down
+                ops.encode_mv_i4(enc, &down_w, &down_s, &gate_buf, &down_buf, hidden, ffn_dim, ffn_dim);
+                // 13. Post-FFN norm + residual (or just residual)
+                if let Some(ref pw) = post_ffn_norm_w {
+                    ops.encode_rms_norm_f16w(enc, &down_buf, pw, &mlp_in_buf, hidden, cfg.rms_norm_eps, add_one);
+                    ops.encode_add_f32_inplace(enc, &x_buf, &mlp_in_buf, hidden);
+                } else {
+                    ops.encode_add_f32_inplace(enc, &x_buf, &down_buf, hidden);
+                }
+            }
+
+            // Final norm
+            let final_norm_w = ops.get_cached_tensor("batched.final_norm")?;
+            ops.encode_rms_norm_f16w(enc, &x_buf, &final_norm_w, &final_norm_buf, hidden, cfg.rms_norm_eps, add_one);
+
+            // Logits
+            let lm_w = ops.get_cached_tensor("batched.lm_w")?;
+            match lm_dtype_str.as_str() {
+                "f16" => {
+                    ops.encode_mv_f16(enc, &lm_w, &final_norm_buf, &logits_buf, vocab, hidden);
+                }
+                "i8" => {
+                    let lm_s = ops.get_cached_tensor("batched.lm_s")?;
+                    ops.encode_mv_i8(enc, &lm_w, &lm_s, &final_norm_buf, &logits_buf, vocab, hidden);
+                }
+                "i4" => {
+                    let lm_s = ops.get_cached_tensor("batched.lm_s")?;
+                    ops.encode_mv_i4(enc, &lm_w, &lm_s, &final_norm_buf, &logits_buf, vocab, hidden, hidden);
+                }
+                _ => return None,
+            }
+
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+
+            let mut logits = vec![0.0f32; vocab];
+            ops.read_named_buf("batched_logits", &mut logits).ok()?;
+            Some(logits)
+        });
+
+        let all_logits = match all_logits {
+            Some(l) => l,
+            None => return Ok(None),
+        };
+
+        // Sync K/V back to CPU cache so regular path stays consistent if we ever fall back
+        let block_id = page_table.block_for_token(pos).map_err(|e| CoreError::Backend(e.to_string()))?;
+        let token_off = page_table.offset_in_block(pos).map_err(|e| CoreError::Backend(e.to_string()))?;
+        for layer in 0..self.max_layers {
+            let spec = self.layer_attn.get(layer).unwrap();
+            let kv_dim = spec.kv_dim;
+            let (k_cache_buf, v_cache_buf) = ops.get_kv_cache_buffers(layer)
+                .ok_or_else(|| CoreError::Backend(format!("batched step: missing kv cache for layer {layer}")))?;
+            let mut k_token = vec![0.0f32; kv_dim];
+            let mut v_token = vec![0.0f32; kv_dim];
+            let k_ptr = k_cache_buf.contents() as *const f32;
+            let v_ptr = v_cache_buf.contents() as *const f32;
+            unsafe {
+                if !k_ptr.is_null() {
+                    std::ptr::copy_nonoverlapping(k_ptr.add(pos * kv_dim), k_token.as_mut_ptr(), kv_dim);
+                }
+                if !v_ptr.is_null() {
+                    std::ptr::copy_nonoverlapping(v_ptr.add(pos * kv_dim), v_token.as_mut_ptr(), kv_dim);
+                }
+            }
+            let mut k_store = vec![0.0f32; layout_kv_dim];
+            let mut v_store = vec![0.0f32; layout_kv_dim];
+            k_store[..kv_dim].copy_from_slice(&k_token);
+            v_store[..kv_dim].copy_from_slice(&v_token);
+            {
+                let mut cv = kv_cache.view_mut();
+                cv.write_token(block_id, layer, token_off, &k_store, &v_store)
+                    .map_err(|e| CoreError::Backend(format!("batched step: kv write failed: {e}")))?;
+            }
+        }
+
+        Ok(Some(all_logits))
+    }
+
     fn step_topk_from_hidden_inner(
         &mut self,
         x0: &[f32],
@@ -394,6 +774,36 @@ impl GemmaRunner {
     ) -> Result<Vec<(u32, f32)>, CoreError> {
         let cfg = self.cfg.clone();
         let hidden = cfg.hidden_size;
+
+        // Try fully-batched single-command-buffer GPU decode first.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if let Some(all_logits) = self.step_topk_batched(x0, per_layer_input, pos, page_table, kv_cache)? {
+            let vocab = cfg.vocab_size;
+            let k = top_k.max(1).min(vocab);
+            let mut top: Vec<(u32, f32)> = Vec::with_capacity(k);
+            let mut min_idx = 0usize;
+            let mut min_val = f32::INFINITY;
+            for (vid, &raw) in all_logits.iter().enumerate() {
+                let dot = if let Some(cap) = self.final_logit_softcapping {
+                    if cap > 0.0 { cap * (raw / cap).tanh() } else { raw }
+                } else {
+                    raw
+                };
+                if top.len() < k {
+                    top.push((vid as u32, dot));
+                    if dot < min_val { min_val = dot; min_idx = top.len() - 1; }
+                } else if dot > min_val {
+                    top[min_idx] = (vid as u32, dot);
+                    min_val = top[0].1; min_idx = 0;
+                    for (i, &(_, s)) in top.iter().enumerate().skip(1) {
+                        if s < min_val { min_val = s; min_idx = i; }
+                    }
+                }
+            }
+            top.sort_by(|a, b| b.1.total_cmp(&a.1));
+            return Ok(top);
+        }
+
         if self.max_q_dim == 0 || self.max_kv_dim == 0 {
             return Err(CoreError::Backend(
                 "gemma: invalid attention head geometry".into(),
@@ -462,7 +872,7 @@ impl GemmaRunner {
         let mut k_store = vec![0.0f32; layout_kv_dim];
         let mut v_store = vec![0.0f32; layout_kv_dim];
 
-        // ── Fused Metal graph path (Gemma3 only, no per-layer input, no TurboQuant) ──
+        // Fused Metal graph path (Gemma3 only, no per-layer input, no TurboQuant) ──
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             let mut disable_graph = false;
@@ -612,209 +1022,316 @@ impl GemmaRunner {
                 rms_norm_f32(&x, &attn_norm_w, cfg.rms_norm_eps, &mut x_norm);
             }
 
-            // Gemma uses rotate_half-style RoPE; keep RoPE on CPU for Gemma3 to
-            // preserve correctness until Metal path matches this convention.
-            let use_metal_rope = self.metal_ops.is_some() && self.use_metal_rope;
-
-            // QKV projections (HF weights are [out, in]).
-            let q_name = format!("model.layers.{layer}.self_attn.q_proj.weight");
-            let k_name = format!("model.layers.{layer}.self_attn.k_proj.weight");
-            let v_name = format!("model.layers.{layer}.self_attn.v_proj.weight");
-            if !is_kv_shared_layer {
-                let fused_qkv = self.linear_qkv_f16_out_in(
-                    &x_norm,
-                    &q_name,
-                    q_dim,
-                    &k_name,
-                    kv_dim,
-                    &v_name,
-                    kv_dim,
-                    hidden,
-                    q_slice,
-                    k_slice,
-                    v_slice,
-                )?;
-                if !fused_qkv {
-                    self.linear_f16_out_in(&x_norm, &q_name, q_dim, hidden, q_slice)?;
-                    self.linear_f16_out_in(&x_norm, &k_name, kv_dim, hidden, k_slice)?;
-                    self.linear_f16_out_in(&x_norm, &v_name, kv_dim, hidden, v_slice)?;
-                }
-            } else {
-                self.linear_f16_out_in(&x_norm, &q_name, q_dim, hidden, q_slice)?;
-            }
-
-
-            // Gemma per-head Q/K RMSNorm before RoPE
-            if use_metal_norm {
-                let qw = self.tensor_f16(
-                    &format!("model.layers.{layer}.self_attn.q_norm.weight"))?.to_vec();
-                let kw = if !is_kv_shared_layer {
-                    Some(
-                        self.tensor_f16(
-                            &format!("model.layers.{layer}.self_attn.k_norm.weight"),
-                        )?
-                        .to_vec(),
-                    )
-                } else {
-                    None
-                };
-                let add_one = self.rmsnorm_weight_is_offset;
-                let ops = self.metal_ops.as_ref().unwrap();
-                for hidx in 0..n_heads {
-                    let seg = &mut q_slice[hidx * head_dim..(hidx + 1) * head_dim];
-                    let inp = seg.to_vec();
-                    ops.rms_norm_f16w(&inp, &qw, cfg.rms_norm_eps, add_one, &format!("gemma.layer.{layer}.q_norm"), seg)
-                        .map_err(|e| CoreError::Backend(e.to_string()))?;
-                }
-                if !is_kv_shared_layer {
-                    let kw = kw.as_ref().unwrap();
-                    for hidx in 0..n_kv_heads {
-                        let seg = &mut k_slice[hidx * kv_head_dim..(hidx + 1) * kv_head_dim];
-                        let inp = seg.to_vec();
-                        ops.rms_norm_f16w(&inp, &kw, cfg.rms_norm_eps, add_one, &format!("gemma.layer.{layer}.k_norm"), seg)
-                            .map_err(|e| CoreError::Backend(e.to_string()))?;
-                    }
-                }
-            } else {
-                q_norm_w.resize(head_dim, 0.0);
-                self.rmsnorm_weight(
-                    &format!("model.layers.{layer}.self_attn.q_norm.weight"),
-                    &mut q_norm_w,
-                )?;
-                for hidx in 0..n_heads {
-                    let start = hidx * head_dim;
-                    let end = start + head_dim;
-                    self.rms_norm_inplace_segment(&mut q_slice[start..end], &q_norm_w, cfg.rms_norm_eps);
-                }
-                if !is_kv_shared_layer {
-                    k_norm_w.resize(kv_head_dim, 0.0);
-                    self.rmsnorm_weight(
-                        &format!("model.layers.{layer}.self_attn.k_norm.weight"),
-                        &mut k_norm_w,
-                    )?;
-                    for hidx in 0..n_kv_heads {
-                        let start = hidx * kv_head_dim;
-                        let end = start + kv_head_dim;
-                        self.rms_norm_inplace_segment(&mut k_slice[start..end], &k_norm_w, cfg.rms_norm_eps);
-                    }
-                }
-            }
-
-            // V norm uses Gemma4 RMSNorm without scale.
-            if !is_kv_shared_layer && self.is_gemma4_text {
-                for hidx in 0..n_kv_heads {
-                    let start = hidx * kv_head_dim;
-                    let end = start + kv_head_dim;
-                    self.rms_norm_inplace_no_weight_segment(&mut v_slice[start..end], cfg.rms_norm_eps);
-                }
-            }
-
-            // ── RoPE ──────────────
-            if use_metal_rope {
-                let ops = self.metal_ops.as_ref().unwrap();
-                ops.rope_half_f32(q_slice, n_heads, head_dim, head_dim, pos, layer_rope_theta)
-                    .map_err(|e| CoreError::Backend(e.to_string()))?;
-                if !is_kv_shared_layer {
-                    ops.rope_half_f32(
-                        k_slice,
-                        n_kv_heads,
-                        kv_head_dim,
-                        kv_head_dim,
-                        pos,
-                        layer_rope_theta,
-                    )
-                        .map_err(|e| CoreError::Backend(e.to_string()))?;
-                }
-            } else {
-                rope_inplace_rotate_half_f32(q_slice, n_heads, head_dim, pos, layer_rope_theta);
-                if !is_kv_shared_layer {
-                    rope_inplace_rotate_half_f32(k_slice, n_kv_heads, kv_head_dim, pos, layer_rope_theta);
-                }
-            }
-
-            // Write new token K/V into paged cache.
-            if !is_kv_shared_layer {
-                if kv_dim == layout_kv_dim {
-                    k_store.copy_from_slice(k_slice);
-                    v_store.copy_from_slice(v_slice);
-                } else {
-                    k_store.fill(0.0);
-                    v_store.fill(0.0);
-                    k_store[..kv_dim].copy_from_slice(k_slice);
-                    v_store[..kv_dim].copy_from_slice(v_slice);
-                }
-                let mut cv = kv_cache.view_mut();
-                cv.write_token(block_id, layer, token_off, &k_store, &v_store)?;
-            }
-
-            // Gather historical K/V and run attention for this token.
+            // Compute context length early so we can choose the fused GPU decode path
+            // (which keeps Q on GPU across projections → norms → RoPE → attention).
             let seq = page_table.token_count();
-            let cr = kv_cache.view();
-            gather_bases.clear();
             let start_tpos = if (self.is_gemma3_text || self.is_gemma4_text) && !is_full_attention_layer {
                 seq.saturating_sub(self.sliding_window)
             } else {
                 0
             };
             let gather_len = seq.saturating_sub(start_tpos);
-            gather_bases.reserve(gather_len);
-            for tpos in start_tpos..seq {
-                let b = page_table.block_for_token(tpos).map_err(|e| {
-                    CoreError::Backend(format!("gemma: block_for_token failed: {e}"))
-                })?;
-                let o = page_table.offset_in_block(tpos).map_err(|e| {
-                    CoreError::Backend(format!("gemma: offset_in_block failed: {e}"))
-                })?;
-                gather_bases.push(cr.layout.token_base_elem(b, kv_shared_source_layer, o)?);
+            let mut gpu_attn_done = false;
+
+            // Fused GPU decode path (project + norm + rope on GPU, keep Q resident) ──
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            {
+                if !is_kv_shared_layer {
+                    let mut k_new = vec![0.0f32; kv_dim];
+                    let mut v_new = vec![0.0f32; kv_dim];
+                    // TODO: gpu_project_qkv_norm_rope currently produces incorrect output.
+                    // Keeping disabled until the fused QKV+norm+RoPE kernel is debugged.
+                    let _proj_ok = self.gpu_project_qkv_norm_rope(
+                        &x_norm, layer, pos,
+                        n_heads, n_kv_heads, head_dim, kv_head_dim,
+                        q_dim, kv_dim, hidden,
+                        layer_rope_theta,
+                        &mut k_new, &mut v_new,
+                    );
+                    let proj_ok = false;
+                    if proj_ok {
+                        if self.is_gemma4_text {
+                            for hidx in 0..n_kv_heads {
+                                let s = hidx * kv_head_dim;
+                                let e = s + kv_head_dim;
+                                self.rms_norm_inplace_no_weight_segment(&mut v_new[s..e], cfg.rms_norm_eps);
+                            }
+                        }
+                        if kv_dim == layout_kv_dim {
+                            k_store.copy_from_slice(&k_new);
+                            v_store.copy_from_slice(&v_new);
+                        } else {
+                            k_store.fill(0.0);
+                            v_store.fill(0.0);
+                            k_store[..kv_dim].copy_from_slice(&k_new);
+                            v_store[..kv_dim].copy_from_slice(&v_new);
+                        }
+                        {
+                            let mut cv = kv_cache.view_mut();
+                            cv.write_token(block_id, layer, token_off, &k_store, &v_store)?;
+                        }
+
+                        let cr = kv_cache.view();
+                        gather_bases.clear();
+                        gather_bases.reserve(gather_len);
+                        for tpos in start_tpos..seq {
+                            let b = page_table.block_for_token(tpos).map_err(|e| {
+                                CoreError::Backend(format!("gemma: block_for_token failed: {e}"))
+                            })?;
+                            let o = page_table.offset_in_block(tpos).map_err(|e| {
+                                CoreError::Backend(format!("gemma: offset_in_block failed: {e}"))
+                            })?;
+                            gather_bases.push(cr.layout.token_base_elem(b, kv_shared_source_layer, o)?);
+                        }
+                        let mut k_seq = vec![0.0f32; gather_len * layout_kv_dim];
+                        let mut v_seq = vec![0.0f32; gather_len * layout_kv_dim];
+                        cr.gather_by_bases_f32(&gather_bases, &mut k_seq, &mut v_seq)?;
+
+                        let attn_scale = if self.is_gemma4_text && !self.gemma4_disable_q_prescale {
+                            1.0f32
+                        } else {
+                            1.0f32 / (head_dim as f32).sqrt()
+                        };
+                        let attn_ok = self.gpu_attention_and_proj_preloaded_q(
+                            "attn_block_q",
+                            &k_seq,
+                            &v_seq,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            gather_len,
+                            layout_kv_dim,
+                            attn_scale,
+                            &format!("model.layers.{layer}.self_attn.o_proj.weight"),
+                            hidden,
+                            &mut attn_proj,
+                        )?;
+                        if attn_ok {
+                            gpu_attn_done = true;
+                        }
+                    }
+                }
             }
-            // Gemma4 attention uses scaling=1.0 in HF; KV kernel applies 1/sqrt(head_dim),
-            // so pre-scale queries by sqrt(head_dim) to match Gemma4 behavior.
-            let q_attn_scaled: Option<Vec<f32>> = if self.is_gemma4_text && !self.gemma4_disable_q_prescale {
-                let s = (head_dim as f32).sqrt();
-                Some(q_slice.iter().map(|&v| v * s).collect())
-            } else {
-                None
-            };
-            let q_for_attn: &[f32] = q_attn_scaled.as_deref().unwrap_or(q_slice);
-            cr.attention_single_token_gqa_from_bases(
-                &gather_bases,
-                q_for_attn,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                None, // attn_scale
-                None, // soft_cap
-                attn_out_slice,
-            )?;
 
-            // o_proj: hidden <- hidden
-            self.linear_f16_out_in(
-                attn_out_slice,
-                &format!("model.layers.{layer}.self_attn.o_proj.weight"),
-                hidden,
-                q_dim,
-                &mut attn_proj,
-            )?;
+            if !gpu_attn_done {
+                // Gemma uses rotate_half-style RoPE; keep RoPE on CPU for Gemma3 to
+                // preserve correctness until Metal path matches this convention.
+                let use_metal_rope = self.metal_ops.is_some() && self.use_metal_rope;
 
-            let x_residual = x.clone();
+                // QKV projections (HF weights are [out, in]).
+                let q_name = format!("model.layers.{layer}.self_attn.q_proj.weight");
+                let k_name = format!("model.layers.{layer}.self_attn.k_proj.weight");
+                let v_name = format!("model.layers.{layer}.self_attn.v_proj.weight");
+                if !is_kv_shared_layer {
+                    let fused_qkv = self.linear_qkv_f16_out_in(
+                        &x_norm,
+                        &q_name,
+                        q_dim,
+                        &k_name,
+                        kv_dim,
+                        &v_name,
+                        kv_dim,
+                        hidden,
+                        q_slice,
+                        k_slice,
+                        v_slice,
+                    )?;
+                    if !fused_qkv {
+                        let batched = self.batch_i4_qkv(
+                            &x_norm, &q_name, q_dim, &k_name, kv_dim, &v_name, kv_dim,
+                            hidden, q_slice, k_slice, v_slice,
+                        )?;
+                        if !batched {
+                            self.linear_f16_out_in(&x_norm, &q_name, q_dim, hidden, q_slice)?;
+                            self.linear_f16_out_in(&x_norm, &k_name, kv_dim, hidden, k_slice)?;
+                            self.linear_f16_out_in(&x_norm, &v_name, kv_dim, hidden, v_slice)?;
+                        }
+                    }
+                } else {
+                    self.linear_f16_out_in(&x_norm, &q_name, q_dim, hidden, q_slice)?;
+                }
 
-            // ── Post-attention norm on attn branch, then residual add
-            if use_metal_norm {
-                let w = self.tensor_f16(
-                    &format!("model.layers.{layer}.post_attention_layernorm.weight"))?.to_vec();
-                let add_one = self.rmsnorm_weight_is_offset;
-                let mut x_out = vec![0.0f32; hidden];
-                self.metal_ops.as_ref().unwrap()
-                    .rms_norm_f16w(&attn_proj, &w, cfg.rms_norm_eps, add_one, &format!("gemma.layer.{layer}.post_attn_norm"), &mut x_out)
-                    .map_err(|e| CoreError::Backend(e.to_string()))?;
-                for i in 0..hidden { x[i] = x_out[i] + x_residual[i]; }
-            } else {
-                self.rmsnorm_weight(
-                    &format!("model.layers.{layer}.post_attention_layernorm.weight"),
-                    &mut post_attn_norm_w,
-                )?;
-                rms_norm_f32(&attn_proj, &post_attn_norm_w, cfg.rms_norm_eps, &mut x_norm);
-                for i in 0..hidden { x[i] = x_norm[i] + x_residual[i]; }
+
+                // Gemma per-head Q/K RMSNorm before RoPE
+                if use_metal_norm {
+                    let qw = self.tensor_f16(
+                        &format!("model.layers.{layer}.self_attn.q_norm.weight"))?.to_vec();
+                    let kw = if !is_kv_shared_layer {
+                        Some(
+                            self.tensor_f16(
+                                &format!("model.layers.{layer}.self_attn.k_norm.weight"),
+                            )?
+                            .to_vec(),
+                        )
+                    } else {
+                        None
+                    };
+                    let add_one = self.rmsnorm_weight_is_offset;
+                    let ops = self.metal_ops.as_ref().unwrap();
+                    for hidx in 0..n_heads {
+                        let seg = &mut q_slice[hidx * head_dim..(hidx + 1) * head_dim];
+                        let inp = seg.to_vec();
+                        ops.rms_norm_f16w(&inp, &qw, cfg.rms_norm_eps, add_one, &format!("gemma.layer.{layer}.q_norm"), seg)
+                            .map_err(|e| CoreError::Backend(e.to_string()))?;
+                    }
+                    if !is_kv_shared_layer {
+                        let kw = kw.as_ref().unwrap();
+                        for hidx in 0..n_kv_heads {
+                            let seg = &mut k_slice[hidx * kv_head_dim..(hidx + 1) * kv_head_dim];
+                            let inp = seg.to_vec();
+                            ops.rms_norm_f16w(&inp, &kw, cfg.rms_norm_eps, add_one, &format!("gemma.layer.{layer}.k_norm"), seg)
+                                .map_err(|e| CoreError::Backend(e.to_string()))?;
+                        }
+                    }
+                } else {
+                    q_norm_w.resize(head_dim, 0.0);
+                    self.rmsnorm_weight(
+                        &format!("model.layers.{layer}.self_attn.q_norm.weight"),
+                        &mut q_norm_w,
+                    )?;
+                    for hidx in 0..n_heads {
+                        let start = hidx * head_dim;
+                        let end = start + head_dim;
+                        self.rms_norm_inplace_segment(&mut q_slice[start..end], &q_norm_w, cfg.rms_norm_eps);
+                    }
+                    if !is_kv_shared_layer {
+                        k_norm_w.resize(kv_head_dim, 0.0);
+                        self.rmsnorm_weight(
+                            &format!("model.layers.{layer}.self_attn.k_norm.weight"),
+                            &mut k_norm_w,
+                        )?;
+                        for hidx in 0..n_kv_heads {
+                            let start = hidx * kv_head_dim;
+                            let end = start + kv_head_dim;
+                            self.rms_norm_inplace_segment(&mut k_slice[start..end], &k_norm_w, cfg.rms_norm_eps);
+                        }
+                    }
+                }
+
+                // V norm uses Gemma4 RMSNorm without scale.
+                if !is_kv_shared_layer && self.is_gemma4_text {
+                    for hidx in 0..n_kv_heads {
+                        let start = hidx * kv_head_dim;
+                        let end = start + kv_head_dim;
+                        self.rms_norm_inplace_no_weight_segment(&mut v_slice[start..end], cfg.rms_norm_eps);
+                    }
+                }
+
+                // RoPE ──────────────
+                if use_metal_rope {
+                    let ops = self.metal_ops.as_ref().unwrap();
+                    ops.rope_half_f32(q_slice, n_heads, head_dim, head_dim, pos, layer_rope_theta)
+                        .map_err(|e| CoreError::Backend(e.to_string()))?;
+                    if !is_kv_shared_layer {
+                        ops.rope_half_f32(
+                            k_slice,
+                            n_kv_heads,
+                            kv_head_dim,
+                            kv_head_dim,
+                            pos,
+                            layer_rope_theta,
+                        )
+                            .map_err(|e| CoreError::Backend(e.to_string()))?;
+                    }
+                } else {
+                    rope_inplace_rotate_half_f32(q_slice, n_heads, head_dim, pos, layer_rope_theta);
+                    if !is_kv_shared_layer {
+                        rope_inplace_rotate_half_f32(k_slice, n_kv_heads, kv_head_dim, pos, layer_rope_theta);
+                    }
+                }
+
+                // Write new token K/V into paged cache.
+                if !is_kv_shared_layer {
+                    if kv_dim == layout_kv_dim {
+                        k_store.copy_from_slice(k_slice);
+                        v_store.copy_from_slice(v_slice);
+                    } else {
+                        k_store.fill(0.0);
+                        v_store.fill(0.0);
+                        k_store[..kv_dim].copy_from_slice(k_slice);
+                        v_store[..kv_dim].copy_from_slice(v_slice);
+                    }
+                    let mut cv = kv_cache.view_mut();
+                    cv.write_token(block_id, layer, token_off, &k_store, &v_store)?;
+
+                    // Also write into persistent GPU KV cache
+                    #[cfg(any(target_os = "macos", target_os = "ios"))]
+                    if let Some(ref ops) = self.metal_ops {
+                        let _ = ops.ensure_layer_kv_cache(layer, kv_dim, kv_cache.max_seq_len());
+                        let _ = ops.write_kv_token(layer, token_off, kv_dim, &k[..kv_dim], &v[..kv_dim]);
+                    }
+                }
+
+                // Gather historical K/V and run attention for this token.
+                let cr = kv_cache.view();
+                gather_bases.clear();
+                gather_bases.reserve(gather_len);
+                for tpos in start_tpos..seq {
+                    let b = page_table.block_for_token(tpos).map_err(|e| {
+                        CoreError::Backend(format!("gemma: block_for_token failed: {e}"))
+                    })?;
+                    let o = page_table.offset_in_block(tpos).map_err(|e| {
+                        CoreError::Backend(format!("gemma: offset_in_block failed: {e}"))
+                    })?;
+                    gather_bases.push(cr.layout.token_base_elem(b, kv_shared_source_layer, o)?);
+                }
+                // Gemma4 attention uses scaling=1.0 in HF; KV kernel applies 1/sqrt(head_dim),
+                // so pre-scale queries by sqrt(head_dim) to match Gemma4 behavior.
+                let q_attn_scaled: Option<Vec<f32>> = if self.is_gemma4_text && !self.gemma4_disable_q_prescale {
+                    let s = (head_dim as f32).sqrt();
+                    Some(q_slice.iter().map(|&v| v * s).collect())
+                } else {
+                    None
+                };
+                let q_for_attn: &[f32] = q_attn_scaled.as_deref().unwrap_or(q_slice);
+
+                // GPU attention: use gather+upload path. The persistent KV cache path
+                // is unreliable here because (a) prefill never writes to it, so historical
+                // positions contain garbage, and (b) shared-KV layers never have their
+                // per-layer cache populated at all.
+                if self.metal_ops.is_some() {
+                    let mut k_seq = vec![0.0f32; gather_len * layout_kv_dim];
+                    let mut v_seq = vec![0.0f32; gather_len * layout_kv_dim];
+                    cr.gather_by_bases_f32(&gather_bases, &mut k_seq, &mut v_seq)?;
+                    let gpu = self.gpu_attention_and_proj(
+                        q_for_attn,
+                        &k_seq,
+                        &v_seq,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        gather_len,
+                        layout_kv_dim,
+                        &format!("model.layers.{layer}.self_attn.o_proj.weight"),
+                        hidden,
+                        &mut attn_proj,
+                    )?;
+                    if gpu {
+                        gpu_attn_done = true;
+                    }
+                }
+
+                if !gpu_attn_done {
+                    cr.attention_single_token_gqa_from_bases(
+                        &gather_bases,
+                        q_for_attn,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        None, // attn_scale
+                        None, // soft_cap
+                        attn_out_slice,
+                    )?;
+
+                    // o_proj: hidden <- hidden
+                    self.linear_f16_out_in(
+                        attn_out_slice,
+                        &format!("model.layers.{layer}.self_attn.o_proj.weight"),
+                        hidden,
+                        q_dim,
+                        &mut attn_proj,
+                    )?;
+                }
             }
 
             let ffn_norm_name = format!("model.layers.{layer}.pre_feedforward_layernorm.weight");
@@ -823,83 +1340,120 @@ impl GemmaRunner {
             let down_name = format!("model.layers.{layer}.mlp.down_proj.weight");
             let add_one = self.rmsnorm_weight_is_offset;
 
-            let mut ffn_done = false;
+            let mut layer_tail_done = false;
+
+            // Try fully fused post-attention tail (post-attn norm + residual + pre-FFN norm + MLP)
+            // on GPU in one command buffer, eliminating CPU↔GPU round-trips between o_proj and MLP.
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             {
-                let has_metal = self.metal_ops.is_some();
-                if has_metal {
-                    // Check if all weights are f16
-                    let mut all_f16 = false;
-                    let gate_res = self.resolve_name(&gate_name);
-                    if let Ok(res_name) = gate_res {
-                        if let Some(meta) = self.tensor_meta_by_exact_name(&res_name) {
-                            if meta.dtype == "f16" {
-                                all_f16 = true;
+                let x_copy = x.clone();
+                let tail_fused = self.fused_post_attn_mlp_i4(
+                    &attn_proj, &x_copy, layer, ffn_dim, hidden, &mut x,
+                )?;
+                if tail_fused {
+                    layer_tail_done = true;
+                }
+            }
+
+            let mut ffn_done = false;
+            if !layer_tail_done {
+                let x_residual = x.clone();
+
+                // Post-attention norm on attn branch, then residual add
+                if use_metal_norm {
+                    let w = self.tensor_f16(
+                        &format!("model.layers.{layer}.post_attention_layernorm.weight"))?.to_vec();
+                    let mut x_out = vec![0.0f32; hidden];
+                    self.metal_ops.as_ref().unwrap()
+                        .rms_norm_f16w(&attn_proj, &w, cfg.rms_norm_eps, add_one, &format!("gemma.layer.{layer}.post_attn_norm"), &mut x_out)
+                        .map_err(|e| CoreError::Backend(e.to_string()))?;
+                    for i in 0..hidden { x[i] = x_out[i] + x_residual[i]; }
+                } else {
+                    self.rmsnorm_weight(
+                        &format!("model.layers.{layer}.post_attention_layernorm.weight"),
+                        &mut post_attn_norm_w,
+                    )?;
+                    rms_norm_f32(&attn_proj, &post_attn_norm_w, cfg.rms_norm_eps, &mut x_norm);
+                    for i in 0..hidden { x[i] = x_norm[i] + x_residual[i]; }
+                }
+
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
+                {
+                    let has_metal = self.metal_ops.is_some();
+                    if has_metal {
+                        // Check if all weights are f16
+                        let mut all_f16 = false;
+                        let gate_res = self.resolve_name(&gate_name);
+                        if let Ok(res_name) = gate_res {
+                            if let Some(meta) = self.tensor_meta_by_exact_name(&res_name) {
+                                if meta.dtype == "f16" {
+                                    all_f16 = true;
+                                }
                             }
                         }
-                    }
 
-                    if all_f16 {
-                        let inter = ffn_dim;
-                        let eps = cfg.rms_norm_eps;
+                        if all_f16 {
+                            let inter = ffn_dim;
+                            let eps = cfg.rms_norm_eps;
 
-                        let norm_w_data: Vec<u16>;
-                        let w1b_data: Vec<u16>;
-                        let w3b_data: Vec<u16>;
-                        let w2b_data: Vec<u16>;
+                            let norm_w_data: Vec<u16>;
+                            let w1b_data: Vec<u16>;
+                            let w3b_data: Vec<u16>;
+                            let w2b_data: Vec<u16>;
 
-                        if let (Ok(nw), Ok(w1), Ok(w3), Ok(w2)) = (
-                            self.tensor_f16(&ffn_norm_name),
-                            self.tensor_f16(&gate_name),
-                            self.tensor_f16(&up_name),
-                            self.tensor_f16(&down_name),
-                        ) {
-                            norm_w_data = nw.to_vec();
-                            w1b_data = w1.to_vec();
-                            w3b_data = w3.to_vec();
-                            w2b_data = w2.to_vec();
+                            if let (Ok(nw), Ok(w1), Ok(w3), Ok(w2)) = (
+                                self.tensor_f16(&ffn_norm_name),
+                                self.tensor_f16(&gate_name),
+                                self.tensor_f16(&up_name),
+                                self.tensor_f16(&down_name),
+                            ) {
+                                norm_w_data = nw.to_vec();
+                                w1b_data = w1.to_vec();
+                                w3b_data = w3.to_vec();
+                                w2b_data = w2.to_vec();
 
-                            let ops = self.metal_ops.as_ref().unwrap();
+                                let ops = self.metal_ops.as_ref().unwrap();
 
-                            if ops.ensure_named_buf("ffn_x", hidden).is_ok()
-                                && ops.ensure_named_buf("ffn_norm_out", hidden).is_ok()
-                                && ops.ensure_named_buf("ffn_gate", inter).is_ok()
-                                && ops.ensure_named_buf("ffn_up", inter).is_ok()
-                                && ops.ensure_named_buf("ffn_down", hidden).is_ok()
-                            {
-                                if let (Ok(norm_wb), Ok(w1b), Ok(w3b), Ok(w2b)) = (
-                                    ops.ensure_tensor_cached(&ffn_norm_name, &norm_w_data),
-                                    ops.ensure_tensor_cached(&gate_name, &w1b_data),
-                                    ops.ensure_tensor_cached(&up_name, &w3b_data),
-                                    ops.ensure_tensor_cached(&down_name, &w2b_data),
-                                ) {
-                                    if ops.write_named_buf("ffn_x", &x).is_ok() {
-                                        if let (Ok(xb), Ok(nb), Ok(gb), Ok(ub), Ok(db)) = (
-                                            ops.get_named_buf("ffn_x"),
-                                            ops.get_named_buf("ffn_norm_out"),
-                                            ops.get_named_buf("ffn_gate"),
-                                            ops.get_named_buf("ffn_up"),
-                                            ops.get_named_buf("ffn_down"),
-                                        ) {
-                                            let batch_res = ops.run_batch(|enc| {
-                                                ops.encode_rms_norm_f16w(enc, &xb, &norm_wb, &nb, hidden, eps, add_one);
-                                                ops.encode_mv_f16_bias(enc, &w1b, &nb, None, &gb, inter, hidden);
-                                                ops.encode_mv_f16_bias(enc, &w3b, &nb, None, &ub, inter, hidden);
-                                                ops.encode_gelu_tanh_mul_f32_inplace(enc, &gb, &ub, inter);
-                                                ops.encode_mv_f16_bias(enc, &w2b, &gb, None, &db, hidden, inter);
-                                                
-                                                // Gemma does a post-FFN norm before the residual add
-                                                // So we can't just do `encode_add_f32_inplace(enc, &xb, &db, hidden)`
-                                                // We must read out `db` (down), then run the rest of the layer on CPU.
-                                                // Let's just break the batch here to simplify, we still save round trips.
-                                                Ok(())
-                                            });
+                                if ops.ensure_named_buf("ffn_x", hidden).is_ok()
+                                    && ops.ensure_named_buf("ffn_norm_out", hidden).is_ok()
+                                    && ops.ensure_named_buf("ffn_gate", inter).is_ok()
+                                    && ops.ensure_named_buf("ffn_up", inter).is_ok()
+                                    && ops.ensure_named_buf("ffn_down", hidden).is_ok()
+                                {
+                                    if let (Ok(norm_wb), Ok(w1b), Ok(w3b), Ok(w2b)) = (
+                                        ops.ensure_tensor_cached(&ffn_norm_name, &norm_w_data),
+                                        ops.ensure_tensor_cached(&gate_name, &w1b_data),
+                                        ops.ensure_tensor_cached(&up_name, &w3b_data),
+                                        ops.ensure_tensor_cached(&down_name, &w2b_data),
+                                    ) {
+                                        if ops.write_named_buf("ffn_x", &x).is_ok() {
+                                            if let (Ok(xb), Ok(nb), Ok(gb), Ok(ub), Ok(db)) = (
+                                                ops.get_named_buf("ffn_x"),
+                                                ops.get_named_buf("ffn_norm_out"),
+                                                ops.get_named_buf("ffn_gate"),
+                                                ops.get_named_buf("ffn_up"),
+                                                ops.get_named_buf("ffn_down"),
+                                            ) {
+                                                let batch_res = ops.run_batch(|enc| {
+                                                    ops.encode_rms_norm_f16w(enc, &xb, &norm_wb, &nb, hidden, eps, add_one);
+                                                    ops.encode_mv_f16_bias(enc, &w1b, &nb, None, &gb, inter, hidden);
+                                                    ops.encode_mv_f16_bias(enc, &w3b, &nb, None, &ub, inter, hidden);
+                                                    ops.encode_gelu_tanh_mul_f32_inplace(enc, &gb, &ub, inter);
+                                                    ops.encode_mv_f16_bias(enc, &w2b, &gb, None, &db, hidden, inter);
 
-                                            if batch_res.is_ok() {
-                                                // We only read back 'down' because Gemma needs to do post-FFN norm on it,
-                                                // and THEN add it to x.
-                                                if ops.read_named_buf("ffn_down", &mut down).is_ok() {
-                                                    ffn_done = true;
+                                                    // Gemma does a post-FFN norm before the residual add
+                                                    // So we can't just do `encode_add_f32_inplace(enc, &xb, &db, hidden)`
+                                                    // We must read out `down` (down), then run the rest of the layer on CPU.
+                                                    // Let's just break the batch here to simplify, we still save round trips.
+                                                    Ok(())
+                                                });
+
+                                                if batch_res.is_ok() {
+                                                    // We only read back 'down' because Gemma needs to do post-FFN norm on it,
+                                                    // and THEN add it to x.
+                                                    if ops.read_named_buf("ffn_down", &mut down).is_ok() {
+                                                        ffn_done = true;
+                                                    }
                                                 }
                                             }
                                         }
@@ -909,48 +1463,67 @@ impl GemmaRunner {
                         }
                     }
                 }
-            }
 
-            let x_residual = x.clone();
+                let x_residual = x.clone();
+                let mut fused_mlp_done = false;
 
-            if !ffn_done {
-                // ── Pre-FFN norm ───────
-                if use_metal_norm {
-                    let w = self.tensor_f16(&ffn_norm_name)?.to_vec();
-                    let ck = format!("gemma.layer.{layer}.attn_norm");
-                    self.metal_ops.as_ref().unwrap()
-                        .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, add_one, &ck, &mut mlp_in)
-                        .map_err(|e| CoreError::Backend(e.to_string()))?;
-                } else {
-                    self.rmsnorm_weight(&ffn_norm_name, &mut pre_ffn_norm_w)?;
-                    rms_norm_f32(&x, &pre_ffn_norm_w, cfg.rms_norm_eps, &mut mlp_in);
+                if !ffn_done {
+                    // Pre-FFN norm ───────
+                    if use_metal_norm {
+                        let w = self.tensor_f16(&ffn_norm_name)?.to_vec();
+                        let ck = format!("gemma.layer.{layer}.attn_norm");
+                        self.metal_ops.as_ref().unwrap()
+                            .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, add_one, &ck, &mut mlp_in)
+                            .map_err(|e| CoreError::Backend(e.to_string()))?;
+                    } else {
+                        self.rmsnorm_weight(&ffn_norm_name, &mut pre_ffn_norm_w)?;
+                        rms_norm_f32(&x, &pre_ffn_norm_w, cfg.rms_norm_eps, &mut mlp_in);
+                    }
+
+                    // Try fully fused MLP (gate+up+gelu+down+post-norm+residual) on GPU.
+                    let fused = self.fused_mlp_i4(
+                        &mlp_in, &x_residual, &gate_name, &up_name, &down_name,
+                        ffn_dim, hidden, &mut x,
+                    )?;
+                    if fused {
+                        fused_mlp_done = true;
+                    }
+
+                    if !fused_mlp_done {
+                        let batched_mlp = self.batch_i4_gate_up(
+                            &mlp_in, &gate_name, &up_name, ffn_dim, hidden, gate_slice, up_slice,
+                        )?;
+                        if !batched_mlp {
+                            self.linear_f16_out_in(&mlp_in, &gate_name, ffn_dim, hidden, gate_slice)?;
+                            self.linear_f16_out_in(&mlp_in, &up_name, ffn_dim, hidden, up_slice)?;
+                        }
+                        for i in 0..ffn_dim {
+                            ffn_out_slice[i] = gelu_tanh_f32(gate_slice[i]) * up_slice[i];
+                        }
+                        self.linear_f16_out_in(ffn_out_slice, &down_name, hidden, ffn_dim, &mut down)?;
+                    }
                 }
 
-                self.linear_f16_out_in(&mlp_in, &gate_name, ffn_dim, hidden, gate_slice)?;
-                self.linear_f16_out_in(&mlp_in, &up_name, ffn_dim, hidden, up_slice)?;
-                for i in 0..ffn_dim {
-                    ffn_out_slice[i] = gelu_tanh_f32(gate_slice[i]) * up_slice[i];
+                // Post-FFN norm on MLP branch, then residual add ──────
+                if !fused_mlp_done {
+                    if use_metal_norm {
+                        let wffn = self.tensor_f16(
+                            &format!("model.layers.{layer}.post_feedforward_layernorm.weight"))?.to_vec();
+                        let mut x_out = vec![0.0f32; hidden];
+                        let ck = format!("gemma.layer.{layer}.ffn_norm");
+                        self.metal_ops.as_ref().unwrap()
+                            .rms_norm_f16w(&down, &wffn, cfg.rms_norm_eps, add_one, &ck, &mut x_out)
+                            .map_err(|e| CoreError::Backend(e.to_string()))?;
+                        for i in 0..hidden { x[i] = x_out[i] + x_residual[i]; }
+                    } else {
+                        self.rmsnorm_weight(
+                            &format!("model.layers.{layer}.post_feedforward_layernorm.weight"),
+                            &mut post_ffn_norm_w,
+                        )?;
+                        rms_norm_f32(&down, &post_ffn_norm_w, cfg.rms_norm_eps, &mut x_norm);
+                        for i in 0..hidden { x[i] = x_norm[i] + x_residual[i]; }
+                    }
                 }
-                self.linear_f16_out_in(ffn_out_slice, &down_name, hidden, ffn_dim, &mut down)?;
-            }
-
-            // ── Post-FFN norm on MLP branch, then residual add ──────
-            if use_metal_norm {
-                let wffn = self.tensor_f16(
-                    &format!("model.layers.{layer}.post_feedforward_layernorm.weight"))?.to_vec();
-                let mut x_out = vec![0.0f32; hidden];
-                let ck = format!("gemma.layer.{layer}.ffn_norm");
-                self.metal_ops.as_ref().unwrap()
-                    .rms_norm_f16w(&down, &wffn, cfg.rms_norm_eps, add_one, &ck, &mut x_out)
-                    .map_err(|e| CoreError::Backend(e.to_string()))?;
-                for i in 0..hidden { x[i] = x_out[i] + x_residual[i]; }
-            } else {
-                self.rmsnorm_weight(
-                    &format!("model.layers.{layer}.post_feedforward_layernorm.weight"),
-                    &mut post_ffn_norm_w,
-                )?;
-                rms_norm_f32(&down, &post_ffn_norm_w, cfg.rms_norm_eps, &mut x_norm);
-                for i in 0..hidden { x[i] = x_norm[i] + x_residual[i]; }
             }
 
             if !self.gemma4_disable_per_layer_input {
@@ -1064,7 +1637,7 @@ impl GemmaRunner {
             .ok_or_else(|| CoreError::Backend(format!("unknown tensor {}", lm_src_resolved)))?;
         let lm_dtype = lm_meta.dtype.clone();
         let use_metal_logits =
-            self.metal_ops.is_some() && self.use_metal_logits && lm_dtype != "i4" && lm_dtype != "i2";
+            self.metal_ops.is_some() && self.use_metal_logits && lm_dtype != "i2";
 
         // Compute all vocab logits on GPU when Metal is active, otherwise CPU.
         let all_logits: Vec<f32>;
@@ -1082,6 +1655,13 @@ impl GemmaRunner {
                     let s = self.tensor_f16_by_exact_name(&format!("{lm_src_resolved}.qscale"))?;
                     self.metal_ops.as_ref().unwrap()
                         .logits_i8(&x_final, w, s, vocab, hidden, &lm_src_resolved, &mut buf)
+                        .map_err(|e| CoreError::Backend(e.to_string()))?;
+                }
+                "i4" => {
+                    let w = self.tensor_u8_by_exact_name(&lm_src_resolved)?;
+                    let s = self.tensor_f16_by_exact_name(&format!("{lm_src_resolved}.qscale"))?;
+                    self.metal_ops.as_ref().unwrap()
+                        .logits_i4(&x_final, w, s, vocab, hidden, hidden, &lm_src_resolved, &mut buf)
                         .map_err(|e| CoreError::Backend(e.to_string()))?;
                 }
                 other => return Err(CoreError::Backend(format!(
@@ -1470,14 +2050,13 @@ impl GemmaRunner {
             )));
         }
         let dtype = meta.dtype.clone();
-        // For Gemma 4 text models, Metal linear matmul is disabled by default because
-        // mixed-dtype models (f16 norms, i4 projections) produce incorrect results when
-        // some f16 layers route through Metal while i4 fall back to CPU in the same pass.
-        // Set CELLM_GEMMA4_I4_DISABLE_METAL_LINEAR=0 to override.
+        // Gemma 4 i4 projections now route through Metal (mv_i4 kernel), so mixed-dtype
+        // models no longer need to force CPU fallback. Keep the env var as an emergency off
+        // switch.
         let disable_metal_linear = self.is_gemma4_text
             && std::env::var("CELLM_GEMMA4_I4_DISABLE_METAL_LINEAR")
                 .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-                .unwrap_or(true);
+                .unwrap_or(false);
         let use_metal = self.metal_ops.is_some() && !disable_metal_linear;
         if use_metal {
             let ctx = self.metal_ops.as_ref().unwrap();
@@ -1492,6 +2071,14 @@ impl GemmaRunner {
                     let w = self.tensor_i8_by_exact_name(&resolved)?;
                     let s = self.tensor_f16_by_exact_name(&format!("{resolved}.qscale"))?;
                     ctx.logits_i8(x, w, s, out_dim, in_dim, &resolved, out)
+                        .map_err(|e| CoreError::Backend(e.to_string()))?;
+                    return Ok(());
+                }
+                "i4" => {
+                    let w = self.tensor_u8_by_exact_name(&resolved)?;
+                    let s = self.tensor_f16_by_exact_name(&format!("{resolved}.qscale"))?;
+                    // cellm native int4 uses per-row scales, so gs == in_dim
+                    ctx.logits_i4(x, w, s, out_dim, in_dim, in_dim, &resolved, out)
                         .map_err(|e| CoreError::Backend(e.to_string()))?;
                     return Ok(());
                 }
@@ -1633,13 +2220,12 @@ impl GemmaRunner {
         k_out: &mut [f32],
         v_out: &mut [f32],
     ) -> Result<bool, CoreError> {
-        // Gemma 4 text models must not use the Metal QKV fused path: i4-quantized models
-        // have mixed dtypes per layer and the Metal path only handles f16. Routing some
-        // layers through Metal and others through CPU produces inconsistent hidden states.
+        // Gemma4 QKV fused path still only supports f16, but the single i4 matmul path
+        // is now wired to Metal, so mixed routing is no longer a problem. Keep env override.
         let disable_metal_linear = self.is_gemma4_text
             && std::env::var("CELLM_GEMMA4_I4_DISABLE_METAL_LINEAR")
                 .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-                .unwrap_or(true);
+                .unwrap_or(false);
         if self.metal_ops.is_none() || disable_metal_linear {
             return Ok(false);
         }
@@ -1708,6 +2294,433 @@ impl GemmaRunner {
                 q_out,
                 k_out,
                 v_out,
+            )
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        Ok(true)
+    }
+
+    /// Try to batch Q+K+V i4 matmuls into a single Metal command buffer.
+    /// Returns Ok(true) if batched, Ok(false) if any weight is not i4 or Metal is unavailable.
+    fn batch_i4_qkv(
+        &mut self,
+        x: &[f32],
+        q_name: &str,
+        q_dim: usize,
+        k_name: &str,
+        k_dim: usize,
+        v_name: &str,
+        v_dim: usize,
+        hidden: usize,
+        q_out: &mut [f32],
+        k_out: &mut [f32],
+        v_out: &mut [f32],
+    ) -> Result<bool, CoreError> {
+        if self.metal_ops.is_none() {
+            return Ok(false);
+        }
+        let q_res = self.resolve_name(q_name);
+        let k_res = self.resolve_name(k_name);
+        let v_res = self.resolve_name(v_name);
+        let (qr, kr, vr) = match (q_res, k_res, v_res) {
+            (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+            _ => return Ok(false),
+        };
+        let q_meta = self.tensor_meta_by_exact_name(&qr);
+        let k_meta = self.tensor_meta_by_exact_name(&kr);
+        let v_meta = self.tensor_meta_by_exact_name(&vr);
+        if q_meta.map(|m| m.dtype.as_str()) != Some("i4")
+            || k_meta.map(|m| m.dtype.as_str()) != Some("i4")
+            || v_meta.map(|m| m.dtype.as_str()) != Some("i4")
+        {
+            return Ok(false);
+        }
+        let q_w = self.tensor_u8_by_exact_name(&qr)?;
+        let q_s = self.tensor_f16_by_exact_name(&format!("{qr}.qscale"))?;
+        let k_w = self.tensor_u8_by_exact_name(&kr)?;
+        let k_s = self.tensor_f16_by_exact_name(&format!("{kr}.qscale"))?;
+        let v_w = self.tensor_u8_by_exact_name(&vr)?;
+        let v_s = self.tensor_f16_by_exact_name(&format!("{vr}.qscale"))?;
+        let jobs = [
+            (q_w, q_s, q_dim, hidden, hidden, qr.as_str()),
+            (k_w, k_s, k_dim, hidden, hidden, kr.as_str()),
+            (v_w, v_s, v_dim, hidden, hidden, vr.as_str()),
+        ];
+        let mut outs: [&mut [f32]; 3] = [q_out, k_out, v_out];
+        self.metal_ops
+            .as_ref()
+            .unwrap()
+            .batch_mv_i4(x, &jobs, &mut outs)
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        Ok(true)
+    }
+
+    /// Try to batch gate+up i4 matmuls into a single Metal command buffer.
+    fn batch_i4_gate_up(
+        &mut self,
+        x: &[f32],
+        gate_name: &str,
+        up_name: &str,
+        ffn_dim: usize,
+        hidden: usize,
+        gate_out: &mut [f32],
+        up_out: &mut [f32],
+    ) -> Result<bool, CoreError> {
+        if self.metal_ops.is_none() {
+            return Ok(false);
+        }
+        let g_res = self.resolve_name(gate_name);
+        let u_res = self.resolve_name(up_name);
+        let (gr, ur) = match (g_res, u_res) {
+            (Ok(a), Ok(b)) => (a, b),
+            _ => return Ok(false),
+        };
+        if self.tensor_meta_by_exact_name(&gr).map(|m| m.dtype.as_str()) != Some("i4")
+            || self.tensor_meta_by_exact_name(&ur).map(|m| m.dtype.as_str()) != Some("i4")
+        {
+            return Ok(false);
+        }
+        let g_w = self.tensor_u8_by_exact_name(&gr)?;
+        let g_s = self.tensor_f16_by_exact_name(&format!("{gr}.qscale"))?;
+        let u_w = self.tensor_u8_by_exact_name(&ur)?;
+        let u_s = self.tensor_f16_by_exact_name(&format!("{ur}.qscale"))?;
+        let jobs = [
+            (g_w, g_s, ffn_dim, hidden, hidden, gr.as_str()),
+            (u_w, u_s, ffn_dim, hidden, hidden, ur.as_str()),
+        ];
+        let mut outs: [&mut [f32]; 2] = [gate_out, up_out];
+        self.metal_ops
+            .as_ref()
+            .unwrap()
+            .batch_mv_i4(x, &jobs, &mut outs)
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        Ok(true)
+    }
+
+    /// Try to run the full MLP block (gate+up+gelu+down+[post-norm]+residual) on GPU in one pass.
+    fn fused_mlp_i4(
+        &mut self,
+        mlp_in: &[f32],
+        residual: &[f32],
+        gate_name: &str,
+        up_name: &str,
+        down_name: &str,
+        ffn_dim: usize,
+        hidden: usize,
+        out: &mut [f32],
+    ) -> Result<bool, CoreError> {
+        if self.metal_ops.is_none() {
+            return Ok(false);
+        }
+        let g_res = self.resolve_name(gate_name);
+        let u_res = self.resolve_name(up_name);
+        let d_res = self.resolve_name(down_name);
+        let (gr, ur, dr) = match (g_res, u_res, d_res) {
+            (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+            _ => return Ok(false),
+        };
+        if self.tensor_meta_by_exact_name(&gr).map(|m| m.dtype.as_str()) != Some("i4")
+            || self.tensor_meta_by_exact_name(&ur).map(|m| m.dtype.as_str()) != Some("i4")
+            || self.tensor_meta_by_exact_name(&dr).map(|m| m.dtype.as_str()) != Some("i4")
+        {
+            return Ok(false);
+        }
+        let g_w = self.tensor_u8_by_exact_name(&gr)?;
+        let g_s = self.tensor_f16_by_exact_name(&format!("{gr}.qscale"))?;
+        let u_w = self.tensor_u8_by_exact_name(&ur)?;
+        let u_s = self.tensor_f16_by_exact_name(&format!("{ur}.qscale"))?;
+        let d_w = self.tensor_u8_by_exact_name(&dr)?;
+        let d_s = self.tensor_f16_by_exact_name(&format!("{dr}.qscale"))?;
+
+        // Fetch post-FFN norm weight if present (Gemma4 has this).
+        let layer_idx = gr.split('.').nth(3).unwrap_or("0");
+        let post_norm_name = format!("model.layers.{}.post_feedforward_layernorm.weight", layer_idx);
+        let post_norm_w = self.tensor_f16(&post_norm_name).ok().map(|w| unsafe {
+            std::slice::from_raw_parts(w.as_ptr(), w.len())
+        });
+
+        self.metal_ops
+            .as_ref()
+            .unwrap()
+            .fused_mlp_i4(
+                mlp_in,
+                residual,
+                g_w,
+                g_s,
+                ffn_dim,
+                &gr,
+                u_w,
+                u_s,
+                ffn_dim,
+                &ur,
+                d_w,
+                d_s,
+                hidden,
+                &dr,
+                post_norm_w,
+                post_norm_w.map(|_| post_norm_name.as_str()),
+                self.cfg.rms_norm_eps,
+                self.rmsnorm_weight_is_offset,
+                hidden,
+                out,
+            )
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        Ok(true)
+    }
+
+    /// Try to run post-attn norm + residual + pre-FFN norm + full MLP on GPU in one pass.
+    fn fused_post_attn_mlp_i4(
+        &mut self,
+        attn_proj: &[f32],
+        x: &[f32],
+        layer: usize,
+        ffn_dim: usize,
+        hidden: usize,
+        out: &mut [f32],
+    ) -> Result<bool, CoreError> {
+        if self.metal_ops.is_none() {
+            return Ok(false);
+        }
+        let gate_name = format!("model.layers.{layer}.mlp.gate_proj.weight");
+        let up_name = format!("model.layers.{layer}.mlp.up_proj.weight");
+        let down_name = format!("model.layers.{layer}.mlp.down_proj.weight");
+        let g_res = self.resolve_name(&gate_name);
+        let u_res = self.resolve_name(&up_name);
+        let d_res = self.resolve_name(&down_name);
+        let (gr, ur, dr) = match (g_res, u_res, d_res) {
+            (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+            _ => return Ok(false),
+        };
+        if self.tensor_meta_by_exact_name(&gr).map(|m| m.dtype.as_str()) != Some("i4")
+            || self.tensor_meta_by_exact_name(&ur).map(|m| m.dtype.as_str()) != Some("i4")
+            || self.tensor_meta_by_exact_name(&dr).map(|m| m.dtype.as_str()) != Some("i4")
+        {
+            return Ok(false);
+        }
+        let g_w = self.tensor_u8_by_exact_name(&gr)?;
+        let g_s = self.tensor_f16_by_exact_name(&format!("{gr}.qscale"))?;
+        let u_w = self.tensor_u8_by_exact_name(&ur)?;
+        let u_s = self.tensor_f16_by_exact_name(&format!("{ur}.qscale"))?;
+        let d_w = self.tensor_u8_by_exact_name(&dr)?;
+        let d_s = self.tensor_f16_by_exact_name(&format!("{dr}.qscale"))?;
+
+        let post_attn_norm_name = format!("model.layers.{layer}.post_attention_layernorm.weight");
+        let pre_ffn_norm_name = format!("model.layers.{layer}.pre_feedforward_layernorm.weight");
+        let post_ffn_norm_name = format!("model.layers.{layer}.post_feedforward_layernorm.weight");
+
+        let post_attn_norm_w = self.tensor_f16(&post_attn_norm_name)
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        let pre_ffn_norm_w = self.tensor_f16(&pre_ffn_norm_name)
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        let post_ffn_norm_w = self.tensor_f16(&post_ffn_norm_name).ok();
+
+        let add_one = self.rmsnorm_weight_is_offset;
+        let eps = self.cfg.rms_norm_eps;
+
+        self.metal_ops
+            .as_ref()
+            .unwrap()
+            .fused_post_attn_residual_mlp_i4(
+                attn_proj,
+                x,
+                unsafe { std::slice::from_raw_parts(post_attn_norm_w.as_ptr(), post_attn_norm_w.len()) },
+                eps,
+                add_one,
+                unsafe { std::slice::from_raw_parts(pre_ffn_norm_w.as_ptr(), pre_ffn_norm_w.len()) },
+                eps,
+                add_one,
+                g_w,
+                g_s,
+                ffn_dim,
+                &gr,
+                u_w,
+                u_s,
+                ffn_dim,
+                &ur,
+                d_w,
+                d_s,
+                hidden,
+                &dr,
+                post_ffn_norm_w.as_ref().map(|w| unsafe {
+                    std::slice::from_raw_parts(w.as_ptr(), w.len())
+                }),
+                post_ffn_norm_w.as_ref().map(|_| post_ffn_norm_name.as_str()),
+                eps,
+                add_one,
+                hidden,
+                out,
+            )
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        Ok(true)
+    }
+
+    /// Run GQA attention + o_proj on GPU in one command buffer.
+    /// Returns Ok(true) if Metal is available and o_proj is i4.
+    fn gpu_attention_and_proj(
+        &mut self,
+        q: &[f32],
+        k_seq: &[f32],
+        v_seq: &[f32],
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        seq_len: usize,
+        kv_stride: usize,
+        o_proj_name: &str,
+        o_proj_dim: usize,
+        out: &mut [f32],
+    ) -> Result<bool, CoreError> {
+        if self.metal_ops.is_none() {
+            return Ok(false);
+        }
+        let o_res = self.resolve_name(o_proj_name);
+        let o_name = match o_res {
+            Ok(n) => n,
+            _ => return Ok(false),
+        };
+        if self.tensor_meta_by_exact_name(&o_name).map(|m| m.dtype.as_str()) != Some("i4") {
+            return Ok(false);
+        }
+        let o_w = self.tensor_u8_by_exact_name(&o_name)?;
+        let o_s = self.tensor_f16_by_exact_name(&format!("{o_name}.qscale"))?;
+        let q_dim = n_heads * head_dim;
+        let soft_cap = self.final_logit_softcapping.unwrap_or(0.0);
+
+        self.metal_ops
+            .as_ref()
+            .unwrap()
+            .attention_and_proj_i4(
+                q, k_seq, v_seq,
+                n_heads, n_kv_heads, head_dim, seq_len,
+                kv_stride,
+                1.0f32 / (head_dim as f32).sqrt(), soft_cap,
+                o_w, o_s,
+                o_proj_dim, q_dim,
+                &o_name,
+                out,
+            )
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        Ok(true)
+    }
+
+    /// QKV i4 projections + per-head Q/K norms + RoPE on GPU in one CB.
+    /// Q stays resident on GPU; K and V are downloaded for CPU cache write.
+    /// Returns Ok(true) if Metal is available and all weights are i4.
+    fn gpu_project_qkv_norm_rope(
+        &mut self,
+        x_norm: &[f32],
+        layer: usize,
+        pos: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        kv_head_dim: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        hidden: usize,
+        layer_rope_theta: f32,
+        k_out: &mut [f32],
+        v_out: &mut [f32],
+    ) -> Result<bool, CoreError> {
+        if self.metal_ops.is_none() {
+            return Ok(false);
+        }
+        let q_name = format!("model.layers.{layer}.self_attn.q_proj.weight");
+        let k_name = format!("model.layers.{layer}.self_attn.k_proj.weight");
+        let v_name = format!("model.layers.{layer}.self_attn.v_proj.weight");
+        let (qr, kr, vr) = match (self.resolve_name(&q_name), self.resolve_name(&k_name), self.resolve_name(&v_name)) {
+            (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+            _ => return Ok(false),
+        };
+        if self.tensor_meta_by_exact_name(&qr).map(|m| m.dtype.as_str()) != Some("i4")
+            || self.tensor_meta_by_exact_name(&kr).map(|m| m.dtype.as_str()) != Some("i4")
+            || self.tensor_meta_by_exact_name(&vr).map(|m| m.dtype.as_str()) != Some("i4")
+        {
+            return Ok(false);
+        }
+        let q_w = self.tensor_u8_by_exact_name(&qr)?;
+        let q_s = self.tensor_f16_by_exact_name(&format!("{qr}.qscale"))?;
+        let k_w = self.tensor_u8_by_exact_name(&kr)?;
+        let k_s = self.tensor_f16_by_exact_name(&format!("{kr}.qscale"))?;
+        let v_w = self.tensor_u8_by_exact_name(&vr)?;
+        let v_s = self.tensor_f16_by_exact_name(&format!("{vr}.qscale"))?;
+
+        let q_norm_name = format!("model.layers.{layer}.self_attn.q_norm.weight");
+        let k_norm_name = format!("model.layers.{layer}.self_attn.k_norm.weight");
+        let q_norm_w = self.tensor_f16(&q_norm_name).ok();
+        let k_norm_w = self.tensor_f16(&k_norm_name).ok();
+
+        self.metal_ops.as_ref().unwrap()
+            .project_qkv_norm_rope_i4(
+                x_norm,
+                q_w, q_s, q_dim, &qr,
+                k_w, k_s, kv_dim, &kr,
+                v_w, v_s, kv_dim, &vr,
+                hidden,
+                q_norm_w.as_ref().map(|w| unsafe { std::slice::from_raw_parts(w.as_ptr(), w.len()) }),
+                k_norm_w.as_ref().map(|w| unsafe { std::slice::from_raw_parts(w.as_ptr(), w.len()) }),
+                layer_rope_theta,
+                pos,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                kv_head_dim,
+                k_out,
+                v_out,
+            )
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        Ok(true)
+    }
+
+    /// GPU attention + o_proj using a pre-resident Q buffer (from gpu_project_qkv_norm_rope).
+    fn gpu_attention_and_proj_preloaded_q(
+        &mut self,
+        q_buf_name: &str,
+        k_seq: &[f32],
+        v_seq: &[f32],
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        seq_len: usize,
+        kv_stride: usize,
+        attn_scale: f32,
+        o_proj_name: &str,
+        o_proj_dim: usize,
+        out: &mut [f32],
+    ) -> Result<bool, CoreError> {
+        if self.metal_ops.is_none() {
+            return Ok(false);
+        }
+        let o_res = self.resolve_name(o_proj_name);
+        let o_name = match o_res {
+            Ok(n) => n,
+            _ => return Ok(false),
+        };
+        if self.tensor_meta_by_exact_name(&o_name).map(|m| m.dtype.as_str()) != Some("i4") {
+            return Ok(false);
+        }
+        let o_w = self.tensor_u8_by_exact_name(&o_name)?;
+        let o_s = self.tensor_f16_by_exact_name(&format!("{o_name}.qscale"))?;
+        let q_dim = n_heads * head_dim;
+        let soft_cap = self.final_logit_softcapping.unwrap_or(0.0);
+
+        self.metal_ops.as_ref().unwrap()
+            .attention_and_proj_i4_preloaded_q(
+                q_buf_name,
+                k_seq,
+                v_seq,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                seq_len,
+                kv_stride,
+                attn_scale,
+                soft_cap,
+                o_w,
+                o_s,
+                o_proj_dim,
+                q_dim,
+                &o_name,
+                out,
             )
             .map_err(|e| CoreError::Backend(e.to_string()))?;
         Ok(true)

@@ -143,6 +143,7 @@ impl LfmRunner {
             intermediate_size: h.intermediate_size,
             rms_norm_eps: h.rms_norm_eps,
             rope_theta: h.rope_theta,
+            attention_softcap: 0.0,
         };
 
         // Initialize conv state cache
@@ -170,6 +171,10 @@ impl LfmRunner {
             metal_ops,
             graph_state,
         })
+    }
+
+    pub fn file(&self) -> &CellmFile {
+        &self.file
     }
 
     pub fn config(&self) -> &ModelConfig {
@@ -611,7 +616,7 @@ impl LfmRunner {
                 x[i] += attn_proj[i];
             }
 
-            // ── Batched FFN block ──────────────────────────────────────
+            // Batched FFN block
             // On Metal: batch ffn_norm + gate + up + silu_mul + down into ONE
             // command buffer, eliminating 5 GPU round-trips → 1 per layer.
             let ffn_norm_name = format!("model.layers.{layer}.ffn_norm.weight");
@@ -795,42 +800,42 @@ impl LfmRunner {
             // Output projection: use embeddings as transposed linear layer
             // embeddings are [vocab_size, hidden], we need [hidden, vocab_size]^T @ x_final
             // This is equivalent to x_final^T @ embeddings^T = x_final @ embeddings (row-wise dot products)
-            
+
             // Check if embeddings are quantized
             let dtype = self.tensor_dtype("model.embed_tokens.weight").unwrap_or_else(|| "f16".to_string());
             let scales_name = "model.embed_tokens.scales".to_string();
             let biases_name = "model.embed_tokens.biases".to_string();
-            
+
             if dtype == "u32" && self.file.has_tensor(&scales_name) && self.file.has_tensor(&biases_name) {
                 // Quantized embeddings - need to dequantize each row and dot with x_final
                 let weight_bytes = self.file.tensor_bytes("model.embed_tokens.weight")?;
                 let scales_bytes = self.file.tensor_bytes(&scales_name)?;
                 let biases_bytes = self.file.tensor_bytes(&biases_name)?;
-                
+
                 let weight_u32: &[u32] = bytemuck::cast_slice(weight_bytes);
                 let scales_f32: &[f32] = bytemuck::cast_slice(scales_bytes);
                 let biases_f32: &[f32] = bytemuck::cast_slice(biases_bytes);
-                
+
                 let group_size = 64usize;
                 let groups_per_row = (hidden + group_size - 1) / group_size;
                 let packed_in = hidden / 8;
-                
+
                 // Compute logits in parallel
                 logits.par_iter_mut().enumerate().for_each(|(vocab_idx, logit)| {
                     let row_offset = vocab_idx * packed_in;
                     let mut acc = 0.0f32;
-                    
+
                     for g in 0..groups_per_row {
                         let g_start = g * group_size;
                         let g_end = ((g + 1) * group_size).min(hidden);
                         let scale_idx = vocab_idx * groups_per_row + g;
                         let scale = scales_f32.get(scale_idx).copied().unwrap_or(1.0);
                         let bias = biases_f32.get(scale_idx).copied().unwrap_or(0.0);
-                        
+
                         for j in g_start..g_end {
                             let packed_idx = row_offset + (j / 8);
                             let nibble_pos = j % 8;
-                            
+
                             if packed_idx < weight_u32.len() {
                                 let packed = weight_u32[packed_idx];
                                 let nibble = ((packed >> (nibble_pos * 4)) & 0xF) as i32;
@@ -840,26 +845,26 @@ impl LfmRunner {
                             }
                         }
                     }
-                    
+
                     *logit = acc;
                 });
             } else {
                 // F16 embeddings
                 let emb = self.tensor_f16("model.embed_tokens.weight")?;
-                
+
                 logits.par_iter_mut().enumerate().for_each(|(vocab_idx, logit)| {
                     let row_start = vocab_idx * hidden;
                     let mut acc = 0.0f32;
-                    
+
                     for j in 0..hidden {
                         let w = f16::from_bits(emb[row_start + j]).to_f32();
                         acc += w * x_final[j];
                     }
-                    
+
                     *logit = acc;
                 });
             }
-            
+
             Ok(logits)
         } else {
             Ok(vec![])
@@ -932,45 +937,45 @@ impl LfmRunner {
         let dtype = self.tensor_dtype("model.embed_tokens.weight").unwrap_or_else(|| "f16".to_string());
         let scales_name = "model.embed_tokens.scales".to_string();
         let biases_name = "model.embed_tokens.biases".to_string();
-        
+
         if dtype == "u32" && self.file.has_tensor(&scales_name) && self.file.has_tensor(&biases_name) {
             // 4-bit quantized embeddings (MLX format)
             let weight_bytes = self.file.tensor_bytes("model.embed_tokens.weight")?;
             let scales_bytes = self.file.tensor_bytes(&scales_name)?;
             let biases_bytes = self.file.tensor_bytes(&biases_name)?;
-            
+
             let weight_u32: &[u32] = bytemuck::cast_slice(weight_bytes);
             let scales_f32: &[f32] = bytemuck::cast_slice(scales_bytes);
             let biases_f32: &[f32] = bytemuck::cast_slice(biases_bytes);
-            
+
             let group_size = 64usize;
             let groups_per_row = (hidden + group_size - 1) / group_size;
             let packed_in = hidden / 8;  // Each uint32 holds 8 nibbles
-            
+
             let row_offset = (token as usize) * packed_in;
-            
+
             for g in 0..groups_per_row {
                 let g_start = g * group_size;
                 let g_end = ((g + 1) * group_size).min(hidden);
                 let scale_idx = (token as usize) * groups_per_row + g;
                 let scale = scales_f32.get(scale_idx).copied().unwrap_or(1.0);
                 let bias = biases_f32.get(scale_idx).copied().unwrap_or(0.0);
-                
+
                 for j in g_start..g_end {
                     let packed_idx = row_offset + (j / 8);
                     let nibble_pos = j % 8;
-                    
+
                     if packed_idx >= weight_u32.len() {
                         out[j] = 0.0;
                         continue;
                     }
-                    
+
                     let packed = weight_u32[packed_idx];
                     let nibble = ((packed >> (nibble_pos * 4)) & 0xF) as i32;
                     // MLX uses zero_point=0, so q = nibble (0-15 range)
                     // The bias term handles centering
                     let q = nibble as f32;
-                    
+
                     out[j] = q * scale + bias;
                 }
             }
@@ -1035,13 +1040,13 @@ impl LfmRunner {
     ) -> Result<(), CoreError> {
         // Check tensor dtype from metadata
         let dtype = self.tensor_dtype(weight_name).unwrap_or_else(|| "f16".to_string());
-        
+
         // Check for pre-quantized weights (uint32 dtype with .scales/.biases)
         // MLX format: scales/biases are named {base}.scales where base is weight name without .weight
         let base_name = weight_name.trim_end_matches(".weight");
         let scales_name = format!("{}.scales", base_name);
         let biases_name = format!("{}.biases", base_name);
-        
+
         let has_scales = self.file.has_tensor(&scales_name);
         let has_biases = self.file.has_tensor(&biases_name);
 
@@ -1054,7 +1059,7 @@ impl LfmRunner {
         let w = self.tensor_f16(weight_name)?;
 
         // Validate weight shape: [out_dim, in_dim] -> out_dim * in_dim elements
-        let expected_len = out_dim * in_dim; 
+        let expected_len = out_dim * in_dim;
         if w.len() != expected_len {
             return Err(CoreError::Backend(format!(
                 "linear_f16_out_in: weight shape mismatch for {weight_name}: got {} elements, expected {} ({}x{} f16)",
@@ -1099,7 +1104,7 @@ impl LfmRunner {
     ) -> Result<(), CoreError> {
         // Check cache first
         let cache_key = (weight_name.to_string(), out_dim, in_dim);
-        
+
         if !self.weight_cache.contains_key(&cache_key) {
             let base_name = weight_name.trim_end_matches(".weight");
             let weight_bytes = self.file.tensor_bytes(weight_name)?;
@@ -1115,7 +1120,7 @@ impl LfmRunner {
             let packed_in = in_dim / 8;
 
             let mut dequant = vec![0.0f32; out_dim * in_dim];
-            
+
             dequant.par_chunks_exact_mut(in_dim).enumerate().for_each(|(i, row)| {
                 let row_offset = i * packed_in;
                 for j_packed in 0..packed_in {
@@ -1131,7 +1136,7 @@ impl LfmRunner {
                     }
                 }
             });
-            
+
             // LRU eviction: if at capacity, remove oldest entry
             if self.weight_cache.len() >= MAX_CACHE_ENTRIES {
                 if let Some(old_key) = self.lru_order.first().cloned() {
@@ -1139,7 +1144,7 @@ impl LfmRunner {
                     self.lru_order.remove(0);
                 }
             }
-            
+
             self.weight_cache.insert(cache_key.clone(), dequant);
             self.lru_order.push(cache_key.clone());
         } else {
@@ -1149,7 +1154,7 @@ impl LfmRunner {
                 self.lru_order.push(key);
             }
         }
-        
+
         // Use cached weights for matmul
         let weights = self.weight_cache.get(&cache_key).unwrap();
 
@@ -1159,7 +1164,7 @@ impl LfmRunner {
                 .map_err(|e| CoreError::Backend(e.to_string()))?;
             return Ok(());
         }
-        
+
         out.par_iter_mut().enumerate().for_each(|(i, out_val)| {
             let row_start = i * in_dim;
             let mut acc = 0.0f32;

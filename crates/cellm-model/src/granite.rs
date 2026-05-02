@@ -18,7 +18,7 @@ pub struct GraniteRunner {
     max_layers: usize,
     eos_token_id: Option<u32>,
     tensor_prefix: String,
-    
+
     // MuP multipliers from config
     embedding_multiplier: f32,
     residual_multiplier: f32,
@@ -50,6 +50,7 @@ impl GraniteRunner {
             intermediate_size: h.intermediate_size,
             rms_norm_eps: h.rms_norm_eps,
             rope_theta: h.rope_theta,
+            attention_softcap: 0.0,
         };
 
         // Extract MuP multipliers from source_text_config if available
@@ -267,7 +268,7 @@ impl GraniteRunner {
             let q_name = format!("model.layers.{layer}.self_attn.q_proj.weight");
             let k_name = format!("model.layers.{layer}.self_attn.k_proj.weight");
             let v_name = format!("model.layers.{layer}.self_attn.v_proj.weight");
-            
+
             self.linear_f16_out_in(&x_norm, &q_name, hidden, hidden, &mut q)?;
             self.linear_f16_out_in(&x_norm, &k_name, kv_dim, hidden, &mut k)?;
             self.linear_f16_out_in(&x_norm, &v_name, kv_dim, hidden, &mut v)?;
@@ -302,7 +303,7 @@ impl GraniteRunner {
                 })?;
                 gather_bases.push(cr.layout.token_base_elem(b, layer, o)?);
             }
-            
+
             // Apply attention_multiplier
             // Granite uses attention_multiplier instead of 1/sqrt(head_dim)
             let scale = self.attention_multiplier;
@@ -311,7 +312,7 @@ impl GraniteRunner {
                 &q,
                 n_heads,
                 n_kv_heads,
-                head_dim, 
+                head_dim,
                 Some(scale),
                 None, // soft_cap
                 &mut attn_out,
@@ -382,19 +383,19 @@ impl GraniteRunner {
         // Logits
         let vocab = cfg.vocab_size;
         let mut logits = vec![0.0f32; vocab];
-        
+
         let lm_head_name = self.resolve_name("lm_head.weight")?;
         let lm_src_resolved = self.resolve_name(&lm_head_name)?;
-        
+
         self.linear_f16_out_in(&x_final, &lm_src_resolved, vocab, hidden, &mut logits)?;
-        
+
         // Apply logits_scaling
         if self.logits_scaling != 1.0 {
             for l in logits.iter_mut() {
                 *l /= self.logits_scaling;
             }
         }
-        
+
         Ok(logits)
     }
 
@@ -421,7 +422,7 @@ impl GraniteRunner {
         if name == "lm_head.weight" || name == "model.embed_tokens.weight" {
              if self.file.tensor_index("model.embed_tokens.weight").is_some() { return Ok("model.embed_tokens.weight".to_string()); }
         }
-        
+
         Err(CoreError::Backend(format!("granite: unknown tensor {name}")))
     }
 
@@ -458,7 +459,7 @@ impl GraniteRunner {
         out: &mut [f32],
     ) -> Result<(), CoreError> {
         let resolved = self.resolve_name(weight_name)?;
-        
+
         if let Some(ref mut ops) = self.metal_ops {
             let bytes = self.file.tensor_bytes(&resolved)?;
             let w: &[u16] = cast_slice(bytes);

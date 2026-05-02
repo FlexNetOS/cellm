@@ -246,21 +246,21 @@ Qwen3-0.6B-int4.cellm (old int4)	Garbage (pre-fix)
 # CPU
 ./target/release/infer \
   --model models/to-huggingface/gemma-3-1b-it-mixed-int4-v1/gemma-3-1b-it-mixed-int4-v1.cellm \
-  --tokenizer models/to-huggingface/gemma-4-E2B-it-int4-aggr-v2/gemma-4-E2B-it-int4-aggr-v2.tokenizer.json \
+  --tokenizer models/to-huggingface/gemma-3-1b-it-int8-v1/tokenizer.json \
   --prompt "what's twitch.com?" \
   --chat --chat-format plain --gen 48 --temperature 0 --backend cpu --kv-encoding f16
 
 # Metal
 ./target/release/infer \
   --model models/to-huggingface/gemma-3-1b-it-mixed-int4-v1/gemma-3-1b-it-mixed-int4-v1.cellm \
-  --tokenizer models/to-huggingface/gemma-4-E2B-it-int4-aggr-v2/gemma-4-E2B-it-int4-aggr-v2.tokenizer.json \
+  --tokenizer models/to-huggingface/gemma-3-1b-it-int8-v1/tokenizer.json \
   --prompt "What is consciousness?" \
   --chat --chat-format plain --gen 48 --temperature 0 --backend metal --kv-encoding f16
 
 
   ./target/release/infer \
   --model models/to-huggingface/gemma-4-E2B-it-int4-aggr-v2/gemma-4-E2B-it-int4-aggr-v2.cellmd \
-  --tokenizer models/to-huggingface/gemma-4-E2B-it-int4-aggr-v2/gemma-4-E2B-it-int4-aggr-v2.tokenizer.json \
+  --tokenizer models/to-huggingface/gemma-3-1b-it-int8-v1/tokenizer.json \
   --prompt "What is consciousness?" \
   --chat --chat-format plain --gen 48 --temperature 0 --backend metal --kv-encoding f16
 ```
@@ -296,7 +296,7 @@ Qwen3-0.6B-int4.cellm (old int4)	Garbage (pre-fix)
 
 ## Gemma 3 1B mixed-int4
 
-```sh
+```sh [ performance here is bad]
 # Metal — turboquant KV
 ./target/release/infer \
   --model models/to-huggingface/gemma-3-1b-it-mixed-int4-v1/gemma-3-1b-it-mixed-int4-v1.cellm \
@@ -325,6 +325,8 @@ Qwen3-0.6B-int4.cellm (old int4)	Garbage (pre-fix)
   --tokenizer models/to-huggingface/gemma-4-E2B-it-int4-aggr-v5/tokenizer.json \
   --prompt "what's sycophancy?" \
   --chat --gen 32 --temperature 0 --backend metal --kv-encoding f16
+
+
 
 # Metal — turboquant KV
 ./target/release/infer \
@@ -416,14 +418,14 @@ CELLM_AUDIO_DEBUG=1 ./target/release/audio-direct \
 ```sh
 # Metal
 ./target/release/infer \
-  --model models/bonsai-1.7b/Bonsai-1.7B_v2.cellm \
+  --model models/to-huggingface/Bonsai-1.7B_v2/Bonsai-1.7B_v2.cellm \
   --tokenizer models/to-huggingface/qwen2.5-0.5b-int8-v1/tokenizer.json \
   --prompt "what's sycophancy?" \
   --backend metal --tokens 32
 
 # CPU
 ./target/release/infer \
-  --model models/bonsai-1.7b/Bonsai-1.7B_v2.cellm \
+  --model models/to-huggingface/Bonsai-1.7B_v2/Bonsai-1.7B_v2.cellm \
   --tokenizer models/to-huggingface/qwen2.5-0.5b-int8-v1/tokenizer.json \
   --prompt "The capital of France is" \
   --backend cpu --tokens 32
