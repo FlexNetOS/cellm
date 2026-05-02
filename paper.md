@@ -349,6 +349,13 @@ Qwen3-0.6B-int4.cellm (old int4)	Garbage (pre-fix)
   --prompt "who is elon musk?" \
   --chat --gen 100 --backend metal
 
+
+    ./target/release/infer \
+  --model models/to-huggingface/gemma-4-E2B-it-int4-aggr-v2/gemma-4-E2B-it-int4-aggr-v2.cellm \
+  --tokenizer models/to-huggingface/gemma-4-E2B-it-int4-aggr-v5/tokenizer.json \
+  --prompt "Graph Lowering Compiler Techniques for\nNeural Networks?" \
+  --chat --gen 100 --backend metal
+
 ```
 
 ### Vision

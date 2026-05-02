@@ -872,7 +872,7 @@ impl GemmaRunner {
         let mut k_store = vec![0.0f32; layout_kv_dim];
         let mut v_store = vec![0.0f32; layout_kv_dim];
 
-        // Fused Metal graph path (Gemma3 only, no per-layer input, no TurboQuant) ──
+        // Fused Metal graph path (Gemma3 only, no per-layer input, no TurboQuant) 
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             let mut disable_graph = false;
@@ -1033,7 +1033,7 @@ impl GemmaRunner {
             let gather_len = seq.saturating_sub(start_tpos);
             let mut gpu_attn_done = false;
 
-            // Fused GPU decode path (project + norm + rope on GPU, keep Q resident) ──
+            // Fused GPU decode path (project + norm + rope on GPU, keep Q resident) 
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             {
                 if !is_kv_shared_layer {
@@ -1217,7 +1217,7 @@ impl GemmaRunner {
                     }
                 }
 
-                // RoPE ──────────────
+                // RoPE
                 if use_metal_rope {
                     let ops = self.metal_ops.as_ref().unwrap();
                     ops.rope_half_f32(q_slice, n_heads, head_dim, head_dim, pos, layer_rope_theta)
@@ -1468,7 +1468,7 @@ impl GemmaRunner {
                 let mut fused_mlp_done = false;
 
                 if !ffn_done {
-                    // Pre-FFN norm ───────
+                    // Pre-FFN norm
                     if use_metal_norm {
                         let w = self.tensor_f16(&ffn_norm_name)?.to_vec();
                         let ck = format!("gemma.layer.{layer}.attn_norm");
@@ -1504,7 +1504,7 @@ impl GemmaRunner {
                     }
                 }
 
-                // Post-FFN norm on MLP branch, then residual add ──────
+                // Post-FFN norm on MLP branch, then residual add─
                 if !fused_mlp_done {
                     if use_metal_norm {
                         let wffn = self.tensor_f16(

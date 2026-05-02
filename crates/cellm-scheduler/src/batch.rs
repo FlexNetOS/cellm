@@ -20,44 +20,44 @@
 //! ## Architecture
 //!
 //! ```text
-//! ┌──────────┐  ┌──────────┐  ┌──────────┐
+//! ┌─┐  ┌─┐  ┌─┐
 //! │ Session A │  │ Session B │  │ Session C │
 //! │ token=42  │  │ token=7   │  │ token=99  │
 //! │ pos=128   │  │ pos=56    │  │ pos=200   │
-//! └────┬─────┘  └────┬─────┘  └────┬─────┘
+//! └─┬┘  └─┬┘  └─┬┘
 //!      │              │              │
-//!      └──────────────┼──────────────┘
+//!      └┼┘
 //!                     │
-//!          ┌──────────▼──────────┐
+//!          ┌─▼─┐
 //!          │   BatchDetector     │  ← checks compatibility
 //!          │   groups=[A,B,C]    │
-//!          └──────────┬──────────┘
+//!          └─┬─┘
 //!                     │
-//!          ┌──────────▼──────────┐
+//!          ┌─▼─┐
 //!          │  Batched Decode     │
-//!          │  ┌────────────────┐ │
+//!          │  ┌─┐ │
 //!          │  │ QKV matmul     │ │  ← batched (batch_dim=3)
 //!          │  │ per-session    │ │
 //!          │  │   attention    │ │  ← unbatched (different KV)
 //!          │  │ output matmul  │ │  ← batched
 //!          │  │ MLP matmuls    │ │  ← batched
 //!          │  │ logits split   │ │  ← per-session
-//!          │  └────────────────┘ │
-//!          └──────────┬──────────┘
+//!          │  └─┘ │
+//!          └─┬─┘
 //!                     │
-//!      ┌──────────────┼──────────────┐
+//!      ┌┼┐
 //!      │              │              │
-//! ┌────▼─────┐  ┌────▼─────┐  ┌────▼─────┐
+//! ┌─▼┐  ┌─▼┐  ┌─▼┐
 //! │ token=X  │  │ token=Y  │  │ token=Z  │
 //! │ write KV │  │ write KV │  │ write KV │
-//! └──────────┘  └──────────┘  └──────────┘
+//! └─┘  └─┘  └─┘
 //! ```
 
 use std::collections::HashMap;
 
 use crate::rr::SessionId;
 
-// BatchGroup ──────
+// BatchGroup─
 
 /// A group of sessions whose decode steps can be batched together.
 ///
@@ -90,7 +90,7 @@ impl BatchGroup {
     }
 }
 
-// BatchDetector ───
+// BatchDetector 
 
 /// Scans the set of active sessions and groups them into batch-compatible
 /// cohorts.
@@ -218,7 +218,7 @@ impl BatchedDecodeResult {
     }
 }
 
-// Tests ───────────
+// Tests
 
 #[cfg(test)]
 mod tests {

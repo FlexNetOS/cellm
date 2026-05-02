@@ -9,4 +9,4 @@ pub mod vulkan;
 pub use cpu::SIMDKernels;
 pub use metal::MetalKernels;
 pub use metal::MetalOps;
-pub use vulkan::VulkanKernels;
+pub use vulkan::VulkanBackend;

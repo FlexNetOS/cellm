@@ -821,6 +821,9 @@ iOS LLM UI now includes a model-management card flow with recommended models:
   - [Linear Congruential Generator (LCG)](https://en.wikipedia.org/wiki/Linear_congruential_generator) — Background on simple PRNG architectures.
   - Xorshift — The specific 64-bit implementation used in `cellm-sdk`.
 
+- **Vulkan / SPIR-V Shader System**:
+  - [Investigating SPIR-V for the Shader System](https://www.stride3d.net/blog/investigating-spirv-for-the-shader-system/) — Reference on SPIR-V bytecode architecture for cross-platform compute shader compilation.
+
 ## License
 
 Licensed under either of:

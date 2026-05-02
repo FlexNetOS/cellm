@@ -377,7 +377,7 @@ impl<'a> BatchedForward<'a> {
     }
 }
 
-// ─── Free functions (use public CellmFile API) ──────────────────────────────
+// Free functions (use public CellmFile API)─
 
 fn load_f32_from_file(
     file: &CellmFile,
@@ -571,7 +571,7 @@ fn topk_from_slice(logits: &[f32], k: usize) -> Vec<(u32, f32)> {
     indexed
 }
 
-// ─── Tests ──────────────────────────────────────────────────────────────────
+// Tests 
 
 #[cfg(test)]
 mod tests {

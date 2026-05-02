@@ -45,4 +45,5 @@ todos/
 scratch/
 lessons/
 scratch/test_nvidia_api.py
-PERFORMANCE_ANALYSIS.md
+PERFORMANCE_ANALYSIS.mdbindings/kotlin/.gradle/
+bindings/kotlin/build/

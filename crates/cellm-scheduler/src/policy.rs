@@ -43,7 +43,7 @@ impl Default for SchedulingPolicy {
     }
 }
 
-// PolicyExecutor ──
+// PolicyExecutor 
 
 /// Drives scheduling decisions according to the active policy.
 ///
@@ -122,7 +122,7 @@ impl PolicyExecutor {
         }
     }
 
-    // Fair (round-robin)────────
+    // Fair (round-robin)
 
     fn tick_fair(&mut self) -> SchedulingPlan {
         if self.decode_order.is_empty() {
@@ -227,7 +227,7 @@ impl PolicyExecutor {
     }
 }
 
-// SchedulingPlan ──
+// SchedulingPlan 
 
 /// The output of one scheduling tick — tells the Engine which sessions to
 /// process and in what order.
@@ -262,7 +262,7 @@ impl SchedulingPlan {
     }
 }
 
-// Tests ───────────
+// Tests
 
 #[cfg(test)]
 mod tests {
