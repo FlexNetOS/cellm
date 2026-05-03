@@ -3299,7 +3299,7 @@ impl MetalKvStorage {
         let soft_cap_val = soft_cap.unwrap_or(0.0f32);
         let soft_cap_ptr = (&soft_cap_val as *const f32).cast();
 
-        enc.set_compute_pipeline_state(&self.pso_attn_single_gqa_f32);
+        enc.set_compute_pipeline_state(&self.pso_attn_single_gqa_f32_tiled);
         enc.set_buffer(0, Some(&self.k), 0);
         enc.set_buffer(1, Some(&self.v), 0);
         enc.set_buffer(2, Some(bases_buf), bases_offset);
@@ -3312,8 +3312,7 @@ impl MetalKvStorage {
         enc.set_bytes(9, std::mem::size_of::<f32>() as u64, scale_ptr);
         enc.set_bytes(10, std::mem::size_of::<f32>() as u64, soft_cap_ptr);
 
-        // Use 64 threads per head for better GPU utilization on models with few heads.
-        // The kernel dynamically adapts via [[threads_per_threadgroup]].
+        // Use 64 threads per head.
         let threads_per_tg = 64;
         let tg = metal::MTLSize { width: threads_per_tg, height: 1, depth: 1 };
         let grid = metal::MTLSize { width: n_heads as u64, height: 1, depth: 1 };
