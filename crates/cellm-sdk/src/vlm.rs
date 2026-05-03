@@ -1282,7 +1282,8 @@ fn run_vision_cellm(
     let mut norm2 = vec![0.0f32; batched_tokens * hidden];
     let mut mlp_up = vec![0.0f32; batched_tokens * intermediate];
     let mut mlp_out = vec![0.0f32; batched_tokens * hidden];
-    let mut score_buf = vec![0.0f32; num_tokens];
+    let attn_sz = num_heads * num_tokens * num_tokens;
+    let mut score_buf = vec![0.0f32; attn_sz.max(num_tokens)];
     let mut prob_buf = vec![0.0f32; num_tokens];
     let mut qkv = vec![0.0f32; batched_tokens * hidden * 3];
 
@@ -3395,14 +3396,13 @@ fn self_attention_full(
     {
         use rayon::prelude::*;
         let out_addr = out.as_mut_ptr() as usize;
-        (0..num_heads).into_par_iter().for_each(|h| {
+        let head_score_sz = seq * seq;
+        score_buf.par_chunks_mut(head_score_sz).enumerate().for_each(|(h, score): (usize, &mut [f32])| {
             let offset = h * head_dim;
             let q_ptr = unsafe { q.as_ptr().add(offset) };
             let k_ptr = unsafe { k.as_ptr().add(offset) };
             let v_ptr = unsafe { v.as_ptr().add(offset) };
             let head_out_ptr = unsafe { (out_addr as *mut f32).add(offset) };
-
-            let mut score = vec![0.0f32; seq * seq];
             unsafe {
                 cblas_sgemm(
                     101, // CblasRowMajor
