@@ -537,8 +537,8 @@ impl QwenRunner {
                     if rotary_dim > 0 {
                         if use_metal_rope {
                             let ops = self.metal_ops.as_ref().unwrap();
-                            ops.rope_half_f32(&mut q, n_heads, head_dim, rotary_dim, pos, cfg.rope_theta).map_err(|e| CoreError::Backend(e.to_string()))?;
-                            ops.rope_half_f32(&mut k, n_kv_heads, head_dim, rotary_dim, pos, cfg.rope_theta).map_err(|e| CoreError::Backend(e.to_string()))?;
+                            ops.rope_adj_f32(&mut q, n_heads, head_dim, pos, cfg.rope_theta).map_err(|e| CoreError::Backend(e.to_string()))?;
+                            ops.rope_adj_f32(&mut k, n_kv_heads, head_dim, pos, cfg.rope_theta).map_err(|e| CoreError::Backend(e.to_string()))?;
                         } else {
                             rope_inplace_f32_partial(&mut q, n_heads, head_dim, rotary_dim, pos, cfg.rope_theta);
                             rope_inplace_f32_partial(&mut k, n_kv_heads, head_dim, rotary_dim, pos, cfg.rope_theta);
@@ -1704,8 +1704,8 @@ impl QwenGraphState {
         }
 
         let km = kv_cache.storage().as_any().downcast_ref::<cellm_cache::kvcache::MetalKvStorage>().unwrap();
-        self.ops.encode_rope_half_f32(enc, &self.q_buf, nh, hd, (hd as f32 * rotary) as usize, total_tokens_now - 1, cfg.rope_theta);
-        self.ops.encode_rope_half_f32(enc, &self.k_buf, nkv, hd, (hd as f32 * rotary) as usize, total_tokens_now - 1, cfg.rope_theta);
+        self.ops.encode_rope_adj_f32(enc, &self.q_buf, nh, hd, total_tokens_now - 1, cfg.rope_theta);
+        self.ops.encode_rope_adj_f32(enc, &self.k_buf, nkv, hd, total_tokens_now - 1, cfg.rope_theta);
         km.encode_write_token_f32(enc, kv_cache.layout().token_base_elem(bid, l, off).unwrap(), &self.k_buf, &self.v_buf, nkv * hd);
 
         km.encode_attention(
