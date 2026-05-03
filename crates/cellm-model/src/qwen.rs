@@ -275,13 +275,13 @@ impl QwenRunner {
                     self.graph_state = None;
                     return false;
                 }
-                // The Qwen Metal full graph has a known correctness issue for some model
-                // configurations (e.g., Qwen3-0.6B int8).  Until the root cause is fixed,
-                // fall back to the CPU layer loop which still uses Metal for matmul and norms.
-                eprintln!("qwen: Metal full graph disabled for this model (using CPU layer loop with Metal matmul where available).");
-                self.metal_strict = false;
-                self.graph_state = None;
-                false
+
+                // o_proj matmul was historically hardcoded as (hidden, hidden) but is now
+                // correctly passed attn_dim = num_heads * head_dim.  Qwen3 models where
+                // attn_dim != hidden_size are therefore safe to run on the full graph.
+                self.graph_state = Some(gs);
+                self.metal_strict = true;
+                true
             }
             (Err(e), _) | (_, Err(e)) => {
                 eprintln!("qwen: failed to enable full metal backend: {e}");
@@ -562,8 +562,13 @@ impl QwenRunner {
                     if rotary_dim > 0 {
                         if use_metal_rope {
                             let ops = self.metal_ops.as_ref().unwrap();
-                            ops.rope_adj_f32(&mut q, n_heads, head_dim, pos, cfg.rope_theta).map_err(|e| CoreError::Backend(e.to_string()))?;
-                            ops.rope_adj_f32(&mut k, n_kv_heads, head_dim, pos, cfg.rope_theta).map_err(|e| CoreError::Backend(e.to_string()))?;
+                            if has_qn {
+                                ops.rope_adj_f32(&mut q, n_heads, head_dim, pos, cfg.rope_theta).map_err(|e| CoreError::Backend(e.to_string()))?;
+                                ops.rope_adj_f32(&mut k, n_kv_heads, head_dim, pos, cfg.rope_theta).map_err(|e| CoreError::Backend(e.to_string()))?;
+                            } else {
+                                ops.rope_half_f32(&mut q, n_heads, head_dim, rotary_dim, pos, cfg.rope_theta).map_err(|e| CoreError::Backend(e.to_string()))?;
+                                ops.rope_half_f32(&mut k, n_kv_heads, head_dim, rotary_dim, pos, cfg.rope_theta).map_err(|e| CoreError::Backend(e.to_string()))?;
+                            }
                         } else {
                             rope_inplace_f32_partial(&mut q, n_heads, head_dim, rotary_dim, pos, cfg.rope_theta);
                             rope_inplace_f32_partial(&mut k, n_kv_heads, head_dim, rotary_dim, pos, cfg.rope_theta);
@@ -1728,8 +1733,15 @@ impl QwenGraphState {
             }
         }
         let km = kv_cache.storage().as_any().downcast_ref::<cellm_cache::kvcache::MetalKvStorage>().unwrap();
-        self.ops.encode_rope_adj_f32(enc, &self.q_buf, nh, hd, total_tokens_now - 1, cfg.rope_theta);
-        self.ops.encode_rope_adj_f32(enc, &self.k_buf, nkv, hd, total_tokens_now - 1, cfg.rope_theta);
+        // Qwen3 uses adjacent-pair RoPE; Qwen2 uses half-dim (interleaved) RoPE.
+        if q_norm_w.is_some() {
+            self.ops.encode_rope_adj_f32(enc, &self.q_buf, nh, hd, total_tokens_now - 1, cfg.rope_theta);
+            self.ops.encode_rope_adj_f32(enc, &self.k_buf, nkv, hd, total_tokens_now - 1, cfg.rope_theta);
+        } else {
+            let rd = (hd as f32 * rotary) as usize;
+            self.ops.encode_rope_half_f32(enc, &self.q_buf, nh, hd, rd, total_tokens_now - 1, cfg.rope_theta);
+            self.ops.encode_rope_half_f32(enc, &self.k_buf, nkv, hd, rd, total_tokens_now - 1, cfg.rope_theta);
+        }
         km.encode_write_token_f32(enc, kv_cache.layout().token_base_elem(bid, l, off).unwrap(), &self.k_buf, &self.v_buf, nkv * hd);
 
         km.encode_attention(

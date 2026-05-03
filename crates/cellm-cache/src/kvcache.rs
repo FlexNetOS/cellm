@@ -1362,8 +1362,6 @@ pub struct MetalKvStorage {
     pso_read_f32: ComputePipelineState,
     pso_gather_f32: ComputePipelineState,
     pso_attn_single_gqa_f32: ComputePipelineState,
-    pso_attn_single_gqa_f32_fast: ComputePipelineState,
-    pso_attn_single_gqa_f32_tiled: ComputePipelineState,
     pso_attn_batched_gqa_f32: ComputePipelineState,
     _pso_attn_single_gqa_q8_f32: ComputePipelineState,
     k: Buffer,
@@ -1517,10 +1515,13 @@ impl MetalKvStorage {
             uint group_size = n_heads / n_kv_heads;
             uint kv_h = head_idx / group_size;
             const device float* qh = q + head_idx * head_dim;
+            // Threadgroup size is fixed at 64 to match dispatch in encode_attention.
+            // If changed here, also update the dispatch call site.
             const uint TGSIZE = 64;
 
             float max_score = -INFINITY;
             float denom = 0.0f;
+            // v_acc accumulates partial V sums; sized for head_dim up to 8192 with 128 threads.
             float v_acc[128];
             for (uint j = 0; j < 128; j++) v_acc[j] = 0.0f;
 
@@ -1557,221 +1558,6 @@ impl MetalKvStorage {
 
             for (uint i = tid, j = 0; i < head_dim; i += TGSIZE, ++j) {
                 out[head_idx * head_dim + i] = v_acc[j] / denom;
-            }
-        }
-
-        // Tiled attention: processes seq positions in tiles of 64.
-        // Within each tile: 64 threads each handle 1 position (full dot product),
-        // scores are shared via threadgroup memory, and each thread accumulates
-        // V for its assigned dimensions across all positions in the tile.
-        // Total: 2 barriers per tile vs 2 per position in the original.
-        kernel void kv_attn_single_gqa_f32_tiled(
-            device const half* k_cache [[buffer(0)]],
-            device const half* v_cache [[buffer(1)]],
-            device const uint* bases [[buffer(2)]],
-            device const float* q [[buffer(3)]],
-            device float* out [[buffer(4)]],
-            constant uint& n_heads [[buffer(5)]],
-            constant uint& n_kv_heads [[buffer(6)]],
-            constant uint& head_dim [[buffer(7)]],
-            constant uint& seq [[buffer(8)]],
-            constant float& scale [[buffer(9)]],
-            constant float& soft_cap [[buffer(10)]],
-            uint tid [[thread_index_in_threadgroup]],
-            uint head_idx [[threadgroup_position_in_grid]],
-            uint tgsize [[threads_per_threadgroup]]
-        ) {
-            if (head_idx >= n_heads) return;
-            uint group_size = n_heads / n_kv_heads;
-            uint kv_h = head_idx / group_size;
-            const device float* qh = q + head_idx * head_dim;
-            device float* oh = out + head_idx * head_dim;
-            const uint TGSIZE = 64;
-
-            float global_max = -INFINITY;
-            float global_denom = 0.0f;
-            float v_acc[128];
-            for (uint j = 0; j < 128; j++) v_acc[j] = 0.0f;
-            threadgroup float tile_scores[64];
-
-            for (uint tile_start = 0; tile_start < seq; tile_start += TGSIZE) {
-                uint tile_end = min(tile_start + TGSIZE, seq);
-                uint tile_count = tile_end - tile_start;
-
-                // Phase 1: each thread computes full dot for its position
-                if (tid < tile_count) {
-                    uint pos = tile_start + tid;
-                    uint base = bases[pos] + kv_h * head_dim;
-                    float dot = 0.0f;
-                    for (uint i = 0; i < head_dim; ++i) dot += qh[i] * float(k_cache[base + i]);
-                    float s = dot * scale;
-                    if (soft_cap > 0.0f) s = tanh(s / soft_cap) * soft_cap;
-                    tile_scores[tid] = s;
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup); // BARRIER 1
-
-                // Phase 2: thread 0 finds tile max
-                if (tid == 0) {
-                    float tile_max = -INFINITY;
-                    for (uint i = 0; i < tile_count; ++i) tile_max = max(tile_max, tile_scores[i]);
-                    tile_scores[0] = tile_max;
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup); // BARRIER 2
-
-                // Phase 3: rescale global + accumulate V over all tile positions
-                float tile_max = tile_scores[0];
-                float new_global_max = max(global_max, tile_max);
-                float rescale = (global_max == -INFINITY) ? 0.0f : exp(global_max - new_global_max);
-                global_denom *= rescale;
-                for (uint i = tid; i < head_dim; i += TGSIZE) {
-                    v_acc[i / TGSIZE] *= rescale;
-                }
-                global_max = new_global_max;
-
-                // Each thread maintains its own denom copy (scores are
-                // shared via threadgroup memory, so all threads compute
-                // the same sum).  This avoids a threadgroup barrier.
-                for (uint ti = 0; ti < tile_count; ++ti) {
-                    float exp_v = exp(tile_scores[ti] - global_max);
-                    global_denom += exp_v;  // each thread does this
-                    uint pos = tile_start + ti;
-                    uint base = bases[pos] + kv_h * head_dim;
-                    for (uint i = tid; i < head_dim; i += TGSIZE) {
-                        v_acc[i / TGSIZE] += exp_v * float(v_cache[base + i]);
-                    }
-                }
-            }
-
-            for (uint i = tid; i < head_dim; i += TGSIZE) {
-                oh[i] = v_acc[i / TGSIZE] / global_denom;
-            }
-        }
-
-        // Thread-parallel decode attention: 64 threads per head cooperate
-        // over all sequence positions, needing only 3 barrier groups total
-        // (vs seq*2 barriers in kv_attn_single_gqa_f32).
-        kernel void kv_attn_single_gqa_f32_fast(
-            device const half* k_cache [[buffer(0)]],
-            device const half* v_cache [[buffer(1)]],
-            device const uint* bases [[buffer(2)]],
-            device const float* q [[buffer(3)]],
-            device float* out [[buffer(4)]],
-            constant uint& n_heads [[buffer(5)]],
-            constant uint& n_kv_heads [[buffer(6)]],
-            constant uint& head_dim [[buffer(7)]],
-            constant uint& seq [[buffer(8)]],
-            constant float& scale [[buffer(9)]],
-            constant float& soft_cap [[buffer(10)]],
-            uint tid [[thread_index_in_threadgroup]],
-            uint gid [[threadgroup_position_in_grid]],
-            uint tgsize [[threads_per_threadgroup]]
-        ) {
-            if (gid >= n_heads) return;
-            uint group_size = n_heads / n_kv_heads;
-            uint kv_h = gid / group_size;
-            device const float* qh = q + gid * head_dim;
-            device float* oh = out + gid * head_dim;
-
-            if (seq == 0) return;
-
-            uint n_threads = tgsize;
-            uint tokens_per_thread = (seq + n_threads - 1) / n_threads;
-            uint start_t = tid * tokens_per_thread;
-            uint end_t = min(start_t + tokens_per_thread, seq);
-
-            // Phase 1: local max score
-            float local_max = -INFINITY;
-            for (uint t = start_t; t < end_t; t++) {
-                uint base = bases[t] + kv_h * head_dim;
-                float dp = 0.0f;
-                uint i = 0;
-                for (; i + 3 < head_dim; i += 4) {
-                    float4 qv = float4(qh[i], qh[i+1], qh[i+2], qh[i+3]);
-                    float4 kv = float4(float(k_cache[base + i]), float(k_cache[base + i + 1]), float(k_cache[base + i + 2]), float(k_cache[base + i + 3]));
-                    dp += dot(qv, kv);
-                }
-                for (; i < head_dim; i++) dp += qh[i] * float(k_cache[base + i]);
-                float score = dp * scale;
-                if (soft_cap > 0.0f) score = tanh(score / soft_cap) * soft_cap;
-                local_max = max(local_max, score);
-            }
-
-            threadgroup float shared[128];
-            shared[tid] = local_max;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (tid == 0) {
-                float m = shared[0];
-                for (uint i = 1; i < n_threads; i++) m = max(m, shared[i]);
-                shared[0] = m;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            float global_max = shared[0];
-
-            // Phase 2: local sum of exponentials
-            float local_sum = 0.0f;
-            for (uint t = start_t; t < end_t; t++) {
-                uint base = bases[t] + kv_h * head_dim;
-                float dp = 0.0f;
-                uint i = 0;
-                for (; i + 3 < head_dim; i += 4) {
-                    float4 qv = float4(qh[i], qh[i+1], qh[i+2], qh[i+3]);
-                    float4 kv = float4(float(k_cache[base + i]), float(k_cache[base + i + 1]), float(k_cache[base + i + 2]), float(k_cache[base + i + 3]));
-                    dp += dot(qv, kv);
-                }
-                for (; i < head_dim; i++) dp += qh[i] * float(k_cache[base + i]);
-                float score = dp * scale;
-                if (soft_cap > 0.0f) score = tanh(score / soft_cap) * soft_cap;
-                local_sum += exp(score - global_max);
-            }
-
-            shared[tid] = local_sum;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (tid == 0) {
-                float s = 0.0f;
-                for (uint i = 0; i < n_threads; i++) s += shared[i];
-                shared[0] = s;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            float global_sum = shared[0];
-
-            // Phase 3: weighted V sum, tiled over head_dim
-            const uint TILE = 32;
-            threadgroup float tg_partial[TILE][128];
-            for (uint d_base = 0; d_base < head_dim; d_base += TILE) {
-                uint d_end = min(d_base + TILE, head_dim);
-                uint tile_count = d_end - d_base;
-
-                float local_partials[TILE];
-                for (uint i = 0; i < tile_count; i++) local_partials[i] = 0.0f;
-
-                for (uint t = start_t; t < end_t; t++) {
-                    uint base = bases[t] + kv_h * head_dim;
-                    float dp = 0.0f;
-                    uint i = 0;
-                    for (; i + 3 < head_dim; i += 4) {
-                        float4 qv = float4(qh[i], qh[i+1], qh[i+2], qh[i+3]);
-                        float4 kv = float4(float(k_cache[base + i]), float(k_cache[base + i + 1]), float(k_cache[base + i + 2]), float(k_cache[base + i + 3]));
-                        dp += dot(qv, kv);
-                    }
-                    for (; i < head_dim; i++) dp += qh[i] * float(k_cache[base + i]);
-                    float score = dp * scale;
-                    if (soft_cap > 0.0f) score = tanh(score / soft_cap) * soft_cap;
-                    float w = exp(score - global_max);
-
-                    for (uint i = 0; i < tile_count; i++) local_partials[i] += w * float(v_cache[base + d_base + i]);
-                }
-
-                for (uint i = 0; i < tile_count; i++) tg_partial[i][tid] = local_partials[i];
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-
-                if (tid == 0) {
-                    for (uint i = 0; i < tile_count; i++) {
-                        float acc = 0.0f;
-                        for (uint j = 0; j < n_threads; j++) acc += tg_partial[i][j];
-                        oh[d_base + i] = acc / global_sum;
-                    }
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
             }
         }
 
@@ -1936,8 +1722,6 @@ impl MetalKvStorage {
         let pso_read_f32 = build_pso(&device, &lib, "kv_read_f32")?;
         let pso_gather_f32 = build_pso(&device, &lib, "kv_gather_f32")?;
         let pso_attn_single_gqa_f32 = build_pso(&device, &lib, "kv_attn_single_gqa_f32")?;
-        let pso_attn_single_gqa_f32_fast = build_pso(&device, &lib, "kv_attn_single_gqa_f32_fast")?;
-        let pso_attn_single_gqa_f32_tiled = build_pso(&device, &lib, "kv_attn_single_gqa_f32_tiled")?;
         let pso_attn_batched_gqa_f32 = build_pso(&device, &lib, "kv_attn_batched_gqa_f32")?;
         let pso_attn_single_gqa_q8_f32 = build_pso(&device, &lib, "kv_attn_single_gqa_q8_f32")?;
         let bytes = (total_elems * std::mem::size_of::<f16>()) as u64;
@@ -2044,8 +1828,6 @@ impl MetalKvStorage {
             pso_read_f32,
             pso_gather_f32,
             pso_attn_single_gqa_f32,
-            pso_attn_single_gqa_f32_fast,
-            pso_attn_single_gqa_f32_tiled,
             pso_attn_batched_gqa_f32,
             _pso_attn_single_gqa_q8_f32: pso_attn_single_gqa_q8_f32,
             k,
@@ -3299,7 +3081,7 @@ impl MetalKvStorage {
         let soft_cap_val = soft_cap.unwrap_or(0.0f32);
         let soft_cap_ptr = (&soft_cap_val as *const f32).cast();
 
-        enc.set_compute_pipeline_state(&self.pso_attn_single_gqa_f32_tiled);
+        enc.set_compute_pipeline_state(&self.pso_attn_single_gqa_f32);
         enc.set_buffer(0, Some(&self.k), 0);
         enc.set_buffer(1, Some(&self.v), 0);
         enc.set_buffer(2, Some(bases_buf), bases_offset);
@@ -3312,7 +3094,8 @@ impl MetalKvStorage {
         enc.set_bytes(9, std::mem::size_of::<f32>() as u64, scale_ptr);
         enc.set_bytes(10, std::mem::size_of::<f32>() as u64, soft_cap_ptr);
 
-        // Use 64 threads per head.
+        // Use 64 threads per head for better GPU utilization on models with few heads.
+        // The kernel dynamically adapts via [[threads_per_threadgroup]].
         let threads_per_tg = 64;
         let tg = metal::MTLSize { width: threads_per_tg, height: 1, depth: 1 };
         let grid = metal::MTLSize { width: n_heads as u64, height: 1, depth: 1 };
