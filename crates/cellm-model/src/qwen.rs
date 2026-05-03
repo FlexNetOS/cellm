@@ -1679,8 +1679,10 @@ impl QwenGraphState {
         } else if q_dtype == "i8" && qs.is_some() && ks.is_some() && vs.is_some() {
             self.ops.encode_qkv_i8_bias(enc, wq, qs.unwrap(), wk, ks.unwrap(), wv, vs.unwrap(), &self.x_norm_buf, bq, bk, bv, &self.q_buf, &self.k_buf, &self.v_buf, nh * hd, nkv * hd, h);
         } else {
-            // Force fallback for i4 to individual linear_f16_out_in (which now supports Metal i4)
-            return false;
+            // f16 weights: use encode_mv_f16_bias
+            self.ops.encode_mv_f16_bias(enc, wq, &self.x_norm_buf, bq, &self.q_buf, nh * hd, h);
+            self.ops.encode_mv_f16_bias(enc, wk, &self.x_norm_buf, bk, &self.k_buf, nkv * hd, h);
+            self.ops.encode_mv_f16_bias(enc, wv, &self.x_norm_buf, bv, &self.v_buf, nkv * hd, h);
         }
 
         // QK Norm (Head-tied or Per-head)
@@ -1779,7 +1781,8 @@ impl QwenGraphState {
         let enc = cb.new_compute_command_encoder();
         let ok = self.encode_single_layer_on_encoder(&enc, l, cfg, prefix, kv_cache, total_tokens_now, stride, off, bid, rotary, offset, bases_buf);
         if !ok {
-            // encoder already not ended by encode_single_layer_on_encoder on fallback path
+            // On the fused-GPU path, encode_single_layer_on_encoder now
+            // handles f16 natively (returned true). No fallback needed.
         }
         enc.end_encoding();
     }
