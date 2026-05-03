@@ -3199,12 +3199,9 @@ fn linear_rows(
         weight_t_cache,
     } = backend
     {
-        // The Metal matmul kernel is a naive element-wise implementation that
-        // is orders of magnitude slower than cblas_sgemm (Accelerate/AMX)
-        // for large encoder-scale matrices. Skip it for large batch sizes.
-        // We keep the tiled Metal matmul for small-to-medium matrices where
-        // dispatch overhead is low (< 16K ops), and fall through to CPU BLAS
-        // for larger matrices which is faster on Apple Silicon's AMX.
+        // The Metal matmul kernel (even tiled) is slower than cblas_sgemm
+        // (Accelerate/AMX) for large encoder-scale matrices due to upload/
+        // download overhead. Keep CPU BLAS for large matrices.
         let total_ops = rows * in_dim * out_dim;
         let skip_metal = total_ops >= (1 << 20);
         if skip_metal {
@@ -3227,8 +3224,6 @@ fn linear_rows(
 
             if let Some(b_buf) = weight_t_cache.get(&key) {
                 if let Ok(a_buf) = ctx.upload_f32(input) {
-                    // Use tiled matmul for sizes where it's competitive,
-                    // naive kernel for tiny matrices.
                     if total_ops >= (1 << 10) {
                         ctx.matmul_row_major_f32_tiled(&a_buf, rows, in_dim, b_buf, out_dim, out)
                             .is_ok()
