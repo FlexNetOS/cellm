@@ -629,11 +629,21 @@ cargo run --release --bin convert -- \
 
 ```sh
 ./target/release/infer \
-  --model models/Qwen3-0.6B.cellm \
-  --tokenizer models/Qwen3-0.6B/tokenizer.json \
+  --model models/to-huggingface/qwen3-0.6b-v1/qwen3-0.6b-int8.cellm \
+  --tokenizer models/to-huggingface/qwen3-0.6b-v1/tokenizer.json \
   --prompt "What is the capital of France?" \
   --gen 20 --backend cpu
 ```
+
+```sh
+./target/release/infer \
+  --model models/to-huggingface/qwen3-0.6b-v1/qwen3-0.6b-int8.cellm \
+  --tokenizer models/to-huggingface/qwen3-0.6b-v1/tokenizer.json \
+  --prompt "What is the capital of France?" \
+  --gen 20 --backend metal
+```
+
+
 
 ### Notes
 
@@ -658,21 +668,21 @@ Architecture: 16 layers alternating between conv and attention blocks.
 
 ### Convert from MLX
 
-python3 tools/convert_lfm.py models/LFM2.5-350M-MLX-4bit models/LFM2.5-350M.cellm
+python3 tools/convert_lfm.py models/LFM2.5-350M-MLX-4bit models/to-huggingface/lfm2.5-350m-v1/lfm2.5-350m-v1.cellm
 
 ### Inference (CPU)
 ```bash
 ./target/release/infer \
-  --model models/LFM2.5-350M.cellm \
-  --tokenizer models/LFM2.5-350M-MLX-4bit/tokenizer.json \
+  --model models/to-huggingface/lfm2.5-350m-v1/lfm2.5-350m-v1.cellm \
+  --tokenizer models/to-huggingface/lfm2.5-350m-v1/tokenizer.json \
   --prompt "The quick brown fox" \
   --tokens 32 --backend cpu
 ```
 
 ```bash
 ./target/release/infer \
-  --model models/LFM2.5-350M.cellm \
-  --tokenizer models/LFM2.5-350M-MLX-4bit/tokenizer.json \
+  --model models/to-huggingface/lfm2.5-350m-v1/lfm2.5-350m-v1.cellm \
+  --tokenizer models/to-huggingface/lfm2.5-350m-v1/tokenizer.json \
   --prompt "The quick brown fox" \
   --gen 32 --backend cpu
   ---
@@ -682,9 +692,9 @@ python3 tools/convert_lfm.py models/LFM2.5-350M-MLX-4bit models/LFM2.5-350M.cell
 
 ```bash
 ./target/release/infer \
-  --model models/LFM2.5-350M.cellm \
-  --tokenizer models/LFM2.5-350M-MLX-4bit/tokenizer.json \
-  --prompt "What is consciousness?" \
+  --model models/to-huggingface/lfm2.5-350m-v1/lfm2.5-350m-v1.cellm \
+  --tokenizer models/to-huggingface/lfm2.5-350m-v1/tokenizer.json \
+  --prompt "What is consciousness? in one paragraph" \
   --gen 100 --backend cpu
 
   ---
@@ -694,8 +704,8 @@ Consciousness refers to the ability of an individual to be aware of their though
 
 ```bash
 ./target/release/infer \
-  --model models/LFM2.5-350M.cellm \
-  --tokenizer models/LFM2.5-350M-MLX-4bit/tokenizer.json \
+  --model models/to-huggingface/lfm2.5-350m-v1/lfm2.5-350m-v1.cellm \
+  --tokenizer models/to-huggingface/lfm2.5-350m-v1/tokenizer.json \
   --prompt "What is consciousness?" \
   --gen 100 --backend metal
 
@@ -708,8 +718,8 @@ Consciousness refers to the ability of an individual to be aware of their though
 
 ```bash
 ./target/release/infer \
-  --model models/LFM2.5-350M.cellm \
-  --tokenizer models/LFM2.5-350M-MLX-4bit/tokenizer.json \
+  --model models/to-huggingface/lfm2.5-350m-v1/lfm2.5-350m-v1.cellm \
+  --tokenizer models/to-huggingface/lfm2.5-350m-v1/tokenizer.json \
   --prompt "You rewrite outreach messages. Do not add new facts.
 
 Return only one message.

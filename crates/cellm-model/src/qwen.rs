@@ -255,9 +255,33 @@ impl QwenRunner {
                     self.graph_state = None;
                     return false;
                 }
-                self.graph_state = Some(gs);
-                self.metal_strict = true;
-                true
+
+                // Metal graph does not yet support attention output gate (Qwen3.5+ q_proj shape [attn_dim*2, hidden]).
+                let attn_dim = self.cfg.num_attention_heads * self.cfg.head_dim;
+                let mut has_attn_gate = false;
+                for l in 0..self.cfg.num_hidden_layers {
+                    let name = format!("layers.{l}.self_attn.q_proj.weight");
+                    let resolved = resolve_tensor_name_file(&self.file, &name);
+                    if let Some(meta) = self.file.tensor_index(&resolved) {
+                        if meta.shape.len() >= 2 && meta.shape[0] == attn_dim * 2 {
+                            has_attn_gate = true;
+                            break;
+                        }
+                    }
+                }
+                if has_attn_gate {
+                    eprintln!("qwen: Metal graph skipped — model has attention output gate (not yet supported on GPU). Using CPU layer loop with Metal matmul where available.");
+                    self.metal_strict = false;
+                    self.graph_state = None;
+                    return false;
+                }
+                // The Qwen Metal full graph has a known correctness issue for some model
+                // configurations (e.g., Qwen3-0.6B int8).  Until the root cause is fixed,
+                // fall back to the CPU layer loop which still uses Metal for matmul and norms.
+                eprintln!("qwen: Metal full graph disabled for this model (using CPU layer loop with Metal matmul where available).");
+                self.metal_strict = false;
+                self.graph_state = None;
+                false
             }
             (Err(e), _) | (_, Err(e)) => {
                 eprintln!("qwen: failed to enable full metal backend: {e}");
@@ -422,7 +446,8 @@ impl QwenRunner {
                     self.partial_rotary_factor,
                     self.rmsnorm_weight_is_offset,
                     return_logits,
-                )?;
+                );
+                let res = res?;
                 return Ok(res.unwrap_or_else(Vec::new));
             }
         }
@@ -1702,7 +1727,6 @@ impl QwenGraphState {
                 self.ops.encode_rms_norm_f16w_at(enc, &self.k_buf, (hidx * hd * 4) as u64, kw, w_off, &self.k_buf, (hidx * hd * 4) as u64, hd, cfg.rms_norm_eps, offset);
             }
         }
-
         let km = kv_cache.storage().as_any().downcast_ref::<cellm_cache::kvcache::MetalKvStorage>().unwrap();
         self.ops.encode_rope_adj_f32(enc, &self.q_buf, nh, hd, total_tokens_now - 1, cfg.rope_theta);
         self.ops.encode_rope_adj_f32(enc, &self.k_buf, nkv, hd, total_tokens_now - 1, cfg.rope_theta);
@@ -1722,16 +1746,17 @@ impl QwenGraphState {
             None  // soft_cap
         );
 
+        let attn_dim = nh * hd;
         let wo = self.get_w_cached(&format!("{pref}.self_attn.o_proj.weight"));
         let bo = self.try_get_w_cached(&format!("{pref}.self_attn.o_proj.bias"));
         let so = self.try_get_w_cached(&format!("{pref}.self_attn.o_proj.weight.qscale")).or_else(|| self.try_get_w_cached(&format!("{pref}.self_attn.o_proj.qscale")));
         if self.get_dtype(&format!("{pref}.self_attn.o_proj.weight")) == "q1_0_g128" {
-            self.ops.encode_mv_q1(enc, wo, &self.attn_out_buf, &self.mlp_in_buf, h, h);
+            self.ops.encode_mv_q1(enc, wo, &self.attn_out_buf, &self.mlp_in_buf, h, attn_dim);
             if let Some(b) = bo { self.ops.encode_add_f32_inplace(enc, &self.mlp_in_buf, b, h); }
         } else if let Some(s) = so {
-            self.ops.encode_mv_i8_bias(enc, wo, s, &self.attn_out_buf, bo, &self.mlp_in_buf, h, h);
+            self.ops.encode_mv_i8_bias(enc, wo, s, &self.attn_out_buf, bo, &self.mlp_in_buf, h, attn_dim);
         } else {
-            self.ops.encode_mv_f16_bias(enc, wo, &self.attn_out_buf, bo, &self.mlp_in_buf, h, h);
+            self.ops.encode_mv_f16_bias(enc, wo, &self.attn_out_buf, bo, &self.mlp_in_buf, h, attn_dim);
         }
         self.ops.encode_add_f32_inplace(enc, &self.x_buf, &self.mlp_in_buf, h);
 
