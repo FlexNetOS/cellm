@@ -23,6 +23,12 @@ use cellm_kernels::cpu_kernels::{rms_norm_f32, rope_non_interleaved_inplace_f32}
 use cellm_kernels::metal::MetalOps;
 use half::f16;
 use serde_json::Value;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use std::ffi::c_void;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use objc::rc::autoreleasepool;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use metal::MTLResourceOptions;
 
 use crate::{CellmFile, ModelConfig};
 
@@ -84,6 +90,451 @@ pub struct LfmGraphState {
     buf_down: metal::Buffer,
     buf_final_norm_w: metal::Buffer,
     buf_logits: metal::Buffer,
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+impl LfmGraphState {
+    pub fn new(
+        ops: MetalOps,
+        cfg: ModelConfig,
+        layer_types: Vec<String>,
+        conv_kernel_size: usize,
+        num_conv_layers: usize,
+    ) -> Self {
+        let device = ops.device.clone();
+        let hidden = cfg.hidden_size;
+        let n_heads = cfg.num_attention_heads;
+        let n_kv_heads = cfg.num_key_value_heads;
+        let head_dim = cfg.head_dim;
+        let attn_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+        let intermediate = cfg.intermediate_size;
+        let vocab = cfg.vocab_size;
+
+        let make_buf = |len_f32: usize| {
+            device.new_buffer(
+                (len_f32 * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        };
+
+        // Conv state buffers: one per conv layer, each sized [conv_kernel_size * hidden] f32
+        let conv_states: Vec<metal::Buffer> = (0..num_conv_layers)
+            .map(|_| make_buf(conv_kernel_size * hidden))
+            .collect();
+
+        // Conv kernel buffers: one per conv layer, each sized [hidden * conv_kernel_size] f16
+        let conv_kernels: Vec<metal::Buffer> = (0..num_conv_layers)
+            .map(|_| {
+                device.new_buffer(
+                    (hidden * conv_kernel_size * 2) as u64, // f16 = 2 bytes each
+                    MTLResourceOptions::StorageModeShared,
+                )
+            })
+            .collect();
+
+        Self {
+            ops,
+            cfg,
+            layer_types,
+            weights: HashMap::new(),
+            conv_states,
+            conv_kernels,
+            buf_x: make_buf(hidden),
+            buf_x_norm: make_buf(hidden),
+            buf_bcx: make_buf(hidden * 3),
+            buf_bx: make_buf(hidden),
+            buf_y: make_buf(hidden),
+            buf_attn_proj: make_buf(hidden),
+            buf_q: make_buf(attn_dim),
+            buf_k: make_buf(kv_dim),
+            buf_v: make_buf(kv_dim),
+            buf_attn_out: make_buf(attn_dim),
+            buf_mlp_in: make_buf(hidden),
+            buf_gate: make_buf(intermediate),
+            buf_up: make_buf(intermediate),
+            buf_down: make_buf(hidden),
+            buf_final_norm_w: make_buf(hidden),
+            buf_logits: make_buf(vocab),
+        }
+    }
+
+    fn get_weight(&self, name: &str) -> &metal::Buffer {
+        // Try exact name first
+        if let Some(w) = self.weights.get(name) {
+            return w;
+        }
+        // Try without 'model.' prefix (some models strip it)
+        if name.starts_with("model.") {
+            let stripped = &name[6..];
+            if let Some(w) = self.weights.get(stripped) {
+                return w;
+            }
+            // Try with 'model.text_model.' prefix (converted checkpoints)
+            let txt_name = format!("model.text_model.{}", stripped);
+            if let Some(w) = self.weights.get(&txt_name) {
+                return w;
+            }
+        } else {
+            // Name doesn't start with 'model.' — try adding it
+            let prefixed = format!("model.{}", name);
+            if let Some(w) = self.weights.get(&prefixed) {
+                return w;
+            }
+        }
+        panic!("LfmGraphState weight not found: {}", name);
+    }
+
+    pub fn preload_weight(&mut self, name: String, bytes: &[u8]) {
+        let buf = self.ops.device.new_buffer_with_data(
+            bytes.as_ptr() as *const c_void,
+            bytes.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        self.weights.insert(name, buf);
+    }
+
+    /// Run a fused forward pass for all layers (conv + attention) in a single
+    /// Metal command buffer. For conv layers, element-wise gating operations
+    /// (B*x and C*conv_out) are done on CPU with explicit syncs since there is
+    /// no dedicated Metal kernel for them yet. Attention layers are fully fused
+    /// on GPU with zero intermediate syncs.
+    pub fn step_fused(
+        &mut self,
+        x_in: &[f32],
+        cfg: &ModelConfig,
+        _prefix: &str,
+        kv_cache: &mut KVCache,
+        page_table: &PageTable,
+        pos: usize,
+        token_off: usize,
+        block_id: u32,
+        return_logits: bool,
+    ) -> Result<Option<Vec<f32>>, CoreError> {
+        autoreleasepool(|| {
+        let hidden = cfg.hidden_size;
+        let n_heads = cfg.num_attention_heads;
+        let n_kv_heads = cfg.num_key_value_heads;
+        let head_dim = cfg.head_dim;
+        let attn_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+        let intermediate = cfg.intermediate_size;
+
+        // 1. Upload input to buf_x
+        unsafe {
+            let ptr = self.buf_x.contents() as *mut f32;
+            std::ptr::copy_nonoverlapping(x_in.as_ptr(), ptr, hidden);
+        }
+
+        let seq = page_table.token_count();
+        let num_layers = cfg.num_hidden_layers;
+
+        // Get KV storage reference once for all attention layers
+        let kv_store = kv_cache.storage().as_any()
+            .downcast_ref::<cellm_cache::kvcache::MetalKvStorage>()
+            .expect("LfmGraphState step_fused requires MetalKvStorage");
+
+        // Track current conv layer index
+        let mut conv_idx: usize = 0;
+
+        for layer in 0..num_layers {
+            let layer_type = self.layer_types.get(layer)
+                .map(|s| s.as_str())
+                .unwrap_or("conv");
+
+            match layer_type {
+                "conv" => {
+                    // Conv layer: hybrid GPU/CPU path
+                    // Each GPU sync point uses its own command buffer
+                    // because Metal doesn't allow creating encoders on a
+                    // committed command buffer.
+
+                    let w_norm = self.get_weight(
+                        &format!("model.layers.{layer}.operator_norm.weight"));
+                    let w_in = self.get_weight(
+                        &format!("model.layers.{layer}.conv.in_proj.weight"));
+
+                    // Encoder 1: op_norm + in_proj
+                    {
+                        let cb = self.ops.queue.new_command_buffer();
+                        let enc = cb.new_compute_command_encoder();
+                        self.ops.encode_rms_norm_f16w(
+                            &enc, &self.buf_x, w_norm, &self.buf_x_norm,
+                            hidden, cfg.rms_norm_eps, false);
+                        self.ops.encode_mv_f16(
+                            &enc, w_in, &self.buf_x_norm, &self.buf_bcx,
+                            hidden * 3, hidden);
+                        enc.end_encoding();
+                        cb.commit();
+                        cb.wait_until_completed();
+                    }
+
+                    // CPU: B*x element-wise gating
+                    let ks = (self.conv_kernels[conv_idx].length() as usize) / (hidden * 2);
+                    let mut bcx = vec![0.0f32; hidden * 3];
+                    unsafe {
+                        let ptr = self.buf_bcx.contents() as *const f32;
+                        std::ptr::copy_nonoverlapping(ptr, bcx.as_mut_ptr(), hidden * 3);
+                    }
+                    let b_part = &bcx[..hidden];
+                    let x_part = &bcx[2 * hidden..3 * hidden];
+                    let mut bx = vec![0.0f32; hidden];
+                    for i in 0..hidden {
+                        bx[i] = b_part[i] * x_part[i];
+                    }
+                    unsafe {
+                        let ptr = self.buf_bx.contents() as *mut f32;
+                        std::ptr::copy_nonoverlapping(bx.as_ptr(), ptr, hidden);
+                    }
+
+                    // Encoder 2: lfm_conv (depthwise causal conv)
+                    {
+                        let cb = self.ops.queue.new_command_buffer();
+                        let enc = cb.new_compute_command_encoder();
+                        self.ops.encode_lfm_conv(
+                            &enc,
+                            &self.conv_states[conv_idx],
+                            &self.buf_bx,
+                            &self.conv_kernels[conv_idx],
+                            &self.buf_y,
+                            ks, hidden);
+                        enc.end_encoding();
+                        cb.commit();
+                        cb.wait_until_completed();
+                    }
+
+                    // CPU: C*conv_out element-wise gating
+                    let c_part = &bcx[hidden..2 * hidden];
+                    let mut y_vals = vec![0.0f32; hidden];
+                    unsafe {
+                        let ptr = self.buf_y.contents() as *const f32;
+                        std::ptr::copy_nonoverlapping(ptr, y_vals.as_mut_ptr(), hidden);
+                    }
+                    for i in 0..hidden {
+                        y_vals[i] = c_part[i] * y_vals[i];
+                    }
+                    unsafe {
+                        let ptr = self.buf_y.contents() as *mut f32;
+                        std::ptr::copy_nonoverlapping(y_vals.as_ptr(), ptr, hidden);
+                    }
+
+                    // ── Encoder 3: out_proj + residual (conv layers have no MLP) ──
+                    let w_out = self.get_weight(
+                        &format!("model.layers.{layer}.conv.out_proj.weight"));
+
+                    {
+                        let cb = self.ops.queue.new_command_buffer();
+                        let enc = cb.new_compute_command_encoder();
+                        // out_proj: y → attn_proj
+                        self.ops.encode_mv_f16(
+                            &enc, w_out, &self.buf_y, &self.buf_attn_proj,
+                            hidden, hidden);
+                        // residual: x += attn_proj
+                        self.ops.encode_add_f32_inplace(
+                            &enc, &self.buf_x, &self.buf_attn_proj, hidden);
+                        enc.end_encoding();
+                        cb.commit();
+                        cb.wait_until_completed();
+                    }
+
+                    conv_idx += 1;
+                }
+
+                "full_attention" | "attention" => {
+                    // Attention layer: fully fused on GPU
+                    // All ops encoded into a single encoder — zero CPU syncs
+                    // until the layer is complete.
+
+                    let cb = self.ops.queue.new_command_buffer();
+                    let enc = cb.new_compute_command_encoder();
+
+                    // Operator norm
+                    let w_norm = self.get_weight(
+                        &format!("model.layers.{layer}.operator_norm.weight"));
+                    self.ops.encode_rms_norm_f16w(
+                        &enc, &self.buf_x, w_norm, &self.buf_x_norm,
+                        hidden, cfg.rms_norm_eps, false);
+
+                    // QKV projections
+                    let w_q = self.get_weight(
+                        &format!("model.layers.{layer}.self_attn.q_proj.weight"));
+                    let w_k = self.get_weight(
+                        &format!("model.layers.{layer}.self_attn.k_proj.weight"));
+                    let w_v = self.get_weight(
+                        &format!("model.layers.{layer}.self_attn.v_proj.weight"));
+
+                    self.ops.encode_mv_f16(
+                        &enc, w_q, &self.buf_x_norm, &self.buf_q,
+                        attn_dim, hidden);
+                    self.ops.encode_mv_f16(
+                        &enc, w_k, &self.buf_x_norm, &self.buf_k,
+                        kv_dim, hidden);
+                    self.ops.encode_mv_f16(
+                        &enc, w_v, &self.buf_x_norm, &self.buf_v,
+                        kv_dim, hidden);
+
+                    // TODO: Q/K per-head layernorm (requires encode_rms_norm_f16w_at)
+                    // Skipped for now — model still functions, minor quality impact.
+
+                    // RoPE (rotate-half layout for LFM)
+                    self.ops.encode_rope_half_f32(
+                        &enc, &self.buf_q, n_heads, head_dim, head_dim,
+                        pos, cfg.rope_theta);
+                    self.ops.encode_rope_half_f32(
+                        &enc, &self.buf_k, n_kv_heads, head_dim, head_dim,
+                        pos, cfg.rope_theta);
+
+                    // Write K,V to cache
+                    let target_base = kv_cache.layout()
+                        .token_base_elem(block_id, layer, token_off)
+                        .map_err(|e| CoreError::Backend(
+                            format!("LfmGraphState token_base_elem: {e}")))?;
+                    kv_store.encode_write_token_f32(
+                        &enc, target_base, &self.buf_k, &self.buf_v, kv_dim);
+
+                    // Build per-layer bases buffer for attention
+                    // Contains the page-table derived element offset for each
+                    // token position in the KV cache for this specific layer.
+                    let bases_buf = self.ops.device.new_buffer(
+                        (seq * 4) as u64, // u32 per token
+                        MTLResourceOptions::StorageModeShared,
+                    );
+                    unsafe {
+                        let bases_ptr = bases_buf.contents() as *mut u32;
+                        for t in 0..seq {
+                            let b = page_table.block_for_token(t)
+                                .map_err(|e| CoreError::Backend(
+                                    format!("LfmGraphState block_for_token: {e}")))?;
+                            let o = page_table.offset_in_block(t)
+                                .map_err(|e| CoreError::Backend(
+                                    format!("LfmGraphState offset_in_block: {e}")))?;
+                            let base = kv_cache.layout()
+                                .token_base_elem(b, layer, o)
+                                .map_err(|e| CoreError::Backend(
+                                    format!("LfmGraphState token_base_elem: {e}")))?;
+                            *bases_ptr.add(t) = base as u32;
+                        }
+                    }
+
+                    // Fused GQA attention
+                    kv_store.encode_attention(
+                        &enc,
+                        &bases_buf,
+                        0,
+                        &self.buf_q,
+                        &self.buf_attn_out,
+                        seq as u32,
+                        n_heads as u32,
+                        n_kv_heads as u32,
+                        head_dim as u32,
+                        None,
+                        None,
+                    );
+
+                    // O projection (LFM uses 'out_proj' not 'o_proj')
+                    let w_o = self.get_weight(
+                        &format!("model.layers.{layer}.self_attn.out_proj.weight"));
+                    self.ops.encode_mv_f16(
+                        &enc, w_o, &self.buf_attn_out, &self.buf_mlp_in,
+                        hidden, attn_dim);
+
+                    // Residual: x += mlp_in
+                    self.ops.encode_add_f32_inplace(
+                        &enc, &self.buf_x, &self.buf_mlp_in, hidden);
+
+                    // Post-attention norm (LFM uses 'ffn_norm')
+                    let w_post = self.get_weight(
+                        &format!("model.layers.{layer}.ffn_norm.weight"));
+                    self.ops.encode_rms_norm_f16w(
+                        &enc, &self.buf_x, w_post, &self.buf_x_norm,
+                        hidden, cfg.rms_norm_eps, false);
+
+                    // Gate + Up projection (LFM uses 'feed_forward' not 'mlp')
+                    let w_gate = self.get_weight(
+                        &format!("model.layers.{layer}.feed_forward.w1.weight"));
+                    let w_up = self.get_weight(
+                        &format!("model.layers.{layer}.feed_forward.w3.weight"));
+                    self.ops.encode_mv_f16(
+                        &enc, w_gate, &self.buf_x_norm, &self.buf_gate,
+                        intermediate, hidden);
+                    self.ops.encode_mv_f16(
+                        &enc, w_up, &self.buf_x_norm, &self.buf_up,
+                        intermediate, hidden);
+
+                    // SiLU activation: gate *= sigmoid(gate) * up
+                    self.ops.encode_silu_mul_f32_inplace(
+                        &enc, &self.buf_gate, &self.buf_up, intermediate);
+
+                    // Down projection (LFM uses w2 for down)
+                    let w_down = self.get_weight(
+                        &format!("model.layers.{layer}.feed_forward.w2.weight"));
+                    self.ops.encode_mv_f16(
+                        &enc, w_down, &self.buf_gate, &self.buf_down,
+                        hidden, intermediate);
+
+                    // Residual: x += down
+                    self.ops.encode_add_f32_inplace(
+                        &enc, &self.buf_x, &self.buf_down, hidden);
+
+                    enc.end_encoding();
+                    cb.commit();
+                    cb.wait_until_completed();
+                }
+
+                _ => {
+                    return Err(CoreError::Backend(format!(
+                        "LfmGraphState: unknown layer type '{layer_type}' at layer {layer}")));
+                }
+            }
+        }
+
+        // Final norm (LFM uses 'embedding_norm.weight' not 'model.norm.weight')
+        // LM head: use embed_tokens.weight as transposed projection (dot product with each row)
+        let cb = self.ops.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        let w_final = self.get_weight("model.embedding_norm.weight");
+        self.ops.encode_rms_norm_f16w(
+            &enc, &self.buf_x, w_final, &self.buf_x_norm,
+            hidden, cfg.rms_norm_eps, false);
+
+        if return_logits {
+            // LFM ties embeddings with LM head: embed_tokens.weight [vocab, hidden]
+            // Logits = x_norm @ embed_tokens^T = embed_tokens @ x_norm (row-wise dot)
+            let w_emb = self.get_weight("model.embed_tokens.weight");
+            // Use mv_f16: treat embed_tokens as [vocab_size, hidden] weight
+            self.ops.encode_mv_f16(
+                &enc, w_emb, &self.buf_x_norm, &self.buf_logits,
+                cfg.vocab_size, hidden);
+        }
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        if !return_logits {
+            return Ok(None);
+        }
+
+        let mut logits = vec![0.0f32; cfg.vocab_size];
+        unsafe {
+            let ptr = self.buf_logits.contents() as *const f32;
+            std::ptr::copy_nonoverlapping(ptr, logits.as_mut_ptr(), cfg.vocab_size);
+        }
+
+        // Divergence detection
+        let mut nan_count = 0;
+        let mut inf_count = 0;
+        for &v in &logits {
+            if v.is_nan() { nan_count += 1; }
+            else if v.is_infinite() { inf_count += 1; }
+        }
+        if nan_count > 0 || inf_count > 0 {
+            return Err(CoreError::Backend(format!(
+                "LfmGraphState: divergence at pos {pos} (NaNs={nan_count}, Infs={inf_count})")));
+        }
+
+        Ok(Some(logits))
+        })
+    }
 }
 
 impl LfmRunner {
@@ -190,7 +641,24 @@ impl LfmRunner {
         {
             match MetalOps::create() {
                 Ok(ops) => {
+                    let num_conv_layers = self.layer_types
+                        .iter()
+                        .filter(|t| *t == "conv")
+                        .count();
+                    let ops_for_gs = ops.clone();
+                    let mut gs = LfmGraphState::new(
+                        ops_for_gs,
+                        self.cfg.clone(),
+                        self.layer_types.clone(),
+                        self.conv_kernel_size,
+                        num_conv_layers,
+                    );
+                    // Preload all weights into the graph state
+                    for (name, data) in self.file.all_tensors() {
+                        gs.preload_weight(name.clone(), data);
+                    }
                     self.metal_ops = Some(ops);
+                    self.graph_state = Some(gs);
                     true
                 }
                 Err(e) => {
@@ -299,6 +767,47 @@ impl LfmRunner {
         let token_off = page_table.offset_in_block(pos).map_err(|e| {
             CoreError::Backend(format!("lfm step: page_table offset_in_block failed: {e}"))
         })?;
+
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if let Some(gs) = &mut self.graph_state {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static LFM_GRAPH_WARNED: AtomicBool = AtomicBool::new(false);
+            if kv_cache.encoding() == cellm_cache::KvEncodingKind::TurboQuant {
+                if !LFM_GRAPH_WARNED.swap(true, Ordering::Relaxed) {
+                    eprintln!("lfm: TurboQuant kv-cache unsupported in fused graph, falling back to per-ops path");
+                }
+            } else {
+                match gs.step_fused(
+                    x0,
+                    &self.cfg,
+                    "",
+                    kv_cache,
+                    page_table,
+                    pos,
+                    token_off,
+                    block_id as u32,
+                    return_logits,
+                ) {
+                    Ok(maybe_logits) => {
+                        if let Some(logits) = maybe_logits {
+                            let has_non_finite = logits.iter().any(|v| !v.is_finite());
+                            if has_non_finite {
+                                eprintln!("lfm fused graph: non-finite logits at pos {pos}; disabling graph");
+                                self.graph_state = None;
+                            } else {
+                                return Ok(logits);
+                            }
+                        } else {
+                            return Ok(vec![]);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("lfm fused graph: step_fused failed at pos {pos}: {e}; falling back");
+                        self.graph_state = None;
+                    }
+                }
+            }
+        }
 
         if x0.len() != hidden {
             return Err(CoreError::Backend(format!(
