@@ -653,13 +653,23 @@ impl LfmRunner {
                         self.conv_kernel_size,
                         num_conv_layers,
                     );
-                    // Preload all weights into the graph state
-                    for (name, data) in self.file.all_tensors() {
-                        gs.preload_weight(name.clone(), data);
+                    // Check if model has i4 quantized weights (u32 dtype)
+                    let has_i4 = self.file.header.tensors.iter().any(|t| t.dtype == "u32");
+                    if has_i4 {
+                        // i4 weights can't be used with the fused graph state
+                        // (they need the dequant cache). Use per-layer Metal instead.
+                        eprintln!("lfm: i4 quantized weights detected, skipping fused graph state");
+                        self.metal_ops = Some(ops);
+                        true
+                    } else {
+                        // Preload all weights into the graph state
+                        for (name, data) in self.file.all_tensors() {
+                            gs.preload_weight(name.clone(), data);
+                        }
+                        self.metal_ops = Some(ops);
+                        self.graph_state = Some(gs);
+                        true
                     }
-                    self.metal_ops = Some(ops);
-                    self.graph_state = Some(gs);
-                    true
                 }
                 Err(e) => {
                     eprintln!("lfm: failed to enable metal backend: {e}");
