@@ -92,6 +92,7 @@ pub struct MetalMatmul {
     pub _lib: Library,
     pub pso: ComputePipelineState,
     pub pso_vec4: ComputePipelineState,
+    pub pso_tiled: ComputePipelineState,
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
@@ -221,11 +222,68 @@ impl MetalKernels {
         }
         "#;
         let (_, pso_vec4) = build_pipeline(&device, src_vec4, "matmul_f32_vec4")?;
+        let src_tiled = r#"
+        #include <metal_stdlib>
+        using namespace metal;
+
+        // Tiled matmul: each threadgroup computes a 16x16 output tile.
+        // Threadgroup memory caches 16x16 tiles of A and B per outer-loop
+        // iteration, dramatically reducing global-memory reads vs the naive
+        // kernel.
+        kernel void matmul_tiled_f32(
+            device const float* a [[buffer(0)]],  // M x K  row-major
+            device const float* b [[buffer(1)]],  // K x N  row-major
+            device       float* out [[buffer(2)]], // M x N  row-major
+            constant     uint&  M     [[buffer(3)]],
+            constant     uint&  N     [[buffer(4)]],
+            constant     uint&  K     [[buffer(5)]],
+            uint2 gid [[threadgroup_position_in_grid]],
+            uint2 lid [[thread_position_in_threadgroup]],
+            uint2 tsize[[threads_per_threadgroup]]
+        ) {
+            const uint TILE = 16;
+            threadgroup float a_tile[TILE][TILE];
+            threadgroup float b_tile[TILE][TILE];
+
+            uint row_start = gid.y * TILE;
+            uint col_start = gid.x * TILE;
+            float acc = 0.0f;
+
+            for (uint k = 0; k < K; k += TILE) {
+                // Cooperative load 16x16 tile of A
+                uint ar = row_start + lid.y;
+                uint ac = k + lid.x;
+                a_tile[lid.y][lid.x] = (ar < M && ac < K) ? a[ar * K + ac] : 0.0f;
+
+                // Cooperative load 16x16 tile of B
+                uint br = k + lid.y;
+                uint bc = col_start + lid.x;
+                b_tile[lid.y][lid.x] = (br < K && bc < N) ? b[br * N + bc] : 0.0f;
+
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                // Accumulate over the tile
+                for (uint i = 0; i < TILE; ++i) {
+                    acc += a_tile[lid.y][i] * b_tile[i][lid.x];
+                }
+
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            uint out_row = row_start + lid.y;
+            uint out_col = col_start + lid.x;
+            if (out_row < M && out_col < N) {
+                out[out_row * N + out_col] = acc;
+            }
+        }
+        "#;
+        let (_, pso_tiled) = build_pipeline(&device, src_tiled, "matmul_tiled_f32")?;
         Ok(MetalMatmul {
             queue,
             _lib: lib,
             pso,
             pso_vec4,
+            pso_tiled,
         })
     }
 }
@@ -246,57 +304,110 @@ impl MetalMatmul {
     /// kernel when `n` is divisible by 4, giving ~2-4x higher GPU ALU
     /// utilization on the vision-encoder-scale matrices that the scalar
     /// kernel struggles with.
-    pub fn matmul_row_major_f32_fast(
-        &self,
-        a_buf: &MetalBuffer,
-        m: usize,
-        k: usize,
-        b_buf: &MetalBuffer,
-        n: usize,
-        out: &mut [f32],
-    ) -> anyhow::Result<()> {
-        if out.len() != m * n {
-            anyhow::bail!("Metal matmul output size mismatch");
+        pub fn matmul_row_major_f32_fast(
+            &self,
+            a_buf: &MetalBuffer,
+            m: usize,
+            k: usize,
+            b_buf: &MetalBuffer,
+            n: usize,
+            out: &mut [f32],
+        ) -> anyhow::Result<()> {
+            if out.len() != m * n {
+                anyhow::bail!("Metal matmul output size mismatch");
+            }
+            let use_vec4 = n % 4 == 0;
+            let pso = if use_vec4 { &self.pso_vec4 } else { &self.pso };
+            autoreleasepool(|| {
+                let out_bytes = (out.len() * 4) as u64;
+                let device = self.queue.device();
+                let out_buf = device.new_buffer(out_bytes, MTLResourceOptions::StorageModeShared);
+
+                let m_u32 = m as u32;
+                let n_u32 = n as u32;
+                let k_u32 = k as u32;
+
+                let cb = self.queue.new_command_buffer();
+                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(pso);
+                enc.set_buffer(0, Some(a_buf), 0);
+                enc.set_buffer(1, Some(b_buf), 0);
+                enc.set_buffer(2, Some(&out_buf), 0);
+                enc.set_bytes(3, 4, (&m_u32 as *const u32).cast());
+                enc.set_bytes(4, 4, (&n_u32 as *const u32).cast());
+                enc.set_bytes(5, 4, (&k_u32 as *const u32).cast());
+
+                let w = pso.thread_execution_width() as u64;
+                let h = pso.max_total_threads_per_threadgroup() as u64 / w;
+                let tg = MTLSize { width: w, height: h, depth: 1 };
+                let grid = if use_vec4 {
+                    MTLSize { width: (n / 4) as u64, height: m as u64, depth: 1 }
+                } else {
+                    MTLSize { width: n as u64, height: m as u64, depth: 1 }
+                };
+                enc.dispatch_threads(grid, tg);
+                enc.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+
+                let out_ptr = out_buf.contents() as *const f32;
+                out.copy_from_slice(unsafe { std::slice::from_raw_parts(out_ptr, out.len()) });
+                Ok(())
+            })
         }
-        let use_vec4 = n % 4 == 0;
-        let pso = if use_vec4 { &self.pso_vec4 } else { &self.pso };
-        autoreleasepool(|| {
-            let out_bytes = (out.len() * 4) as u64;
-            let device = self.queue.device();
-            let out_buf = device.new_buffer(out_bytes, MTLResourceOptions::StorageModeShared);
 
-            let m_u32 = m as u32;
-            let n_u32 = n as u32;
-            let k_u32 = k as u32;
+        /// Tiled matmul using threadgroup memory for cache reuse.
+        /// Uses 16x16 tiles with a 16x16 threadgroup (256 threads).
+        /// Significantly faster than the naive element-wise kernel for matrices
+        /// larger than ~[64, 64] because each element of A and B is read from
+        /// global memory only K/TILE times instead of K times per output element.
+        pub fn matmul_row_major_f32_tiled(
+            &self,
+            a_buf: &MetalBuffer,
+            m: usize,
+            k: usize,
+            b_buf: &MetalBuffer,
+            n: usize,
+            out: &mut [f32],
+        ) -> anyhow::Result<()> {
+            if out.len() != m * n {
+                anyhow::bail!("Metal tiled matmul output size mismatch");
+            }
+            autoreleasepool(|| {
+                let out_bytes = (out.len() * 4) as u64;
+                let device = self.queue.device();
+                let out_buf = device.new_buffer(out_bytes, MTLResourceOptions::StorageModeShared);
 
-            let cb = self.queue.new_command_buffer();
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(pso);
-            enc.set_buffer(0, Some(a_buf), 0);
-            enc.set_buffer(1, Some(b_buf), 0);
-            enc.set_buffer(2, Some(&out_buf), 0);
-            enc.set_bytes(3, 4, (&m_u32 as *const u32).cast());
-            enc.set_bytes(4, 4, (&n_u32 as *const u32).cast());
-            enc.set_bytes(5, 4, (&k_u32 as *const u32).cast());
+                let m_u32 = m as u32;
+                let n_u32 = n as u32;
+                let k_u32 = k as u32;
 
-            let w = pso.thread_execution_width() as u64;
-            let h = pso.max_total_threads_per_threadgroup() as u64 / w;
-            let tg = MTLSize { width: w, height: h, depth: 1 };
-            let grid = if use_vec4 {
-                MTLSize { width: (n / 4) as u64, height: m as u64, depth: 1 }
-            } else {
-                MTLSize { width: n as u64, height: m as u64, depth: 1 }
-            };
-            enc.dispatch_threads(grid, tg);
-            enc.end_encoding();
-            cb.commit();
-            cb.wait_until_completed();
+                let cb = self.queue.new_command_buffer();
+                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&self.pso_tiled);
+                enc.set_buffer(0, Some(a_buf), 0);
+                enc.set_buffer(1, Some(b_buf), 0);
+                enc.set_buffer(2, Some(&out_buf), 0);
+                enc.set_bytes(3, 4, (&m_u32 as *const u32).cast());
+                enc.set_bytes(4, 4, (&n_u32 as *const u32).cast());
+                enc.set_bytes(5, 4, (&k_u32 as *const u32).cast());
 
-            let out_ptr = out_buf.contents() as *const f32;
-            out.copy_from_slice(unsafe { std::slice::from_raw_parts(out_ptr, out.len()) });
-            Ok(())
-        })
-    }
+                // Dispatch 16x16 threadgroups
+                let tg = MTLSize { width: 16, height: 16, depth: 1 };
+                // ceil division for grid
+                let grid_w = (n + 15) / 16;
+                let grid_h = (m + 15) / 16;
+                let grid = MTLSize { width: grid_w as u64, height: grid_h as u64, depth: 1 };
+                enc.dispatch_thread_groups(grid, tg);
+                enc.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+
+                let out_ptr = out_buf.contents() as *const f32;
+                out.copy_from_slice(unsafe { std::slice::from_raw_parts(out_ptr, out.len()) });
+                Ok(())
+            })
+        }
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -1048,6 +1159,59 @@ kernel void scatter_f32(
         dst[offset + gid] = src[gid];
     }
 }
+
+kernel void copy_f32(
+    device const float* src [[buffer(0)]],
+    device       float* dst [[buffer(1)]],
+    constant     uint&  src_offset [[buffer(2)]],
+    constant     uint&  dst_offset [[buffer(3)]],
+    constant     uint&  n           [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid < n) {
+        dst[dst_offset + gid] = src[src_offset + gid];
+    }
+}
+
+kernel void batch_mv_f16(
+    device const ushort* A       [[buffer(0)]],  // [out_dim, in_dim] f16 weights, row-major
+    device const float*  x_all   [[buffer(1)]],  // [num_tokens, in_dim] f32 input
+    device       float*  out_all [[buffer(2)]],  // [num_tokens, out_dim] f32 output
+    constant     uint&   num_tokens [[buffer(3)]],
+    constant     uint&   out_dim    [[buffer(4)]],
+    constant     uint&   in_dim     [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint token_idx = gid.y;
+    uint row = gid.x;
+    if (token_idx >= num_tokens || row >= out_dim) return;
+
+    device const ushort* row_ptr = A + row * in_dim;
+    device const float* x_ptr = x_all + token_idx * in_dim;
+    float acc = 0.0f;
+    for (uint i = 0; i < in_dim; ++i) {
+        acc += x_ptr[i] * float(as_type<half>(row_ptr[i]));
+    }
+    out_all[token_idx * out_dim + row] = acc;
+}
+"#;
+
+const COPY_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void copy_f32(
+    device const float* src [[buffer(0)]],
+    device       float* dst [[buffer(1)]],
+    constant     uint&  src_offset [[buffer(2)]],
+    constant     uint&  dst_offset [[buffer(3)]],
+    constant     uint&  n           [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid < n) {
+        dst[dst_offset + gid] = src[src_offset + gid];
+    }
+}
 "#;
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -1074,6 +1238,8 @@ pub struct MetalOps {
     pub pso_attention_gqa: ComputePipelineState,
     pub pso_attention_gqa_fast: ComputePipelineState,
     pub pso_scatter_f32: ComputePipelineState,
+    pub pso_copy_f32: ComputePipelineState,
+    pub pso_batch_mv_f16: ComputePipelineState,
 
     x_buf: Mutex<Option<Buffer>>,
     out_buf: Mutex<Option<Buffer>>,
@@ -1111,6 +1277,8 @@ impl Clone for MetalOps {
             pso_attention_gqa: self.pso_attention_gqa.clone(),
             pso_attention_gqa_fast: self.pso_attention_gqa_fast.clone(),
             pso_scatter_f32: self.pso_scatter_f32.clone(),
+            pso_copy_f32: self.pso_copy_f32.clone(),
+            pso_batch_mv_f16: self.pso_batch_mv_f16.clone(),
             x_buf: Mutex::new(None),
             out_buf: Mutex::new(None),
             tensor_cache: Mutex::new(HashMap::new()),
@@ -1121,13 +1289,130 @@ impl Clone for MetalOps {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+#[derive(Clone)]
 pub struct MetalOps;
 
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
 impl MetalOps {
-    pub fn encode_gelu_tanh_mul_f32_inplace(&self, _enc: &(), _gate: &(), _up: &(), _n: usize) {}
-    pub fn encode_rms_norm_f16w_at(&self, _enc: &(), _x: &(), _xo: u64, _w: &(), _wo: u64, _out: &(), _oo: u64, _n: usize, _eps: f32, _add: bool) {}
-    pub fn encode_lfm_conv(&self, _enc: &(), _state: &(), _input: &(), _kernel: &(), _out: &(), _ks: usize, _hidden: usize) {}
+    pub fn create() -> anyhow::Result<Self> {
+        anyhow::bail!("MetalOps only supported on macOS/iOS")
+    }
+    pub fn ensure_layer_kv_cache(&self, _: usize, _: usize, _: usize) -> anyhow::Result<()> {
+        anyhow::bail!("Metal not available on this platform")
+    }
+    pub fn write_kv_token(&self, _: usize, _: usize, _: usize, _: &[f32], _: &[f32]) -> anyhow::Result<()> {
+        anyhow::bail!("Metal not available on this platform")
+    }
+    pub fn get_kv_cache_buffers(&self, _: usize) -> Option<(MetalBuffer, MetalBuffer)> { None }
+    pub fn ensure_named_buf(&self, _: &str, _: usize) -> anyhow::Result<()> {
+        anyhow::bail!("Metal not available on this platform")
+    }
+    pub fn write_named_buf(&self, _: &str, _: &[f32]) -> anyhow::Result<()> {
+        anyhow::bail!("Metal not available on this platform")
+    }
+    pub fn read_named_buf(&self, _: &str, _: &mut [f32]) -> anyhow::Result<()> {
+        anyhow::bail!("Metal not available on this platform")
+    }
+    pub fn get_named_buf(&self, _: &str) -> anyhow::Result<MetalBuffer> {
+        anyhow::bail!("Metal not available on this platform")
+    }
+    pub fn ensure_tensor_cached(&self, _: &str, _: &[u16]) -> anyhow::Result<MetalBuffer> {
+        anyhow::bail!("Metal not available on this platform")
+    }
+    pub fn ensure_tensor_cached_f32(&self, _: &str, _: &[f32]) -> anyhow::Result<MetalBuffer> {
+        anyhow::bail!("Metal not available on this platform")
+    }
+    pub fn ensure_tensor_cached_i8(&self, _: &str, _: &[i8]) -> anyhow::Result<MetalBuffer> {
+        anyhow::bail!("Metal not available on this platform")
+    }
+    pub fn get_cached_tensor(&self, _: &str) -> Option<MetalBuffer> { None }
+    pub fn ensure_tensor_cached_i4(&self, _: &str, _: &[u8], _: &str, _: &[u16]) -> anyhow::Result<(MetalBuffer, MetalBuffer)> {
+        anyhow::bail!("Metal not available on this platform")
+    }
+    pub fn run_batch<F>(&self, _: F) -> anyhow::Result<()> where F: FnOnce(&()) -> anyhow::Result<()> {
+        anyhow::bail!("Metal not available on this platform")
+    }
+    pub fn lfm_conv(&self, _: &mut [f32], _: &[f32], _: &[u16], _: usize, _: usize, _: &str, _: &mut [f32]) -> anyhow::Result<()> {
+        anyhow::bail!("Metal not available on this platform")
+    }
+    pub fn rms_norm_f16w(&self, _: &[f32], _: &[u16], _: f32, _: bool, _: &str, _: &mut [f32]) -> anyhow::Result<()> {
+        anyhow::bail!("Metal not available on this platform")
+    }
+    pub fn encode_rms_norm_f16w(&self, _enc: &(), _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: usize, _: f32, _: bool) {}
+    pub fn rope_half_f32(&self, _: &mut [f32], _: usize, _: usize, _: usize, _: usize, _: f32) -> anyhow::Result<()> {
+        anyhow::bail!("Metal not available on this platform")
+    }
+    pub fn encode_rope_half_f32(&self, _enc: &(), _: &MetalBuffer, _: usize, _: usize, _: usize, _: usize, _: f32) {}
+    pub fn encode_rope_half_f32_at(&self, _enc: &(), _: &MetalBuffer, _: u64, _: usize, _: usize, _: usize, _: usize, _: f32) {}
+    pub fn rope_adj_f32(&self, _: &mut [f32], _: usize, _: usize, _: usize, _: f32) -> anyhow::Result<()> {
+        anyhow::bail!("Metal not available on this platform")
+    }
+    pub fn encode_rope_adj_f32(&self, _enc: &(), _: &MetalBuffer, _: usize, _: usize, _: usize, _: f32) {}
+    pub fn encode_rope_adj_f32_at(&self, _enc: &(), _: &MetalBuffer, _: u64, _: usize, _: usize, _: usize, _: f32) {}
+    pub fn encode_mv_f16_bias(&self, _enc: &(), _: &MetalBuffer, _: &MetalBuffer, _: Option<&MetalBuffer>, _: &MetalBuffer, _: usize, _: usize) {}
+    pub fn encode_mv_f16_bias_at(&self, _enc: &(), _: &MetalBuffer, _: &MetalBuffer, _: u64, _: Option<&MetalBuffer>, _: u64, _: &MetalBuffer, _: u64, _: usize, _: usize) {}
+    pub fn encode_mv_i8_bias(&self, _enc: &(), _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: Option<&MetalBuffer>, _: &MetalBuffer, _: usize, _: usize) {}
+    pub fn encode_mv_i8_bias_at(&self, _enc: &(), _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: u64, _: Option<&MetalBuffer>, _: u64, _: &MetalBuffer, _: u64, _: usize, _: usize) {}
+    pub fn encode_qkv_f16_bias(&self, _enc: &(), _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: Option<&MetalBuffer>, _: Option<&MetalBuffer>, _: Option<&MetalBuffer>, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: usize, _: usize, _: usize) {}
+    pub fn encode_qkv_f16_bias_at(&self, _enc: &(), _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: u64, _: Option<&MetalBuffer>, _: u64, _: Option<&MetalBuffer>, _: u64, _: Option<&MetalBuffer>, _: u64, _: &MetalBuffer, _: u64, _: &MetalBuffer, _: u64, _: &MetalBuffer, _: u64, _: usize, _: usize, _: usize) {}
+    pub fn encode_qkv_i8_bias(&self, _enc: &(), _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: Option<&MetalBuffer>, _: Option<&MetalBuffer>, _: Option<&MetalBuffer>, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: usize, _: usize, _: usize) {}
+    pub fn encode_qkv_i8_bias_at(&self, _enc: &(), _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: u64, _: Option<&MetalBuffer>, _: u64, _: Option<&MetalBuffer>, _: u64, _: Option<&MetalBuffer>, _: u64, _: &MetalBuffer, _: u64, _: &MetalBuffer, _: u64, _: &MetalBuffer, _: u64, _: usize, _: usize, _: usize) {}
+    pub fn encode_add_f32_inplace(&self, _enc: &(), _: &MetalBuffer, _: &MetalBuffer, _: usize) {}
+    pub fn encode_add_f32_inplace_at(&self, _enc: &(), _: &MetalBuffer, _: u64, _: &MetalBuffer, _: u64, _: usize) {}
+    pub fn encode_scatter_f32(&self, _enc: &(), _: &MetalBuffer, _: &MetalBuffer, _: usize, _: usize) {}
+    pub fn encode_copy_f32(&self, _enc: &(), _: &MetalBuffer, _: &MetalBuffer, _: usize, _: usize, _: usize) {}
+    pub fn encode_silu_mul_f32_inplace(&self, _enc: &(), _: &MetalBuffer, _: &MetalBuffer, _: usize) {}
+    pub fn encode_gelu_tanh_mul_f32_inplace(&self, _enc: &(), _: &MetalBuffer, _: &MetalBuffer, _: usize) {}
+    pub fn encode_rms_norm_f16w_at(&self, _enc: &(), _: &MetalBuffer, _: u64, _: &MetalBuffer, _: u64, _: &MetalBuffer, _: u64, _: usize, _: f32, _: bool) {}
+    pub fn logits_qkv_f16(&self, _: &[f32], _: &[u16], _: &[u16], _: &[u16], _: usize, _: usize, _: usize, _: usize, _: &str, _: &str, _: &str, _: &mut [f32], _: &mut [f32], _: &mut [f32]) -> anyhow::Result<()> {
+        anyhow::bail!("Metal not available on this platform")
+    }
+    pub fn logits_f16(&self, _: &[f32], _: &[u16], _: usize, _: usize, _: &str, _: &mut [f32]) -> anyhow::Result<()> {
+        anyhow::bail!("Metal not available on this platform")
+    }
+    pub fn logits_i8(&self, _: &[f32], _: &[i8], _: &[u16], _: usize, _: usize, _: &str, _: &mut [f32]) -> anyhow::Result<()> {
+        anyhow::bail!("Metal not available on this platform")
+    }
+    pub fn logits_q1(&self, _: &[f32], _: &[u8], _: usize, _: usize, _: &str, _: &mut [f32]) -> anyhow::Result<()> {
+        anyhow::bail!("Metal not available on this platform")
+    }
+    pub fn encode_mv_f16(&self, _enc: &(), _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: usize, _: usize) {}
+    pub fn encode_batch_mv_f16(&self, _: &(), _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: usize, _: usize, _: usize) {}
+    pub fn encode_mv_i8(&self, _enc: &(), _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: usize, _: usize) {}
+    pub fn encode_qkv_f16(&self, _enc: &(), _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: usize, _: usize, _: usize) {}
+    pub fn logits_f32(&self, _: &[f32], _: &[f32], _: usize, _: usize, _: &str, _: &mut [f32]) -> anyhow::Result<()> {
+        anyhow::bail!("Metal not available on this platform")
+    }
+    pub fn encode_mv_f32(&self, _enc: &(), _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: usize, _: usize) {}
+    pub fn encode_attention_gqa_f32(&self, _enc: &(), _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: usize, _: usize, _: usize, _: usize, _: f32, _: f32, _: usize) {}
+    pub fn encode_lfm_conv(&self, _enc: &(), _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: usize, _: usize) {}
+    pub fn encode_qkv_i8(&self, _enc: &(), _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: usize, _: usize, _: usize) {}
+    pub fn encode_mv_q1(&self, _enc: &(), _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: usize, _: usize) {}
+    pub fn encode_mv_i4(&self, _enc: &(), _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: usize, _: usize, _: usize) {}
+    pub fn logits_i4(&self, _: &[f32], _: &[u8], _: &[u16], _: usize, _: usize, _: usize, _: &str, _: &mut [f32]) -> anyhow::Result<()> {
+        anyhow::bail!("Metal not available on this platform")
+    }
+    pub fn attention_and_proj_i4(&self, _: &[f32], _: &[f32], _: &[f32], _: usize, _: usize, _: usize, _: usize, _: usize, _: f32, _: f32, _: &[u8], _: &[u16], _: usize, _: usize, _: &str, _: &mut [f32]) -> anyhow::Result<()> {
+        anyhow::bail!("Metal not available on this platform")
+    }
+    pub fn project_qkv_norm_rope_i4(&self, _: &[f32], _: &[u8], _: &[u16], _: usize, _: &str, _: &[u8], _: &[u16], _: usize, _: &str, _: &[u8], _: &[u16], _: usize, _: &str, _: usize, _: Option<&[u16]>, _: Option<&[u16]>, _: f32, _: usize, _: usize, _: usize, _: usize, _: usize, _: &mut [f32], _: &mut [f32]) -> anyhow::Result<()> {
+        anyhow::bail!("Metal not available on this platform")
+    }
+    pub fn attention_and_proj_i4_preloaded_q(&self, _: &str, _: &[f32], _: &[f32], _: usize, _: usize, _: usize, _: usize, _: usize, _: f32, _: f32, _: &[u8], _: &[u16], _: usize, _: usize, _: &str, _: &mut [f32]) -> anyhow::Result<()> {
+        anyhow::bail!("Metal not available on this platform")
+    }
+    pub fn attention_and_proj_i4_persistent_kv(&self, _: &[f32], _: &MetalBuffer, _: &MetalBuffer, _: usize, _: usize, _: usize, _: usize, _: usize, _: f32, _: f32, _: &[u8], _: &[u16], _: usize, _: usize, _: &str, _: &mut [f32]) -> anyhow::Result<()> {
+        anyhow::bail!("Metal not available on this platform")
+    }
+    pub fn batch_mv_i4(&self, _: &[f32], _: &[(&[u8], &[u16], usize, usize, usize, &str)], _: &mut [&mut [f32]]) -> anyhow::Result<()> {
+        anyhow::bail!("Metal not available on this platform")
+    }
+    pub fn fused_mlp_i4(&self, _: &[f32], _: &[f32], _: &[u8], _: &[u16], _: usize, _: &str, _: &[u8], _: &[u16], _: usize, _: &str, _: &[u8], _: &[u16], _: usize, _: &str, _: Option<&[u16]>, _: Option<&str>, _: f32, _: bool, _: usize, _: &mut [f32]) -> anyhow::Result<()> {
+        anyhow::bail!("Metal not available on this platform")
+    }
+    pub fn fused_post_attn_residual_mlp_i4(&self, _: &[f32], _: &[f32], _: &[u16], _: f32, _: bool, _: &[u16], _: f32, _: bool, _: &[u8], _: &[u16], _: usize, _: &str, _: &[u8], _: &[u16], _: usize, _: &str, _: &[u8], _: &[u16], _: usize, _: &str, _: Option<&[u16]>, _: Option<&str>, _: f32, _: bool, _: usize, _: &mut [f32]) -> anyhow::Result<()> {
+        anyhow::bail!("Metal not available on this platform")
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -1165,11 +1450,17 @@ impl MetalOps {
         let pso_attention_gqa = build_pso_ops(&device, &lib, "attention_gqa_f32")?;
         let pso_attention_gqa_fast = build_pso_ops(&device, &lib, "attention_gqa_f32_fast")?;
         let pso_scatter_f32 = build_pso_ops(&device, &lib, "scatter_f32")?;
+        let pso_batch_mv_f16 = build_pso_ops(&device, &lib, "batch_mv_f16")?;
+
+        // Compile the copy kernel from its own shader string
+        let copy_lib = load_or_compile_metallib(&device, COPY_SHADER, false, "cellm_copy")
+            .map_err(|e| anyhow::anyhow!("Copy kernel compile failed: {e:?}"))?;
+        let pso_copy_f32 = build_pso_ops(&device, &copy_lib, "copy_f32")?;
 
         Ok(Self {
             device, queue, _lib: lib.clone(),
             pso_rms_norm, pso_rope_adj, pso_rope_half, pso_mv_f16, pso_mv_i8, pso_mv_i4, pso_mv_qkv_f16, pso_mv_qkv_i8, pso_mv2_f16, pso_mv2_i8,
-            pso_add_f32, pso_silu_mul_f32, pso_gelu_mul_f32, pso_mv_q1, pso_lfm_conv, pso_mv_f32, pso_attention_gqa, pso_attention_gqa_fast, pso_scatter_f32,
+            pso_add_f32, pso_silu_mul_f32, pso_gelu_mul_f32, pso_mv_q1, pso_lfm_conv, pso_mv_f32, pso_attention_gqa, pso_attention_gqa_fast, pso_scatter_f32, pso_copy_f32, pso_batch_mv_f16,
             x_buf: Mutex::new(None), out_buf: Mutex::new(None),
             tensor_cache: Mutex::new(HashMap::new()),
             named_bufs: Mutex::new(HashMap::new()),
@@ -1349,7 +1640,7 @@ impl MetalOps {
         let ob_lock = self.out_buf.lock().unwrap();
         let xb = xb_lock.as_ref().unwrap();
         let ob = ob_lock.as_ref().unwrap();
-        
+
         write_f32(xb, input)?;
         autoreleasepool(|| {
             let cb = self.queue.new_command_buffer();
@@ -1363,7 +1654,7 @@ impl MetalOps {
         // Copy state back to CPU
         let ptr = sb.contents() as *const f32;
         unsafe { std::ptr::copy_nonoverlapping(ptr, state.as_mut_ptr(), state.len()); }
-        
+
         read_f32(ob, out)
     }
 
@@ -1652,6 +1943,21 @@ impl MetalOps {
         enc.dispatch_threads(MTLSize { width: threads, height: 1, depth: 1 }, MTLSize { width: w.min(threads), height: 1, depth: 1 });
     }
 
+    pub fn encode_copy_f32(&self, enc: &metal::ComputeCommandEncoderRef, src: &metal::BufferRef, dst: &metal::BufferRef, src_offset: usize, dst_offset: usize, n: usize) {
+        let src_off = src_offset as u32;
+        let dst_off = dst_offset as u32;
+        let n32 = n as u32;
+        enc.set_compute_pipeline_state(&self.pso_copy_f32);
+        enc.set_buffer(0, Some(src), 0);
+        enc.set_buffer(1, Some(dst), 0);
+        enc.set_bytes(2, 4, (&src_off as *const u32).cast());
+        enc.set_bytes(3, 4, (&dst_off as *const u32).cast());
+        enc.set_bytes(4, 4, (&n32 as *const u32).cast());
+        let threads = n as u64;
+        let w = self.pso_copy_f32.thread_execution_width() as u64;
+        enc.dispatch_threads(MTLSize { width: threads, height: 1, depth: 1 }, MTLSize { width: w.min(threads), height: 1, depth: 1 });
+    }
+
     pub fn encode_silu_mul_f32_inplace(&self, enc: &metal::ComputeCommandEncoderRef, a: &metal::BufferRef, b: &metal::BufferRef, n: usize) {
         let n32 = n as u32;
         enc.set_compute_pipeline_state(&self.pso_silu_mul_f32);
@@ -1794,6 +2100,27 @@ impl MetalOps {
     pub fn encode_qkv_f16(&self, enc: &metal::ComputeCommandEncoderRef, w_q: &metal::Buffer, w_k: &metal::Buffer, w_v: &metal::Buffer, x_buf: &metal::Buffer, q_out: &metal::Buffer, k_out: &metal::Buffer, v_out: &metal::Buffer, rows_q: usize, rows_kv: usize, cols: usize) {
         self.encode_qkv_f16_bias(enc, w_q, w_k, w_v, x_buf, None, None, None, q_out, k_out, v_out, rows_q, rows_kv, cols);
     }
+
+    pub fn encode_batch_mv_f16(&self, enc: &metal::ComputeCommandEncoderRef,
+        weight: &metal::Buffer, x_all: &metal::Buffer, out_all: &metal::Buffer,
+        num_tokens: usize, out_dim: usize, in_dim: usize)
+    {
+        let nt = num_tokens as u32;
+        let od = out_dim as u32;
+        let id = in_dim as u32;
+        enc.set_compute_pipeline_state(&self.pso_batch_mv_f16);
+        enc.set_buffer(0, Some(weight), 0);
+        enc.set_buffer(1, Some(x_all), 0);
+        enc.set_buffer(2, Some(out_all), 0);
+        enc.set_bytes(3, 4, (&nt as *const u32).cast());
+        enc.set_bytes(4, 4, (&od as *const u32).cast());
+        enc.set_bytes(5, 4, (&id as *const u32).cast());
+        let grid = MTLSize { width: out_dim as u64, height: num_tokens as u64, depth: 1 };
+        let w = self.pso_batch_mv_f16.thread_execution_width() as u64;
+        let tg = MTLSize { width: w, height: 1, depth: 1 };
+        enc.dispatch_threads(grid, tg);
+    }
+
     pub fn logits_f32(&self, x: &[f32], weights_f32: &[f32], vocab: usize, hidden: usize, cache_key: &str, out: &mut [f32]) -> anyhow::Result<()> {
         if !self.tensor_cache.lock().unwrap().contains_key(cache_key) {
             self.tensor_cache.lock().unwrap().insert(cache_key.to_string(), upload_f32(&self.device, weights_f32)?);
@@ -1925,13 +2252,13 @@ impl MetalOps {
         let cache = self.tensor_cache.lock().unwrap();
         let wb = cache.get(&w_key).unwrap();
         let sb = cache.get(&s_key).unwrap();
-        
+
         ensure_buf_f32(&self.device, &mut *self.x_buf.lock().unwrap(), hidden)?;
         ensure_buf_f32(&self.device, &mut *self.out_buf.lock().unwrap(), vocab)?;
         let xb_ref = self.x_buf.lock().unwrap(); let xb = xb_ref.as_ref().unwrap();
         let ob_ref = self.out_buf.lock().unwrap(); let ob = ob_ref.as_ref().unwrap();
         write_f32(xb, x)?;
-        
+
         autoreleasepool(|| {
             let cb = self.queue.new_command_buffer();
             let enc = cb.new_compute_command_encoder();
@@ -2752,12 +3079,12 @@ fn build_pso_ops(device: &metal::DeviceRef, lib: &Library, name: &str) -> anyhow
     if cache_guard.is_none() {
         *cache_guard = Some(HashMap::new());
     }
-    
+
     let cache = cache_guard.as_mut().unwrap();
     if let Some(pso) = cache.get(name) {
         return Ok(pso.clone());
     }
-    
+
     let f = lib.get_function(name, None).map_err(|_| anyhow::anyhow!("Missing function {name}"))?;
     let pso = device.new_compute_pipeline_state_with_function(&f).map_err(|e| anyhow::anyhow!("PSO {name} failed: {e:?}"))?;
     cache.insert(name.to_string(), pso.clone());

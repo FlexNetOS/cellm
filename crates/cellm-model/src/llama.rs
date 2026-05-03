@@ -205,10 +205,15 @@ impl LlamaRunner {
         }
     }
 
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub fn reserve_metal_sequence_capacity(&mut self, max_seq: usize) {
         if let Some(gs) = &mut self.graph_state {
             gs.reserve_sequence_capacity(max_seq, self.cfg.num_hidden_layers);
         }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    pub fn reserve_metal_sequence_capacity(&mut self, _max_seq: usize) {
+        // no-op on non-Apple platforms
     }
 
     pub fn embed_token_hidden(&self, token: u32, out: &mut [f32]) -> Result<(), CoreError> {
@@ -311,19 +316,19 @@ impl LlamaRunner {
                 })?;
             }
         }
-        // NOTE: prefill_fused method doesn't exist in LlamaGraphState yet
-        // #[cfg(any(target_os = "macos", target_os = "ios"))]
-        // {
-        //     if let Some(gs) = &mut self.graph_state {
-        //         if kv_cache.encoding() != cellm_cache::KvEncodingKind::TurboQuant {
-        //             return gs.prefill_fused(
-        //                 x_all, &self.cfg, &self.tensor_prefix,
-        //                 kv_cache, page_table, start_pos, return_logits,
-        //             );
-        //         }
-        //     }
-        // }
-        // Fallback to per-token CPU path.
+        // Use batched GPU prefill when available (eliminates N-1 command buffers).
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            if let Some(gs) = &mut self.graph_state {
+                if kv_cache.encoding() != cellm_cache::KvEncodingKind::TurboQuant {
+                    return gs.prefill_fused(
+                        x_all, &self.cfg, &self.tensor_prefix,
+                        kv_cache, page_table, start_pos, return_logits,
+                    );
+                }
+            }
+        }
+        // Fallback to per-token path (non-Metal or TurboQuant KV cache).
         for i in 0..num_tokens {
             let pos = start_pos + i;
             let mut x = vec![0.0f32; self.cfg.hidden_size];

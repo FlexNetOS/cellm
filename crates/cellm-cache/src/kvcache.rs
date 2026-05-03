@@ -1543,13 +1543,13 @@ impl MetalKvStorage {
                     shared_score = s;
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                
+
                 float score = shared_score;
                 float old_max = max_score;
                 max_score = max(max_score, score);
                 float exp_prev = (old_max == -INFINITY) ? 0.0f : exp(old_max - max_score);
                 float exp_curr = exp(score - max_score);
-                
+
                 denom = denom * exp_prev + exp_curr;
                 for (uint i = tid, j = 0; i < head_dim; i += TGSIZE, ++j) {
                     v_acc[j] = v_acc[j] * exp_prev + exp_curr * float(v_cache[base + i]);
@@ -1688,13 +1688,13 @@ impl MetalKvStorage {
                     shared_score = s;
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                
+
                 float score = shared_score;
                 float old_max = max_score;
                 max_score = max(max_score, score);
                 float exp_prev = (old_max == -INFINITY) ? 0.0f : exp(old_max - max_score);
                 float exp_curr = exp(score - max_score);
-                
+
                 denom = denom * exp_prev + exp_curr;
                 for (uint i = lane, j = 0; i < head_dim; i += TGSIZE, ++j) {
                     v_acc[j] = v_acc[j] * exp_prev + exp_curr * float(v_cache[base + i]);
@@ -2692,11 +2692,11 @@ impl DeviceKvStorage for MetalKvStorage {
         } else {
             let soft_cap_val = soft_cap.unwrap_or(0.0f32);
             let soft_cap_ptr = (&soft_cap_val as *const f32).cast();
-            
+
             let cmd = self.queue.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&self.pso_attn_single_gqa_f32);
-            
+
             enc.set_buffer(0, Some(&self.k), 0);
             enc.set_buffer(1, Some(&self.v), 0);
             enc.set_buffer(2, Some(&bases_buf), 0);
@@ -2988,14 +2988,19 @@ impl KVCache {
                     layout.head_dim,
                 )?)
             }
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             (KvStorageKind::Metal, enc) => Box::new(MetalKvStorage::new(
                 total_elems,
                 layout.num_kv_heads,
                 layout.head_dim,
                 enc,
             )?),
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            (KvStorageKind::Metal, _) => Box::new(CpuKvStorage {
+                k: vec![f16::from_f32(0.0); total_elems],
+                v: vec![f16::from_f32(0.0); total_elems],
+            }),
         };
-
         Ok(Self {
             allocator: BlockAllocator::new(layout.total_blocks),
             layout,
@@ -3147,7 +3152,7 @@ impl MetalKvStorage {
         let grid = metal::MTLSize { width: n_heads as u64, height: num_tokens as u64, depth: 1 };
         enc.dispatch_thread_groups(grid, tg);
     }
-    
+
     pub fn encode_write_token_f32(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
@@ -3171,7 +3176,7 @@ impl MetalKvStorage {
         enc.set_buffer(3, Some(v_buf), 0);
         enc.set_bytes(4, 4, base_ptr);
         enc.set_bytes(5, 4, items_ptr);
-        
+
         let threads = kv_dim as u64;
         let w = self.pso_write_f32.thread_execution_width() as u64;
         let tg = metal::MTLSize { width: w.min(threads), height: 1, depth: 1 };

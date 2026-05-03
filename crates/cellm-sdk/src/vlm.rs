@@ -828,19 +828,72 @@ fn run_decode_cellm(
             }
         }
     } else {
-        for &tok_id in input_ids.iter() {
-            let is_img = !prefix_image_features && tok_id == image_token_id;
+        // For best performance, batch consecutive image tokens together
+        // using `prefill_fused_hidden` instead of one-at-a-time step_from_hidden.
+        let mut i = 0usize;
+        while i < input_ids.len() {
+            let tok_id = input_ids[i];
+            let is_img = tok_id == image_token_id;
             if is_img {
-                if image_idx >= image_features.shape()[0] {
+                // Find the run of consecutive image tokens
+                let run_start = i;
+                while i < input_ids.len() && input_ids[i] == image_token_id {
+                    i += 1;
+                }
+                let run_len = i - run_start;
+
+                // Collect the hidden states for all image tokens in this run
+                if image_idx + run_len > image_features.shape()[0] {
                     anyhow::bail!("image token count mismatch: prompt has more <image> tokens than vision features");
                 }
-                if std::env::var("CELLM_VLM_ZERO_IMAGE_FEATURES").is_ok() {
-                    x.fill(0.0);
+
+                let use_metal_batch = cfg.backend == BackendKind::Metal
+                    && matches!(&runner, DecodeRunner::Llama(_))
+                    && run_len > 1;
+
+                if use_metal_batch {
+                    // Batch process all image tokens in one command buffer
+                    let mut x_all = Vec::with_capacity(run_len * hidden);
+                    for j in 0..run_len {
+                        if std::env::var("CELLM_VLM_ZERO_IMAGE_FEATURES").is_ok() {
+                            x_all.extend(std::iter::repeat(0.0f32).take(hidden));
+                        } else {
+                            let src = image_features.index_axis(Axis(0), image_idx + j);
+                            x_all.extend_from_slice(src.as_slice().context("vision feature row not contiguous")?);
+                        }
+                    }
+                    if let DecodeRunner::Llama(r) = &mut runner {
+                        r.prefill_fused_hidden(&x_all, pos, &mut page_table, &mut kv_cache, false)
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    }
+                    // Update x to last image token's hidden state for the caller
+                    let last_src = image_features.index_axis(Axis(0), image_idx + run_len - 1);
+                    x.copy_from_slice(last_src.as_slice().context("vision feature row not contiguous")?);
+                    pos += run_len;
+                    image_idx += run_len;
                 } else {
-                    let src = image_features.index_axis(Axis(0), image_idx);
-                    x.copy_from_slice(src.as_slice().context("vision feature row not contiguous")?);
+                    // Fallback: process one by one
+                    for _ in 0..run_len {
+                        if std::env::var("CELLM_VLM_ZERO_IMAGE_FEATURES").is_ok() {
+                            x.fill(0.0);
+                        } else {
+                            let src = image_features.index_axis(Axis(0), image_idx);
+                            x.copy_from_slice(src.as_slice().context("vision feature row not contiguous")?);
+                        }
+                        image_idx += 1;
+                        match &mut runner {
+                            DecodeRunner::Llama(r) => r
+                                .step_from_hidden(&x, pos, &mut page_table, &mut kv_cache)
+                                .map_err(|e| anyhow::anyhow!("{e}"))?,
+                            DecodeRunner::Gemma(r) => {
+                                let _ = r
+                                    .step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
+                                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                            }
+                        }
+                        pos += 1;
+                    }
                 }
-                image_idx += 1;
             } else {
                 match &runner {
                     DecodeRunner::Llama(r) => r
@@ -851,21 +904,19 @@ fn run_decode_cellm(
                         .map_err(|e| anyhow::anyhow!("{e}"))?,
                 }
                 recent.push(tok_id as u32);
-            }
-            match &mut runner {
-                DecodeRunner::Llama(r) => r
-                    .step_from_hidden(&x, pos, &mut page_table, &mut kv_cache)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?,
-                DecodeRunner::Gemma(r) => {
-                    let _ = if is_img {
-                        r.step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
-                    } else {
-                        r.step_topk_from_hidden_with_token(tok_id as u32, &x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
+                match &mut runner {
+                    DecodeRunner::Llama(r) => r
+                        .step_from_hidden(&x, pos, &mut page_table, &mut kv_cache)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?,
+                    DecodeRunner::Gemma(r) => {
+                        let _ = r
+                            .step_topk_from_hidden_with_token(tok_id as u32, &x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
                     }
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
                 }
+                pos += 1;
+                i += 1;
             }
-            pos += 1;
         }
     }
     if image_idx != image_features.shape()[0] {
@@ -1321,7 +1372,7 @@ fn run_vision_cellm(
         linear_rows(
             &norm1, batched_tokens, hidden, &layer.v_w, hidden, Some(&layer.v_b), &mut v, &mut linear_backend,
         );
-        
+
         for img in 0..nimg {
             let offset = img * num_tokens * hidden;
             self_attention_full(
@@ -1393,7 +1444,7 @@ fn run_vision_cellm(
 
     let total_out_rows = nimg * out_tokens_per_image;
     let mut packed_tokens = vec![0.0f32; total_out_rows * projector_in];
-    
+
     for img in 0..nimg {
         let img_offset = img * num_tokens * hidden;
         let img_tokens = &tokens[img_offset..img_offset + num_tokens * hidden];
@@ -1427,14 +1478,14 @@ fn run_vision_cellm(
         &mut flat_out,
         &mut linear_backend,
     );
-    
+
     for r in 0..total_out_rows {
         for c in 0..text_hidden {
             out[[r, c]] = flat_out[r * text_hidden + c];
         }
     }
     encoder_ms += encoder_start.elapsed().as_secs_f64() * 1000.0;
-    
+
     if std::env::var("CELLM_STEP_TIMING").is_ok() {
         eprintln!("VISION_ENCODER patch={:.1}ms total_encoder={:.1}ms", patch_ms, encoder_ms);
         let sum_layers: f64 = encoder_layer_ms.iter().sum();
@@ -3150,6 +3201,9 @@ fn linear_rows(
         // The Metal matmul kernel is a naive element-wise implementation that
         // is orders of magnitude slower than cblas_sgemm (Accelerate/AMX)
         // for large encoder-scale matrices. Skip it for large batch sizes.
+        // We keep the tiled Metal matmul for small-to-medium matrices where
+        // dispatch overhead is low (< 16K ops), and fall through to CPU BLAS
+        // for larger matrices which is faster on Apple Silicon's AMX.
         let total_ops = rows * in_dim * out_dim;
         let skip_metal = total_ops >= (1 << 20);
         if skip_metal {
@@ -3172,8 +3226,15 @@ fn linear_rows(
 
             if let Some(b_buf) = weight_t_cache.get(&key) {
                 if let Ok(a_buf) = ctx.upload_f32(input) {
-                    ctx.matmul_row_major_f32_with_b_buffer(&a_buf, rows, in_dim, b_buf, out_dim, out)
-                        .is_ok()
+                    // Use tiled matmul for sizes where it's competitive,
+                    // naive kernel for tiny matrices.
+                    if total_ops >= (1 << 10) {
+                        ctx.matmul_row_major_f32_tiled(&a_buf, rows, in_dim, b_buf, out_dim, out)
+                            .is_ok()
+                    } else {
+                        ctx.matmul_row_major_f32_with_b_buffer(&a_buf, rows, in_dim, b_buf, out_dim, out)
+                            .is_ok()
+                    }
                 } else {
                     false
                 }
@@ -3370,7 +3431,7 @@ fn self_attention_full(
                         continue;
                     }
                 }
-                
+
                 let mut mx = f32::NEG_INFINITY;
                 for j in 0..seq {
                     if let Some(mask) = valid_mask {
@@ -3382,14 +3443,14 @@ fn self_attention_full(
                         mx = score[i * seq + j];
                     }
                 }
-                
+
                 let mut sum = 0.0f32;
                 for j in 0..seq {
                     let p = (score[i * seq + j] - mx).exp();
                     score[i * seq + j] = p;
                     sum += p;
                 }
-                
+
                 let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
                 for j in 0..seq {
                     score[i * seq + j] *= inv;
@@ -3414,7 +3475,7 @@ fn self_attention_full(
                     hidden as i32,
                 );
             }
-            
+
             if let Some(mask) = valid_mask {
                 for i in 0..seq {
                     if !mask[i] {
