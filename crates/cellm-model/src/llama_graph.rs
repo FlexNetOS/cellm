@@ -234,12 +234,21 @@ impl LlamaGraphState {
             }
         }).collect();
 
-        // ---- 4. Allocate per-token Q buffer for batched attention ----
+        // ---- 4. Allocate per-token buffers ----
         let all_tokens_bytes = (num_tokens * hidden * 4) as u64;
         let q_all_buf = self.device.new_buffer(all_tokens_bytes, MTLResourceOptions::StorageModeShared);
         let attn_out_all_buf = self.device.new_buffer(all_tokens_bytes, MTLResourceOptions::StorageModeShared);
+        let x_norm_all_buf = self.device.new_buffer(all_tokens_bytes, MTLResourceOptions::StorageModeShared);
+        let kv_dim_b = n_kv_heads * head_dim;
+        let all_kv_bytes = (num_tokens * kv_dim_b * 4) as u64;
+        let k_all_buf = self.device.new_buffer(all_kv_bytes, MTLResourceOptions::StorageModeShared);
+        let v_all_buf = self.device.new_buffer(all_kv_bytes, MTLResourceOptions::StorageModeShared);
+        let o_out_all_buf = self.device.new_buffer(all_tokens_bytes, MTLResourceOptions::StorageModeShared);
+        let interm_bytes = (num_tokens * cfg.intermediate_size * 4) as u64;
+        let gate_all_buf = self.device.new_buffer(interm_bytes, MTLResourceOptions::StorageModeShared);
+        let up_all_buf = self.device.new_buffer(interm_bytes, MTLResourceOptions::StorageModeShared);
 
-        // ---- 5. Single compute encoder per layer (per-token MV + batched attention) ----
+        // ---- 5. Single compute encoder per layer (batched QKV + per-token rms/rope/write_kv + batched attention) ----
         autoreleasepool(|| -> Result<Option<Vec<f32>>, CoreError> {
         let cb = self.queue.new_command_buffer();
 
@@ -247,7 +256,25 @@ impl LlamaGraphState {
             let ln = &layer_names[layer];
             let enc = cb.new_compute_command_encoder();
 
-            // Pre-attention: per-token RMS norm, QKV, RoPE, write KV, save Q to q_all
+            // Phase 1: per-token RMS norm -> x_norm_all_buf
+            for token_idx in 0..num_tokens {
+                let tok_off = token_idx * hidden;
+                self.ops.encode_copy_f32(&enc, &all_x_buf, &self.x_buf, tok_off, 0, hidden);
+                let w_in = self.get_weight(&ln.in_norm[0], Some(&ln.in_norm[1]));
+                self.ops.encode_rms_norm_f16w(&enc, &self.x_buf, w_in, &self.x_norm_buf, hidden, cfg.rms_norm_eps, false);
+                self.ops.encode_copy_f32(&enc, &self.x_norm_buf, &x_norm_all_buf, 0, tok_off, hidden);
+            }
+
+            // Phase 2: batched Q, K, V projections
+            let w_q = self.get_weight(&ln.q_proj[0], Some(&ln.q_proj[1]));
+            let w_k = self.get_weight(&ln.k_proj[0], Some(&ln.k_proj[1]));
+            let w_v = self.get_weight(&ln.v_proj[0], Some(&ln.v_proj[1]));
+            let kv_dim = n_kv_heads * head_dim;
+            self.ops.encode_batch_mv_f16(&enc, w_q, &x_norm_all_buf, &q_all_buf, num_tokens, hidden, hidden);
+            self.ops.encode_batch_mv_f16(&enc, w_k, &x_norm_all_buf, &k_all_buf, num_tokens, kv_dim, hidden);
+            self.ops.encode_batch_mv_f16(&enc, w_v, &x_norm_all_buf, &v_all_buf, num_tokens, kv_dim, hidden);
+
+            // Phase 3: per-token RoPE, write KV, update Q in q_all_buf
             for token_idx in 0..num_tokens {
                 let pos = start_pos + token_idx;
                 let block_id = page_table.block_for_token(pos)
@@ -255,21 +282,14 @@ impl LlamaGraphState {
                 let token_off = page_table.offset_in_block(pos)
                     .map_err(|e| CoreError::Backend(format!("prefill offset: {e}")))?;
                 let tok_off = token_idx * hidden;
+                let kv_off = token_idx * kv_dim;
 
-                self.ops.encode_copy_f32(&enc, &all_x_buf, &self.x_buf, tok_off, 0, hidden);
-                let w_in = self.get_weight(&ln.in_norm[0], Some(&ln.in_norm[1]));
-                self.ops.encode_rms_norm_f16w(&enc, &self.x_buf, w_in, &self.x_norm_buf, hidden, cfg.rms_norm_eps, false);
+                // Copy K,V for this token from batch results to scratch buffers
+                self.ops.encode_copy_f32(&enc, &k_all_buf, &self.k_buf, kv_off, 0, kv_dim);
+                self.ops.encode_copy_f32(&enc, &v_all_buf, &self.v_buf, kv_off, 0, kv_dim);
+                self.ops.encode_copy_f32(&enc, &q_all_buf, &self.q_buf, tok_off, 0, hidden);
 
-                // Per-token QKV
-                let w_q = self.get_weight(&ln.q_proj[0], Some(&ln.q_proj[1]));
-                let w_k = self.get_weight(&ln.k_proj[0], Some(&ln.k_proj[1]));
-                let w_v = self.get_weight(&ln.v_proj[0], Some(&ln.v_proj[1]));
-                self.ops.encode_mv_f16(&enc, w_q, &self.x_norm_buf, &self.q_buf, hidden, hidden);
-                let kv_dim = n_kv_heads * head_dim;
-                self.ops.encode_mv_f16(&enc, w_k, &self.x_norm_buf, &self.k_buf, kv_dim, hidden);
-                self.ops.encode_mv_f16(&enc, w_v, &self.x_norm_buf, &self.v_buf, kv_dim, hidden);
-
-                // RoPE
+                // RoPE (modifies q_buf, k_buf in place)
                 if self.rope_interleaved {
                     self.ops.encode_rope_adj_f32(&enc, &self.q_buf, n_heads, head_dim, pos, cfg.rope_theta);
                     self.ops.encode_rope_adj_f32(&enc, &self.k_buf, n_kv_heads, head_dim, pos, cfg.rope_theta);
@@ -285,7 +305,7 @@ impl LlamaGraphState {
                     .map_err(|e| CoreError::Backend(format!("prefill base_elem: {e}")))?;
                 kv_store.encode_write_token_f32(&enc, target_base, &self.k_buf, &self.v_buf, kv_dim);
 
-                // Save Q for batched attention
+                // Save roped Q back to q_all_buf
                 self.ops.encode_copy_f32(&enc, &self.q_buf, &q_all_buf, 0, tok_off, hidden);
             }
 
@@ -300,33 +320,40 @@ impl LlamaGraphState {
                 None, None,
             );
 
-            // Post-attention: per-token O projection, residual, MLP
+            // Phase 4: batched O projection -> o_out_all_buf (separate buffer, no src/dst overlap)
+            let w_o = self.get_weight(&ln.o_proj[0], Some(&ln.o_proj[1]));
+            self.ops.encode_batch_mv_f16(&enc, w_o, &attn_out_all_buf, &o_out_all_buf, num_tokens, hidden, hidden);
+
+            // Phase 5: per-token residual, post-norm -> x_norm_all_buf
             for token_idx in 0..num_tokens {
                 let tok_off = token_idx * hidden;
-
-                // O projection + residual
                 self.ops.encode_copy_f32(&enc, &all_x_buf, &self.x_buf, tok_off, 0, hidden);
-                self.ops.encode_copy_f32(&enc, &attn_out_all_buf, &self.attn_out_buf, tok_off, 0, hidden);
-                let w_o = self.get_weight(&ln.o_proj[0], Some(&ln.o_proj[1]));
-                self.ops.encode_mv_f16(&enc, w_o, &self.attn_out_buf, &self.mlp_in_buf, hidden, hidden);
+                self.ops.encode_copy_f32(&enc, &o_out_all_buf, &self.mlp_in_buf, tok_off, 0, hidden);
                 self.ops.encode_add_f32_inplace(&enc, &self.x_buf, &self.mlp_in_buf, hidden);
-
-                // Post-norm
                 let w_post = self.get_weight(&ln.post_norm[0], Some(&ln.post_norm[1]));
                 self.ops.encode_rms_norm_f16w(&enc, &self.x_buf, w_post, &self.x_norm_buf, hidden, cfg.rms_norm_eps, false);
+                self.ops.encode_copy_f32(&enc, &self.x_norm_buf, &x_norm_all_buf, 0, tok_off, hidden);
+            }
 
-                // Gate + Up
-                let w_gate = self.get_weight(&ln.gate_proj[0], Some(&ln.gate_proj[1]));
-                let w_up   = self.get_weight(&ln.up_proj[0], Some(&ln.up_proj[1]));
-                self.ops.encode_mv_f16(&enc, w_gate, &self.x_norm_buf, &self.gate_buf, cfg.intermediate_size, hidden);
-                self.ops.encode_mv_f16(&enc, w_up,   &self.x_norm_buf, &self.up_buf,   cfg.intermediate_size, hidden);
-                self.ops.encode_silu_mul_f32_inplace(&enc, &self.gate_buf, &self.up_buf, cfg.intermediate_size);
+            // Phase 6: batched gate/up
+            let w_gate = self.get_weight(&ln.gate_proj[0], Some(&ln.gate_proj[1]));
+            let w_up   = self.get_weight(&ln.up_proj[0], Some(&ln.up_proj[1]));
+            self.ops.encode_batch_mv_f16(&enc, w_gate, &x_norm_all_buf, &gate_all_buf, num_tokens, cfg.intermediate_size, hidden);
+            self.ops.encode_batch_mv_f16(&enc, w_up,   &x_norm_all_buf, &up_all_buf,   num_tokens, cfg.intermediate_size, hidden);
 
-                // Down + residual
+            // Phase 7: per-token silu, down, residual
+            for token_idx in 0..num_tokens {
+                let tok_off = token_idx * hidden;
+                let interm_off = token_idx * cfg.intermediate_size;
                 let w_down = self.get_weight(&ln.down_proj[0], Some(&ln.down_proj[1]));
+                self.ops.encode_copy_f32(&enc, &gate_all_buf, &self.gate_buf, interm_off, 0, cfg.intermediate_size);
+                self.ops.encode_copy_f32(&enc, &up_all_buf,   &self.up_buf,   interm_off, 0, cfg.intermediate_size);
+                self.ops.encode_silu_mul_f32_inplace(&enc, &self.gate_buf, &self.up_buf, cfg.intermediate_size);
                 self.ops.encode_mv_f16(&enc, w_down, &self.gate_buf, &self.down_buf, hidden, cfg.intermediate_size);
+                self.ops.encode_copy_f32(&enc, &all_x_buf, &self.x_buf, tok_off, 0, hidden);
+                self.ops.encode_copy_f32(&enc, &o_out_all_buf, &self.mlp_in_buf, tok_off, 0, hidden);
+                self.ops.encode_add_f32_inplace(&enc, &self.x_buf, &self.mlp_in_buf, hidden);
                 self.ops.encode_add_f32_inplace(&enc, &self.x_buf, &self.down_buf, hidden);
-
                 self.ops.encode_copy_f32(&enc, &self.x_buf, &all_x_buf, 0, tok_off, hidden);
             }
 
