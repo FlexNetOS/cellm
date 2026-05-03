@@ -256,14 +256,9 @@ impl LlamaGraphState {
             let ln = &layer_names[layer];
             let enc = cb.new_compute_command_encoder();
 
-            // Phase 1: per-token RMS norm -> x_norm_all_buf
-            for token_idx in 0..num_tokens {
-                let tok_off = token_idx * hidden;
-                self.ops.encode_copy_f32(&enc, &all_x_buf, &self.x_buf, tok_off, 0, hidden);
-                let w_in = self.get_weight(&ln.in_norm[0], Some(&ln.in_norm[1]));
-                self.ops.encode_rms_norm_f16w(&enc, &self.x_buf, w_in, &self.x_norm_buf, hidden, cfg.rms_norm_eps, false);
-                self.ops.encode_copy_f32(&enc, &self.x_norm_buf, &x_norm_all_buf, 0, tok_off, hidden);
-            }
+            // Phase 1: batched RMS norm -> x_norm_all_buf
+            let w_in = self.get_weight(&ln.in_norm[0], Some(&ln.in_norm[1]));
+            self.ops.encode_batch_rms_norm_f16w(&enc, &all_x_buf, w_in, &x_norm_all_buf, num_tokens, hidden, cfg.rms_norm_eps, false);
 
             // Phase 2: batched Q, K, V projections
             let w_q = self.get_weight(&ln.q_proj[0], Some(&ln.q_proj[1]));
@@ -274,45 +269,30 @@ impl LlamaGraphState {
             self.ops.encode_batch_mv_f16(&enc, w_k, &x_norm_all_buf, &k_all_buf, num_tokens, kv_dim, hidden);
             self.ops.encode_batch_mv_f16(&enc, w_v, &x_norm_all_buf, &v_all_buf, num_tokens, kv_dim, hidden);
 
-            // Phase 3: per-token RoPE, write KV, update Q in q_all_buf
-            for token_idx in 0..num_tokens {
-                let pos = start_pos + token_idx;
-                let block_id = page_table.block_for_token(pos)
-                    .map_err(|e| CoreError::Backend(format!("prefill block: {e}")))?;
-                let token_off = page_table.offset_in_block(pos)
-                    .map_err(|e| CoreError::Backend(format!("prefill offset: {e}")))?;
-                let tok_off = token_idx * hidden;
-                let kv_off = token_idx * kv_dim;
-
-                // Copy K,V for this token from batch results to scratch buffers
-                self.ops.encode_copy_f32(&enc, &k_all_buf, &self.k_buf, kv_off, 0, kv_dim);
-                self.ops.encode_copy_f32(&enc, &v_all_buf, &self.v_buf, kv_off, 0, kv_dim);
-                self.ops.encode_copy_f32(&enc, &q_all_buf, &self.q_buf, tok_off, 0, hidden);
-
-                // RoPE (modifies q_buf, k_buf in place)
-                if self.rope_interleaved {
-                    self.ops.encode_rope_adj_f32(&enc, &self.q_buf, n_heads, head_dim, pos, cfg.rope_theta);
-                    self.ops.encode_rope_adj_f32(&enc, &self.k_buf, n_kv_heads, head_dim, pos, cfg.rope_theta);
-                } else {
-                    self.ops.encode_rope_half_f32(&enc, &self.q_buf, n_heads, head_dim, head_dim, pos, cfg.rope_theta);
-                    self.ops.encode_rope_half_f32(&enc, &self.k_buf, n_kv_heads, head_dim, head_dim, pos, cfg.rope_theta);
-                }
-
-                // Write KV
-                let kv_store = kv_cache.storage().as_any().downcast_ref::<cellm_cache::kvcache::MetalKvStorage>()
-                    .expect("prefill requires MetalKvStorage");
-                let target_base = kv_cache.layout().token_base_elem(block_id, layer, token_off)
-                    .map_err(|e| CoreError::Backend(format!("prefill base_elem: {e}")))?;
-                kv_store.encode_write_token_f32(&enc, target_base, &self.k_buf, &self.v_buf, kv_dim);
-
-                // Save roped Q back to q_all_buf
-                self.ops.encode_copy_f32(&enc, &self.q_buf, &q_all_buf, 0, tok_off, hidden);
-            }
-
-            // Batched attention
-            let bases_offset = (layer * stride * 4) as u64;
+            // Phase 3: batch RoPE + batch write KV (3 dispatches vs 749× per-token loop)
             let kv_store = kv_cache.storage().as_any().downcast_ref::<cellm_cache::kvcache::MetalKvStorage>()
                 .expect("prefill requires MetalKvStorage");
+            let bases_offset = (layer * stride * 4) as u64;
+
+            // Apply RoPE to Q and K in-place on the batch buffers
+            if self.rope_interleaved {
+                self.ops.encode_batch_rope_adj_f32(&enc, &q_all_buf, num_tokens, n_heads, head_dim, start_pos, cfg.rope_theta);
+                self.ops.encode_batch_rope_adj_f32(&enc, &k_all_buf, num_tokens, n_kv_heads, head_dim, start_pos, cfg.rope_theta);
+            } else {
+                self.ops.encode_batch_rope_half_f32(&enc, &q_all_buf, num_tokens, n_heads, head_dim, head_dim, start_pos, cfg.rope_theta);
+                self.ops.encode_batch_rope_half_f32(&enc, &k_all_buf, num_tokens, n_kv_heads, head_dim, head_dim, start_pos, cfg.rope_theta);
+            }
+
+            // Write all K/V to cache in one batch dispatch
+            self.ops.encode_batch_write_kv_f32(
+                &enc,
+                kv_store.k_buffer(), kv_store.v_buffer(),
+                &k_all_buf, &v_all_buf,
+                bases_ref, bases_offset,
+                num_tokens, kv_dim, start_pos,
+            );
+
+            // Batched attention
             kv_store.encode_attention_batched(
                 &enc, bases_ref, bases_offset, &q_all_buf, &attn_out_all_buf,
                 start_pos as u32, num_tokens as u32,

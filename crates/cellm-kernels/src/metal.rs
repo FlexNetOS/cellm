@@ -1219,6 +1219,139 @@ kernel void batch_mv_i8(
     }
     out_all[token_idx * out_dim + row] = acc * scale;
 }
+
+// Batch RoPE for half-split (non-interleaved): applies RoPE to multi-token buffer in-place.
+// Dispatch: 2D grid (num_pairs_per_token, num_tokens) where num_pairs = n_heads * head_dim/2
+kernel void batch_rope_half_f32(
+    device       float* x         [[buffer(0)]],  // [num_tokens, n_heads * head_dim]
+    constant     uint&  num_tokens [[buffer(1)]],
+    constant     uint&  n_heads   [[buffer(2)]],
+    constant     uint&  head_dim  [[buffer(3)]],
+    constant     uint&  rotary_dim [[buffer(4)]],
+    constant     uint&  start_pos [[buffer(5)]],
+    constant     float& theta     [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint token_idx = gid.y;
+    uint pair_idx = gid.x;
+    uint half_rd = rotary_dim >> 1;
+    uint h = pair_idx / half_rd;
+    uint i = pair_idx % half_rd;
+    if (token_idx >= num_tokens || h >= n_heads) return;
+    float inv_freq = pow(theta, -(2.0f * float(i)) / float(rotary_dim));
+    float angle = float(start_pos + token_idx) * inv_freq;
+    float c = cos(angle); float s = sin(angle);
+    uint base = token_idx * n_heads * head_dim + h * head_dim;
+    float x0 = x[base + i];
+    float x1 = x[base + half_rd + i];
+    x[base + i]           = x0 * c - x1 * s;
+    x[base + half_rd + i] = x1 * c + x0 * s;
+}
+
+// Batch RoPE for adjacent-pair (interleaved): applies RoPE to multi-token buffer in-place.
+// Dispatch: 2D grid (num_pairs_per_token, num_tokens) where num_pairs = n_heads * head_dim/2
+kernel void batch_rope_adj_f32(
+    device       float* x         [[buffer(0)]],  // [num_tokens, n_heads * head_dim]
+    constant     uint&  num_tokens [[buffer(1)]],
+    constant     uint&  n_heads   [[buffer(2)]],
+    constant     uint&  head_dim  [[buffer(3)]],
+    constant     uint&  start_pos [[buffer(4)]],
+    constant     float& theta     [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint token_idx = gid.y;
+    uint pair_idx = gid.x;
+    uint half_hd = head_dim >> 1;
+    uint h = pair_idx / half_hd;
+    uint dim = pair_idx % half_hd;
+    if (token_idx >= num_tokens || h >= n_heads) return;
+    float inv_freq = pow(theta, -(2.0f * float(dim)) / float(head_dim));
+    float angle = float(start_pos + token_idx) * inv_freq;
+    float c = cos(angle); float s = sin(angle);
+    uint base = token_idx * n_heads * head_dim + h * head_dim + dim * 2;
+    float x0 = x[base]; float x1 = x[base + 1];
+    x[base]     = x0 * c - x1 * s;
+    x[base + 1] = x0 * s + x1 * c;
+}
+
+// Batch write K/V: writes all tokens' K/V from multi-token buffers to KV cache.
+// Dispatch: 2D grid (kv_dim, num_tokens)
+// bases[pos] = base element in KV cache for position pos, layer-relative
+kernel void batch_write_kv_f32(
+    device half*   k_cache   [[buffer(0)]],
+    device half*   v_cache   [[buffer(1)]],
+    device const float* k_all [[buffer(2)]],  // [num_tokens, kv_dim]
+    device const float* v_all [[buffer(3)]],  // [num_tokens, kv_dim]
+    device const uint*  bases [[buffer(4)]],  // [stride] base per position (layer-relative)
+    constant     uint&  num_tokens [[buffer(5)]],
+    constant     uint&  kv_dim     [[buffer(6)]],
+    constant     uint&  start_pos  [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint token_idx = gid.y;
+    uint d = gid.x;
+    if (token_idx >= num_tokens || d >= kv_dim) return;
+    uint pos = start_pos + token_idx;
+    uint base = bases[pos];
+    uint idx = base + d;
+    k_cache[idx] = half(clamp(k_all[token_idx * kv_dim + d], -65504.0f, 65504.0f));
+    v_cache[idx] = half(clamp(v_all[token_idx * kv_dim + d], -65504.0f, 65504.0f));
+}
+
+// Batched RMS norm: processes all tokens in one dispatch.
+// Each threadgroup handles one token's RMS norm reduction.
+// Dispatch grid: num_tokens threadgroups, each with thread_execution_width threads.
+kernel void batch_rms_norm_f16w(
+    device const float* x       [[buffer(0)]],  // [num_tokens, hidden] f32
+    device const half*  w       [[buffer(1)]],  // [hidden] f16 weight
+    device       float* out     [[buffer(2)]],  // [num_tokens, hidden] f32
+    constant     uint&  num_tokens [[buffer(3)]],
+    constant     uint&  hidden     [[buffer(4)]],
+    constant     float&  eps       [[buffer(5)]],
+    constant     uint&  w_add_one  [[buffer(6)]],
+    uint tid   [[thread_index_in_threadgroup]],
+    uint gid   [[threadgroup_position_in_grid]],  // token index
+    uint tgsize[[threads_per_threadgroup]]
+) {
+    if (gid >= num_tokens) return;
+
+    device const float* x_token = x + gid * hidden;
+    device       float* out_token = out + gid * hidden;
+
+    // Phase 1: each thread computes partial sum of squares
+    float partial = 0.0f;
+    for (uint i = tid; i < hidden; i += tgsize) {
+        float v = x_token[i];
+        partial += v * v;
+    }
+
+    threadgroup float shared[256];
+    shared[tid] = partial;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase 2: tree reduction
+    for (uint s = tgsize / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared[tid] += shared[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Phase 3: compute inv_rms
+    if (tid == 0) {
+        float mean_sq = shared[0] / float(hidden);
+        shared[0] = rsqrt(mean_sq + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_rms = shared[0];
+
+    // Phase 4: apply normalization with weight
+    for (uint i = tid; i < hidden; i += tgsize) {
+        float wi = float(w[i]);
+        if (w_add_one) wi += 1.0f;
+        out_token[i] = x_token[i] * inv_rms * wi;
+    }
+}
 "#;
 
 const COPY_SHADER: &str = r#"
@@ -1264,7 +1397,11 @@ pub struct MetalOps {
     pub pso_attention_gqa_fast: ComputePipelineState,
     pub pso_scatter_f32: ComputePipelineState,
     pub pso_copy_f32: ComputePipelineState,
-    pub pso_batch_mv_f16: ComputePipelineState,
+    pso_batch_mv_f16: ComputePipelineState,
+    pso_batch_rope_half: ComputePipelineState,
+    pso_batch_rope_adj: ComputePipelineState,
+    pso_batch_write_kv: ComputePipelineState,
+    pso_batch_rms_norm: ComputePipelineState,
 
     x_buf: Mutex<Option<Buffer>>,
     out_buf: Mutex<Option<Buffer>>,
@@ -1304,6 +1441,10 @@ impl Clone for MetalOps {
             pso_scatter_f32: self.pso_scatter_f32.clone(),
             pso_copy_f32: self.pso_copy_f32.clone(),
             pso_batch_mv_f16: self.pso_batch_mv_f16.clone(),
+            pso_batch_rope_half: self.pso_batch_rope_half.clone(),
+            pso_batch_rope_adj: self.pso_batch_rope_adj.clone(),
+            pso_batch_write_kv: self.pso_batch_write_kv.clone(),
+            pso_batch_rms_norm: self.pso_batch_rms_norm.clone(),
             x_buf: Mutex::new(None),
             out_buf: Mutex::new(None),
             tensor_cache: Mutex::new(HashMap::new()),
@@ -1403,6 +1544,10 @@ impl MetalOps {
     }
     pub fn encode_mv_f16(&self, _enc: &(), _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: usize, _: usize) {}
     pub fn encode_batch_mv_f16(&self, _: &(), _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: usize, _: usize, _: usize) {}
+    pub fn encode_batch_rope_half_f32(&self, _: &(), _: &MetalBuffer, _: usize, _: usize, _: usize, _: usize, _: usize, _: f32) {}
+    pub fn encode_batch_rope_adj_f32(&self, _: &(), _: &MetalBuffer, _: usize, _: usize, _: usize, _: usize, _: f32) {}
+    pub fn encode_batch_write_kv_f32(&self, _: &(), _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: u64, _: usize, _: usize, _: usize) {}
+    pub fn encode_batch_rms_norm_f16w(&self, _: &(), _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: usize, _: usize, _: f32, _: bool) {}
     pub fn encode_mv_i8(&self, _enc: &(), _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: usize, _: usize) {}
     pub fn encode_qkv_f16(&self, _enc: &(), _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: usize, _: usize, _: usize) {}
     pub fn logits_f32(&self, _: &[f32], _: &[f32], _: usize, _: usize, _: &str, _: &mut [f32]) -> anyhow::Result<()> {
@@ -1477,6 +1622,11 @@ impl MetalOps {
         let pso_scatter_f32 = build_pso_ops(&device, &lib, "scatter_f32")?;
         let pso_batch_mv_f16 = build_pso_ops(&device, &lib, "batch_mv_f16")?;
 
+        let pso_batch_rope_half = build_pso_ops(&device, &lib, "batch_rope_half_f32")?;
+        let pso_batch_rope_adj = build_pso_ops(&device, &lib, "batch_rope_adj_f32")?;
+        let pso_batch_write_kv = build_pso_ops(&device, &lib, "batch_write_kv_f32")?;
+        let pso_batch_rms_norm = build_pso_ops(&device, &lib, "batch_rms_norm_f16w")?;
+
         // Compile the copy kernel from its own shader string
         let copy_lib = load_or_compile_metallib(&device, COPY_SHADER, false, "cellm_copy")
             .map_err(|e| anyhow::anyhow!("Copy kernel compile failed: {e:?}"))?;
@@ -1486,6 +1636,7 @@ impl MetalOps {
             device, queue, _lib: lib.clone(),
             pso_rms_norm, pso_rope_adj, pso_rope_half, pso_mv_f16, pso_mv_i8, pso_mv_i4, pso_mv_qkv_f16, pso_mv_qkv_i8, pso_mv2_f16, pso_mv2_i8,
             pso_add_f32, pso_silu_mul_f32, pso_gelu_mul_f32, pso_mv_q1, pso_lfm_conv, pso_mv_f32, pso_attention_gqa, pso_attention_gqa_fast, pso_scatter_f32, pso_copy_f32, pso_batch_mv_f16,
+            pso_batch_rope_half, pso_batch_rope_adj, pso_batch_write_kv, pso_batch_rms_norm,
             x_buf: Mutex::new(None), out_buf: Mutex::new(None),
             tensor_cache: Mutex::new(HashMap::new()),
             named_bufs: Mutex::new(HashMap::new()),
@@ -2144,6 +2295,99 @@ impl MetalOps {
         let w = self.pso_batch_mv_f16.thread_execution_width() as u64;
         let tg = MTLSize { width: w, height: 1, depth: 1 };
         enc.dispatch_threads(grid, tg);
+    }
+
+    pub fn encode_batch_rope_half_f32(&self, enc: &metal::ComputeCommandEncoderRef,
+        x: &metal::Buffer, num_tokens: usize, n_heads: usize, head_dim: usize,
+        rotary_dim: usize, start_pos: usize, theta: f32)
+    {
+        let nt = num_tokens as u32;
+        let nh = n_heads as u32;
+        let hd = head_dim as u32;
+        let rd = rotary_dim as u32;
+        let sp = start_pos as u32;
+        enc.set_compute_pipeline_state(&self.pso_batch_rope_half);
+        enc.set_buffer(0, Some(x), 0);
+        enc.set_bytes(1, 4, (&nt as *const u32).cast());
+        enc.set_bytes(2, 4, (&nh as *const u32).cast());
+        enc.set_bytes(3, 4, (&hd as *const u32).cast());
+        enc.set_bytes(4, 4, (&rd as *const u32).cast());
+        enc.set_bytes(5, 4, (&sp as *const u32).cast());
+        enc.set_bytes(6, 4, (&theta as *const f32).cast());
+        let num_pairs = n_heads * (rotary_dim / 2);
+        let grid = MTLSize { width: num_pairs as u64, height: num_tokens as u64, depth: 1 };
+        let w = self.pso_batch_rope_half.thread_execution_width() as u64;
+        let tg = MTLSize { width: w, height: 1, depth: 1 };
+        enc.dispatch_threads(grid, tg);
+    }
+
+    pub fn encode_batch_rope_adj_f32(&self, enc: &metal::ComputeCommandEncoderRef,
+        x: &metal::Buffer, num_tokens: usize, n_heads: usize, head_dim: usize,
+        start_pos: usize, theta: f32)
+    {
+        let nt = num_tokens as u32;
+        let nh = n_heads as u32;
+        let hd = head_dim as u32;
+        let sp = start_pos as u32;
+        enc.set_compute_pipeline_state(&self.pso_batch_rope_adj);
+        enc.set_buffer(0, Some(x), 0);
+        enc.set_bytes(1, 4, (&nt as *const u32).cast());
+        enc.set_bytes(2, 4, (&nh as *const u32).cast());
+        enc.set_bytes(3, 4, (&hd as *const u32).cast());
+        enc.set_bytes(4, 4, (&sp as *const u32).cast());
+        enc.set_bytes(5, 4, (&theta as *const f32).cast());
+        let num_pairs = n_heads * (head_dim / 2);
+        let grid = MTLSize { width: num_pairs as u64, height: num_tokens as u64, depth: 1 };
+        let w = self.pso_batch_rope_adj.thread_execution_width() as u64;
+        let tg = MTLSize { width: w, height: 1, depth: 1 };
+        enc.dispatch_threads(grid, tg);
+    }
+
+    /// Write all tokens' K/V to KV cache using batch kernel.
+    /// bases[pos] = base element in KV cache for position pos (layer-relative).
+    pub fn encode_batch_write_kv_f32(&self, enc: &metal::ComputeCommandEncoderRef,
+        k_cache: &metal::BufferRef, v_cache: &metal::BufferRef,
+        k_all: &metal::Buffer, v_all: &metal::Buffer,
+        bases: &metal::Buffer, bases_offset: u64,
+        num_tokens: usize, kv_dim: usize, start_pos: usize)
+    {
+        let nt = num_tokens as u32;
+        let kd = kv_dim as u32;
+        let sp = start_pos as u32;
+        enc.set_compute_pipeline_state(&self.pso_batch_write_kv);
+        enc.set_buffer(0, Some(k_cache), 0);
+        enc.set_buffer(1, Some(v_cache), 0);
+        enc.set_buffer(2, Some(k_all), 0);
+        enc.set_buffer(3, Some(v_all), 0);
+        enc.set_buffer(4, Some(bases), bases_offset);
+        enc.set_bytes(5, 4, (&nt as *const u32).cast());
+        enc.set_bytes(6, 4, (&kd as *const u32).cast());
+        enc.set_bytes(7, 4, (&sp as *const u32).cast());
+        let grid = MTLSize { width: kv_dim as u64, height: num_tokens as u64, depth: 1 };
+        let w = self.pso_batch_write_kv.thread_execution_width() as u64;
+        let tg = MTLSize { width: w, height: 1, depth: 1 };
+        enc.dispatch_threads(grid, tg);
+    }
+
+    pub fn encode_batch_rms_norm_f16w(&self, enc: &metal::ComputeCommandEncoderRef,
+        x_all: &metal::BufferRef, w: &metal::BufferRef, out_all: &metal::BufferRef,
+        num_tokens: usize, hidden: usize, eps: f32, w_add_one: bool)
+    {
+        let nt = num_tokens as u32;
+        let hd = hidden as u32;
+        let wa = w_add_one as u32;
+        enc.set_compute_pipeline_state(&self.pso_batch_rms_norm);
+        enc.set_buffer(0, Some(x_all), 0);
+        enc.set_buffer(1, Some(w), 0);
+        enc.set_buffer(2, Some(out_all), 0);
+        enc.set_bytes(3, 4, (&nt as *const u32).cast());
+        enc.set_bytes(4, 4, (&hd as *const u32).cast());
+        enc.set_bytes(5, 4, (&eps as *const f32).cast());
+        enc.set_bytes(6, 4, (&wa as *const u32).cast());
+        let w = self.pso_batch_rms_norm.thread_execution_width() as u64;
+        let tg = MTLSize { width: w, height: 1, depth: 1 };
+        let grid = MTLSize { width: num_tokens as u64, height: 1, depth: 1 };
+        enc.dispatch_thread_groups(grid, tg);
     }
 
     pub fn logits_f32(&self, x: &[f32], weights_f32: &[f32], vocab: usize, hidden: usize, cache_key: &str, out: &mut [f32]) -> anyhow::Result<()> {
