@@ -1362,6 +1362,7 @@ pub struct MetalKvStorage {
     pso_read_f32: ComputePipelineState,
     pso_gather_f32: ComputePipelineState,
     pso_attn_single_gqa_f32: ComputePipelineState,
+    pso_attn_single_gqa_f32_fast: ComputePipelineState,
     pso_attn_batched_gqa_f32: ComputePipelineState,
     _pso_attn_single_gqa_q8_f32: ComputePipelineState,
     k: Buffer,
@@ -1515,13 +1516,10 @@ impl MetalKvStorage {
             uint group_size = n_heads / n_kv_heads;
             uint kv_h = head_idx / group_size;
             const device float* qh = q + head_idx * head_dim;
-            // Threadgroup size is fixed at 64 to match dispatch in encode_attention.
-            // If changed here, also update the dispatch call site.
             const uint TGSIZE = 64;
 
             float max_score = -INFINITY;
             float denom = 0.0f;
-            // v_acc accumulates partial V sums; sized for head_dim up to 8192 with 128 threads.
             float v_acc[128];
             for (uint j = 0; j < 128; j++) v_acc[j] = 0.0f;
 
@@ -1558,6 +1556,134 @@ impl MetalKvStorage {
 
             for (uint i = tid, j = 0; i < head_dim; i += TGSIZE, ++j) {
                 out[head_idx * head_dim + i] = v_acc[j] / denom;
+            }
+        }
+
+        // Thread-parallel decode attention: 64 threads per head cooperate
+        // over all sequence positions, needing only 3 barrier groups total
+        // (vs seq*2 barriers in kv_attn_single_gqa_f32).
+        kernel void kv_attn_single_gqa_f32_fast(
+            device const half* k_cache [[buffer(0)]],
+            device const half* v_cache [[buffer(1)]],
+            device const uint* bases [[buffer(2)]],
+            device const float* q [[buffer(3)]],
+            device float* out [[buffer(4)]],
+            constant uint& n_heads [[buffer(5)]],
+            constant uint& n_kv_heads [[buffer(6)]],
+            constant uint& head_dim [[buffer(7)]],
+            constant uint& seq [[buffer(8)]],
+            constant float& scale [[buffer(9)]],
+            constant float& soft_cap [[buffer(10)]],
+            uint tid [[thread_index_in_threadgroup]],
+            uint gid [[threadgroup_position_in_grid]],
+            uint tgsize [[threads_per_threadgroup]]
+        ) {
+            if (gid >= n_heads) return;
+            uint group_size = n_heads / n_kv_heads;
+            uint kv_h = gid / group_size;
+            device const float* qh = q + gid * head_dim;
+            device float* oh = out + gid * head_dim;
+
+            if (seq == 0) return;
+
+            uint n_threads = tgsize;
+            uint tokens_per_thread = (seq + n_threads - 1) / n_threads;
+            uint start_t = tid * tokens_per_thread;
+            uint end_t = min(start_t + tokens_per_thread, seq);
+
+            // Phase 1: local max score
+            float local_max = -INFINITY;
+            for (uint t = start_t; t < end_t; t++) {
+                uint base = bases[t] + kv_h * head_dim;
+                float dp = 0.0f;
+                uint i = 0;
+                for (; i + 3 < head_dim; i += 4) {
+                    float4 qv = float4(qh[i], qh[i+1], qh[i+2], qh[i+3]);
+                    float4 kv = float4(float(k_cache[base + i]), float(k_cache[base + i + 1]), float(k_cache[base + i + 2]), float(k_cache[base + i + 3]));
+                    dp += dot(qv, kv);
+                }
+                for (; i < head_dim; i++) dp += qh[i] * float(k_cache[base + i]);
+                float score = dp * scale;
+                if (soft_cap > 0.0f) score = tanh(score / soft_cap) * soft_cap;
+                local_max = max(local_max, score);
+            }
+
+            threadgroup float shared[128];
+            shared[tid] = local_max;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid == 0) {
+                float m = shared[0];
+                for (uint i = 1; i < n_threads; i++) m = max(m, shared[i]);
+                shared[0] = m;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float global_max = shared[0];
+
+            // Phase 2: local sum of exponentials
+            float local_sum = 0.0f;
+            for (uint t = start_t; t < end_t; t++) {
+                uint base = bases[t] + kv_h * head_dim;
+                float dp = 0.0f;
+                uint i = 0;
+                for (; i + 3 < head_dim; i += 4) {
+                    float4 qv = float4(qh[i], qh[i+1], qh[i+2], qh[i+3]);
+                    float4 kv = float4(float(k_cache[base + i]), float(k_cache[base + i + 1]), float(k_cache[base + i + 2]), float(k_cache[base + i + 3]));
+                    dp += dot(qv, kv);
+                }
+                for (; i < head_dim; i++) dp += qh[i] * float(k_cache[base + i]);
+                float score = dp * scale;
+                if (soft_cap > 0.0f) score = tanh(score / soft_cap) * soft_cap;
+                local_sum += exp(score - global_max);
+            }
+
+            shared[tid] = local_sum;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid == 0) {
+                float s = 0.0f;
+                for (uint i = 0; i < n_threads; i++) s += shared[i];
+                shared[0] = s;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float global_sum = shared[0];
+
+            // Phase 3: weighted V sum, tiled over head_dim
+            const uint TILE = 32;
+            threadgroup float tg_partial[TILE][128];
+            for (uint d_base = 0; d_base < head_dim; d_base += TILE) {
+                uint d_end = min(d_base + TILE, head_dim);
+                uint tile_count = d_end - d_base;
+
+                float local_partials[TILE];
+                for (uint i = 0; i < tile_count; i++) local_partials[i] = 0.0f;
+
+                for (uint t = start_t; t < end_t; t++) {
+                    uint base = bases[t] + kv_h * head_dim;
+                    float dp = 0.0f;
+                    uint i = 0;
+                    for (; i + 3 < head_dim; i += 4) {
+                        float4 qv = float4(qh[i], qh[i+1], qh[i+2], qh[i+3]);
+                        float4 kv = float4(float(k_cache[base + i]), float(k_cache[base + i + 1]), float(k_cache[base + i + 2]), float(k_cache[base + i + 3]));
+                        dp += dot(qv, kv);
+                    }
+                    for (; i < head_dim; i++) dp += qh[i] * float(k_cache[base + i]);
+                    float score = dp * scale;
+                    if (soft_cap > 0.0f) score = tanh(score / soft_cap) * soft_cap;
+                    float w = exp(score - global_max);
+
+                    for (uint i = 0; i < tile_count; i++) local_partials[i] += w * float(v_cache[base + d_base + i]);
+                }
+
+                for (uint i = 0; i < tile_count; i++) tg_partial[i][tid] = local_partials[i];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                if (tid == 0) {
+                    for (uint i = 0; i < tile_count; i++) {
+                        float acc = 0.0f;
+                        for (uint j = 0; j < n_threads; j++) acc += tg_partial[i][j];
+                        oh[d_base + i] = acc / global_sum;
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
             }
         }
 
@@ -1722,6 +1848,7 @@ impl MetalKvStorage {
         let pso_read_f32 = build_pso(&device, &lib, "kv_read_f32")?;
         let pso_gather_f32 = build_pso(&device, &lib, "kv_gather_f32")?;
         let pso_attn_single_gqa_f32 = build_pso(&device, &lib, "kv_attn_single_gqa_f32")?;
+        let pso_attn_single_gqa_f32_fast = build_pso(&device, &lib, "kv_attn_single_gqa_f32_fast")?;
         let pso_attn_batched_gqa_f32 = build_pso(&device, &lib, "kv_attn_batched_gqa_f32")?;
         let pso_attn_single_gqa_q8_f32 = build_pso(&device, &lib, "kv_attn_single_gqa_q8_f32")?;
         let bytes = (total_elems * std::mem::size_of::<f16>()) as u64;
@@ -1828,6 +1955,7 @@ impl MetalKvStorage {
             pso_read_f32,
             pso_gather_f32,
             pso_attn_single_gqa_f32,
+            pso_attn_single_gqa_f32_fast,
             pso_attn_batched_gqa_f32,
             _pso_attn_single_gqa_q8_f32: pso_attn_single_gqa_q8_f32,
             k,
