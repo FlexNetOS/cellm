@@ -1,6 +1,7 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 #version 450
 
-//  In-place softmax over the last dimension 
+//  In-place softmax over the last dimension
 //   x is a flat buffer of N elements.
 //   The "last dimension" is the entire buffer (single row).
 //
@@ -30,7 +31,7 @@ shared float row_sum;
 void main() {
     uint tid = gl_LocalInvocationID.x;
 
-    //  Load x into shared memory 
+    //  Load x into shared memory
     float val = 0.0;
     if (tid < p.N) {
         val = x[tid];
@@ -38,7 +39,7 @@ void main() {
     smem[tid] = val;
     barrier();
 
-    //  Find maximum 
+    //  Find maximum
     for (uint stride = 128u; stride > 0u; stride >>= 1u) {
         if (tid < stride) {
             smem[tid] = max(smem[tid], smem[tid + stride]);
@@ -52,7 +53,7 @@ void main() {
 
     float local_max = row_max;
 
-    //  Compute exp(x - max) and store back to smem 
+    //  Compute exp(x - max) and store back to smem
     if (tid < p.N) {
         val = exp(val - local_max);
         smem[tid] = val;
@@ -61,7 +62,7 @@ void main() {
     }
     barrier();
 
-    //  Reduce sum 
+    //  Reduce sum
     for (uint stride = 128u; stride > 0u; stride >>= 1u) {
         if (tid < stride) {
             smem[tid] += smem[tid + stride];
@@ -73,7 +74,7 @@ void main() {
     }
     barrier();
 
-    //  Normalise and write back 
+    //  Normalise and write back
     float inv_sum = 1.0 / max(row_sum, 1e-10);
     if (tid < p.N) {
         x[tid] = val * inv_sum;

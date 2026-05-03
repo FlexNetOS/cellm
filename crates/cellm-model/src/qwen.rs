@@ -13,6 +13,7 @@ use half::f16;
 use serde_json::Value;
 
 use crate::{CellmFile, ModelConfig};
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 use metal::Buffer;
 
 const QWEN_METAL_LINEAR_MAX_ELEMS: usize = 262_144;
@@ -1786,7 +1787,24 @@ impl QwenGraphState {
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 impl std::fmt::Debug for QwenGraphState { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.debug_struct("QwenGraphState").finish() } }
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-pub struct QwenGraphState;
+pub struct QwenGraphState {
+    pub tensor_dtypes: std::collections::HashMap<String, String>,
+}
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+impl QwenGraphState {
+    pub fn new(_: usize, _: usize, _: usize, _: usize, _: usize, _: usize, _: MetalOps) -> Result<Self, CoreError> {
+        Err(CoreError::Backend("Metal not available on this platform".into()))
+    }
+    pub fn preload_weight(&mut self, _: String, _: &[u8]) {
+        // no-op on non-Apple platforms
+    }
+    pub fn prefill_fused(&mut self, _: &[f32], _: &crate::ModelConfig, _: &str, _: &mut cellm_cache::KVCache, _: &cellm_cache::PageTable, _: usize, _: f32, _: bool) -> Result<(), CoreError> {
+        Err(CoreError::Backend("Metal not available on this platform".into()))
+    }
+    pub fn step_fused(&mut self, _: &[f32], _: &crate::ModelConfig, _: &str, _: &mut cellm_cache::KVCache, _: &cellm_cache::PageTable, _: usize, _: usize, _: u32, _: f32, _: bool, _: bool) -> Result<Option<Vec<f32>>, CoreError> {
+        Err(CoreError::Backend("Metal not available on this platform".into()))
+    }
+}
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
 impl std::fmt::Debug for QwenGraphState { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.debug_struct("QwenGraphState (No Metal)").finish() } }
 

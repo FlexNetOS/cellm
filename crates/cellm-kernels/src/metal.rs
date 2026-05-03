@@ -1194,6 +1194,31 @@ kernel void batch_mv_f16(
     }
     out_all[token_idx * out_dim + row] = acc;
 }
+
+kernel void batch_mv_i8(
+    device const char*   A          [[buffer(0)]],
+    device const ushort* scales     [[buffer(1)]],
+    device const float*  x_all      [[buffer(2)]],
+    device       float*  out_all    [[buffer(3)]],
+    constant     uint&   num_tokens [[buffer(4)]],
+    constant     uint&   out_dim    [[buffer(5)]],
+    constant     uint&   in_dim     [[buffer(6)]],
+    constant     uint&   per_chan   [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint token_idx = gid.y;
+    uint row = gid.x;
+    if (token_idx >= num_tokens || row >= out_dim) return;
+
+    float scale = float(as_type<half>(scales[per_chan ? row : 0]));
+    device const char* row_ptr = A + row * in_dim;
+    device const float* x_ptr = x_all + token_idx * in_dim;
+    float acc = 0.0f;
+    for (uint i = 0; i < in_dim; ++i) {
+        acc += x_ptr[i] * float(row_ptr[i]);
+    }
+    out_all[token_idx * out_dim + row] = acc * scale;
+}
 "#;
 
 const COPY_SHADER: &str = r#"

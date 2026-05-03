@@ -1,3 +1,5 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
+
 #version 450
 
 // Single-query GQA (Grouped-Query Attention)
@@ -45,11 +47,11 @@ void main() {
     uint tid = gl_LocalInvocationID.x; // thread within the workgroup
     uint hd = p.head_dim;
 
-    //  Determine KV head for this query head (GQA) 
+    // Determine KV head for this query head (GQA)
     uint heads_per_kv = p.n_heads / p.n_kv_heads;
     uint kv_head = head / heads_per_kv;
 
-    //  Step 1: compute Q·K scores 
+    // Step 1: compute Q·K scores
     // Each thread handles one element of the dot-product accumulation,
     // then we reduce across threads and store the per-position score.
 
@@ -119,7 +121,7 @@ void main() {
     }
     barrier();
 
-    //  Step 3: weighted sum over V 
+    // Step 3: weighted sum over V
     // Each thread accumulates one element of the output head.
     if (tid < hd) {
         float acc = 0.0;

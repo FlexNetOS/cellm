@@ -20,6 +20,7 @@ bytemuck = { workspace = true }
 half = { workspace = true }
 rayon = { workspace = true }
 tempfile = "3.10"
+libc = "0.2"
 matrixmultiply = { version = "0.3.10", features = ["threading"] }
 
 [lib]

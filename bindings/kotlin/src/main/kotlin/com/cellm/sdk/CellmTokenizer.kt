@@ -21,7 +21,7 @@ class CellmTokenizer(
         }
 
         @JvmStatic
-        private external fun nativeTokenizerCreate(path: String): Long
+        private external fun nativeTokenizerCreate(path: IntArray): Long
 
         @JvmStatic
         private external fun nativeTokenizerDestroy(handle: Long)
@@ -29,7 +29,7 @@ class CellmTokenizer(
         @JvmStatic
         private external fun nativeTokenizerEncode(
             handle: Long,
-            text: String,
+            text: IntArray,
             outTokens: IntArray?,
             maxTokens: Int
         ): Int
@@ -48,7 +48,8 @@ class CellmTokenizer(
          */
         @JvmStatic
         fun load(path: String): CellmTokenizer {
-            val handle = nativeTokenizerCreate(path)
+            val pathInts = path.toByteArray(Charsets.UTF_8).map { it.toInt() and 0xFF }.toIntArray()
+            val handle = nativeTokenizerCreate(pathInts)
             if (handle == 0L) {
                 throw RuntimeException("cellm_tokenizer_create failed for $path")
             }
@@ -61,10 +62,11 @@ class CellmTokenizer(
      * Returns the token count. If outTokens is null, returns the required array size.
      */
     fun encode(text: String): IntArray {
-        val count = nativeTokenizerEncode(handle, text, null, 0)
+        val textInts = text.toByteArray(Charsets.UTF_8).map { it.toInt() and 0xFF }.toIntArray()
+        val count = nativeTokenizerEncode(handle, textInts, null, 0)
         if (count <= 0) return IntArray(0)
         val tokens = IntArray(count)
-        nativeTokenizerEncode(handle, text, tokens, count)
+        nativeTokenizerEncode(handle, textInts, tokens, count)
         return tokens
     }
 
@@ -73,7 +75,8 @@ class CellmTokenizer(
      * Returns the number of tokens written.
      */
     fun encodeInto(text: String, outTokens: IntArray): Int {
-        return nativeTokenizerEncode(handle, text, outTokens, outTokens.size)
+        val textInts = text.toByteArray(Charsets.UTF_8).map { it.toInt() and 0xFF }.toIntArray()
+        return nativeTokenizerEncode(handle, textInts, outTokens, outTokens.size)
     }
 
     /**

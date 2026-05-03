@@ -13,6 +13,8 @@ pub type SessionId = u64;
 
 pub mod ffi;
 pub mod vlm;
+#[cfg(target_os = "android")]
+pub mod jni;
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {

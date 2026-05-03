@@ -1,6 +1,7 @@
 // Author: Jeffrey Asante (https://jeffasante.github.io/)
 use std::collections::HashMap;
 use std::fs::File;
+use std::os::unix::io::FromRawFd;
 use std::path::Path;
 
 use cellm_core::CoreError;
@@ -49,41 +50,99 @@ pub struct CellmHeader {
 }
 
 pub struct CellmFile {
-    mmap: Mmap,
+    data: CellmData,
     pub header: CellmHeader,
     tensors: HashMap<String, CellmTensorIndex>,
 }
 
+enum CellmData {
+    Mmap(Mmap),
+    Owned(Vec<u8>),
+}
+
+impl CellmData {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            CellmData::Mmap(m) => m,
+            CellmData::Owned(v) => v,
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+fn open_model_file(path: &Path) -> Result<File, CoreError> {
+    use std::os::unix::ffi::OsStrExt;
+    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| CoreError::Backend("cellm load: path contains null".into()))?;
+    let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY) };
+    if fd < 0 {
+        return Err(CoreError::Backend(format!(
+            "cellm load: libc::open failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(not(target_os = "android"))]
+fn open_model_file(path: &Path) -> Result<File, CoreError> {
+    File::open(path).map_err(|e| CoreError::Backend(format!("cellm load: open failed: {e}")))
+}
+
 impl CellmFile {
     pub fn load(path: &Path) -> Result<Self, CoreError> {
-        let f = File::open(path)
-            .map_err(|e| CoreError::Backend(format!("cellm load: open failed: {e}")))?;
-        let mmap = unsafe { Mmap::map(&f) }
-            .map_err(|e| CoreError::Backend(format!("cellm load: mmap failed: {e}")))?;
+        let f = open_model_file(path)?;
+        let file_data = match unsafe { Mmap::map(&f) } {
+            Ok(m) => CellmData::Mmap(m),
+            Err(mmap_err) => {
+                use std::io::Read;
+                let mut buf = Vec::new();
+                #[cfg(target_os = "android")]
+                let mut file = {
+                    use std::os::unix::ffi::OsStrExt;
+                    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
+                        .map_err(|_| CoreError::Backend("cellm load: path contains null".into()))?;
+                    let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY) };
+                    if fd < 0 {
+                        return Err(CoreError::Backend(format!(
+                            "cellm load: libc::open reopen failed: {}",
+                            std::io::Error::last_os_error()
+                        )));
+                    }
+                    unsafe { std::fs::File::from_raw_fd(fd) }
+                };
+                #[cfg(not(target_os = "android"))]
+                let mut file = File::open(path)
+                    .map_err(|e| CoreError::Backend(format!("cellm load: reopen for read failed: {e}")))?;
+                file.read_to_end(&mut buf)
+                    .map_err(|e| CoreError::Backend(format!("cellm load: read failed (mmap err: {mmap_err}, read err: {e})")))?;
+                CellmData::Owned(buf)
+            }
+        };
 
-        if mmap.len() < 10 {
+        if file_data.as_slice().len() < 10 {
             return Err(CoreError::Backend("cellm load: file too small".into()));
         }
-        if &mmap[0..5] != b"CELLM" {
+        if &file_data.as_slice()[0..5] != b"CELLM" {
             return Err(CoreError::Backend("cellm load: bad magic".into()));
         }
-        let version = mmap[5];
+        let version = file_data.as_slice()[5];
         if version != 1 {
             return Err(CoreError::Backend(format!(
                 "cellm load: unsupported version {version}"
             )));
         }
 
-        let header_len = u32::from_le_bytes([mmap[6], mmap[7], mmap[8], mmap[9]]) as usize;
+        let header_len = u32::from_le_bytes([file_data.as_slice()[6], file_data.as_slice()[7], file_data.as_slice()[8], file_data.as_slice()[9]]) as usize;
         let header_start = 10usize;
         let header_end = header_start + header_len;
-        if header_end > mmap.len() {
+        if header_end > file_data.as_slice().len() {
             return Err(CoreError::Backend(
                 "cellm load: header length out of range".into(),
             ));
         }
 
-        let header: CellmHeader = serde_json::from_slice(&mmap[header_start..header_end])
+        let header: CellmHeader = serde_json::from_slice(&file_data.as_slice()[header_start..header_end])
             .map_err(|e| CoreError::Backend(format!("cellm load: header json parse failed: {e}")))?;
 
         let mut tensors = HashMap::with_capacity(header.tensors.len());
@@ -100,27 +159,40 @@ impl CellmFile {
         // Metal avoids this by calling preload_weight() for all tensors; we replicate that
         // benefit here for the CPU path.
         {
-            // Read one byte per OS page to force all page faults now.
-            // Apple Silicon uses 16 KB pages; use 4 KB as safe lower bound on all platforms.
-            const PAGE: usize = 4096;
-            let _ = (0..mmap.len()).step_by(PAGE).fold(0u8, |acc, i| acc | mmap[i]);
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            {
+                // Use madvise for async non-blocking prefetch on Linux/Android.
+                // This avoids blocking the thread for minutes on slow emulator storage.
+                let ptr = file_data.as_slice().as_ptr() as *mut libc::c_void;
+                let len = file_data.as_slice().len();
+                unsafe {
+                    libc::madvise(ptr, len, libc::MADV_WILLNEED);
+                }
+            }
+            #[cfg(not(any(target_os = "android", target_os = "linux")))]
+            {
+                // Read one byte per OS page to force all page faults now.
+                // Apple Silicon uses 16 KB pages; use 4 KB as safe lower bound on all platforms.
+                const PAGE: usize = 4096;
+                let _ = (0..file_data.as_slice().len()).step_by(PAGE).fold(0u8, |acc, i| acc | file_data.as_slice()[i]);
+            }
         }
 
         // Basic bounds check.
         for t in header.tensors.iter() {
             let start = t.offset_bytes as usize;
             let end = start + t.nbytes as usize;
-            if end > mmap.len() {
+            if end > file_data.as_slice().len() {
                 return Err(CoreError::Backend(format!(
                     "cellm load: tensor {} out of range (end={} file_len={})",
                     t.name,
                     end,
-                    mmap.len()
+                    file_data.as_slice().len()
                 )));
             }
         }
 
-        Ok(Self { mmap, header, tensors })
+        Ok(Self { data: file_data, header, tensors })
     }
 
     pub fn tensor_index(&self, name: &str) -> Option<&CellmTensorIndex> {
@@ -131,7 +203,7 @@ impl CellmFile {
         self.tensors.iter().map(move |(name, t)| {
             let start = t.offset_bytes as usize;
             let end = start + t.nbytes as usize;
-            (name, &self.mmap[start..end])
+            (name, &self.data.as_slice()[start..end])
         })
     }
 
@@ -142,7 +214,7 @@ impl CellmFile {
             .ok_or_else(|| CoreError::Backend(format!("cellm: unknown tensor {name}")))?;
         let start = t.offset_bytes as usize;
         let end = start + t.nbytes as usize;
-        Ok(&self.mmap[start..end])
+        Ok(&self.data.as_slice()[start..end])
     }
 
     pub fn has_tensor(&self, name: &str) -> bool {

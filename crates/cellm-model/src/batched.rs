@@ -101,6 +101,7 @@ impl<'a> BatchedForward<'a> {
     }
 
     /// Run one batched decode step: produce one next token for each session.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub fn step_topk_batched(
         &mut self,
         handles: &mut [BatchedDecodeHandle<'_>],

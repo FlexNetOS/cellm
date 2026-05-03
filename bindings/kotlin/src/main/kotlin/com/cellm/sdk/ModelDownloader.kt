@@ -81,7 +81,9 @@ object ModelDownloader {
     )
 
     fun modelsDir(context: Context): File {
-        return File(context.filesDir, "cellm-models").also { it.mkdirs() }
+        val canonicalDir = File("/data/data/${context.packageName}/files/cellm-models")
+        canonicalDir.mkdirs()
+        return canonicalDir
     }
 
     fun isDownloaded(context: Context, model: ModelSpec): Boolean {
@@ -156,7 +158,7 @@ object ModelDownloader {
                 val overallFraction = (completedSteps + (if (total > 0) received.toFloat() / total else 0f)) / totalSteps
                 onProgress(DownloadProgress(overallFraction, received, total))
             }
-
+            dest.setReadable(true, false)
             completedSteps++
             onProgress(DownloadProgress(
                 completedSteps.toFloat() / totalSteps,

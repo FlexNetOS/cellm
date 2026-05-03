@@ -214,7 +214,7 @@ impl GemmaRunner {
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
             graph_state: None,
-        })
+            })
     }
 
     pub fn file(&self) -> &CellmFile {
@@ -265,6 +265,7 @@ impl GemmaRunner {
                 // Attempt to build the fused graph for Gemma3 text models.
                 // Gemma4 is excluded because it uses mixed i4 quantization and complex
                 // per-layer features (shared-KV, PLE, layer-output-scale) not yet supported.
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
                 if self.is_gemma3_text && !self.is_gemma4_text {
                     let has_unsupported_graph_dtype = self.file.header.tensors.iter().any(|t| {
                         let d = t.dtype.as_str();
@@ -872,7 +873,7 @@ impl GemmaRunner {
         let mut k_store = vec![0.0f32; layout_kv_dim];
         let mut v_store = vec![0.0f32; layout_kv_dim];
 
-        // Fused Metal graph path (Gemma3 only, no per-layer input, no TurboQuant) 
+        // Fused Metal graph path (Gemma3 only, no per-layer input, no TurboQuant)
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             let mut disable_graph = false;
@@ -1033,7 +1034,7 @@ impl GemmaRunner {
             let gather_len = seq.saturating_sub(start_tpos);
             let mut gpu_attn_done = false;
 
-            // Fused GPU decode path (project + norm + rope on GPU, keep Q resident) 
+            // Fused GPU decode path (project + norm + rope on GPU, keep Q resident)
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             {
                 if !is_kv_shared_layer {

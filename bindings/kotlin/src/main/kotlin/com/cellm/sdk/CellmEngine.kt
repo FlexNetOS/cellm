@@ -48,7 +48,7 @@ class CellmEngine private constructor(
 
         @JvmStatic
         private external fun nativeCreate(
-            modelPath: String,
+            modelPath: IntArray,
             tokensPerBlock: Int,
             totalBlocks: Int,
             topK: Int,
@@ -113,7 +113,7 @@ class CellmEngine private constructor(
         ): Int
 
         @JvmStatic
-        private external fun nativeBackendName(handle: Long): String
+        private external fun nativeBackendName(handle: Long): IntArray?
 
         @JvmStatic
         private external fun nativeSetSchedulingPolicy(handle: Long, policy: Int): Int
@@ -153,8 +153,18 @@ class CellmEngine private constructor(
             turboqInt8Dot: Boolean = true,
             turboqQjlCorr: Boolean = true
         ): CellmEngine {
+            android.util.Log.d("CellmEngine", "nativeCreate called with modelPath=$modelPath")
+            val testFile = java.io.File(modelPath)
+            android.util.Log.d("CellmEngine", "Java check: exists=${testFile.exists()}, canRead=${testFile.canRead()}, length=${testFile.length()}")
+            try {
+                java.io.FileInputStream(testFile).use { it.read() }
+                android.util.Log.d("CellmEngine", "Java FileInputStream: SUCCESS reading first byte")
+            } catch (e: Exception) {
+                android.util.Log.e("CellmEngine", "Java FileInputStream: FAILED - ${e.javaClass.simpleName}: ${e.message}")
+            }
+            val pathInts = modelPath.toByteArray(Charsets.UTF_8).map { it.toInt() and 0xFF }.toIntArray()
             val handle = nativeCreate(
-                modelPath,
+                pathInts,
                 tokensPerBlock,
                 totalBlocks,
                 topK,
@@ -167,6 +177,7 @@ class CellmEngine private constructor(
                 if (turboqInt8Dot) 1 else 0,
                 if (turboqQjlCorr) 1 else 0
             )
+            android.util.Log.d("CellmEngine", "nativeCreate returned handle=$handle")
             if (handle == 0L) {
                 throw RuntimeException("cellm_engine_create failed for $modelPath")
             }
@@ -237,7 +248,8 @@ class CellmEngine private constructor(
     }
 
     fun getBackendName(): String {
-        return nativeBackendName(handle)
+        val arr = nativeBackendName(handle)
+        return if (arr == null) "" else String(arr.map { it.toChar() }.toCharArray())
     }
 
     fun setSchedulingPolicy(policy: SchedulingPolicy): Boolean {
