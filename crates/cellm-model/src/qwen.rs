@@ -445,33 +445,7 @@ impl QwenRunner {
 
         for layer in 0..self.max_layers {
             // Input norm
-            // DEBUG: compare Metal vs CPU for layer 0 input norm
-            let debug_layer = layer == 0 && std::env::var("CELLM_DEBUG_QWEN").is_ok();
-            if debug_layer {
-                // CPU reference
-                let mut cpu_x_norm = vec![0.0f32; hidden];
-                let mut in_norm_w = vec![0.0f32; hidden];
-                self.rmsnorm_weight(&format!("{prefix}layers.{layer}.input_layernorm.weight"), &mut in_norm_w)?;
-                if self.rmsnorm_weight_is_offset { add_one_inplace(&mut in_norm_w); }
-                rms_norm_f32(&x, &in_norm_w, cfg.rms_norm_eps, &mut cpu_x_norm);
-
-                // Metal
-                let name = format!("{prefix}layers.{layer}.input_layernorm.weight");
-                let w = self.tensor_f16(&name)?.to_vec();
-                let add_one = self.rmsnorm_weight_is_offset;
-                self.metal_ops.as_ref().unwrap()
-                    .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, add_one, &name, &mut x_norm)
-                    .map_err(|e| CoreError::Backend(e.to_string()))?;
-
-                // Compare
-                let mut max_diff = 0.0f32;
-                for i in 0..hidden.min(10) {
-                    let diff = (x_norm[i] - cpu_x_norm[i]).abs();
-                    if diff > max_diff { max_diff = diff; }
-                }
-                eprintln!("QWEN_DEBUG layer={} RMS norm max_diff={:.8} first_10_cpu={:.4?} first_10_metal={:.4?}",
-                    layer, max_diff, &cpu_x_norm[..5], &x_norm[..5]);
-            } else if use_metal_norm {
+            if use_metal_norm {
                 let name = format!("{prefix}layers.{layer}.input_layernorm.weight");
                 let w = self.tensor_f16(&name)?.to_vec();
                 let add_one = self.rmsnorm_weight_is_offset;
