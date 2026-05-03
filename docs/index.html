@@ -432,6 +432,131 @@
                 border: 1px solid var(--border);
             }
 
+            /* GitHub Commits Widget */
+            .gh-commits-wrapper {
+                background: #f5f5f5;
+                border: 1px solid #e0e0e0;
+                border-radius: 6px;
+                padding: 10px 12px;
+                font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+                color: #333333;
+                max-width: 520px;
+            }
+            .gh-first-commit {
+                padding-bottom: 6px;
+            }
+            .gh-commits {
+                padding-top: 6px;
+            }
+            .gh-commit {
+                padding: 6px 0;
+            }
+            .gh-commit + .gh-commit {
+                border-top: 1px solid #e0e0e0;
+            }
+            #gh-toggle-btn {
+                width: 100%;
+                text-align: left;
+                background: transparent;
+                border: none;
+                border-top: 1px solid #e0e0e0;
+                padding: 6px 0;
+                margin-top: 6px;
+                color: #666;
+                font-family: inherit;
+                font-size: 0.7rem;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                transition: color 0.2s ease;
+            }
+            #gh-toggle-btn:hover {
+                color: #000;
+            }
+            .gh-commit-header {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                margin-bottom: 3px;
+            }
+            .gh-commit-icon {
+                color: #888;
+                flex-shrink: 0;
+                display: flex;
+            }
+            .gh-commit-title {
+                font-size: 0.78rem;
+                font-weight: 500;
+                color: #222;
+                line-height: 1.35;
+                word-break: break-word;
+            }
+            .gh-commit-stats {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                margin-bottom: 3px;
+                font-size: 0.7rem;
+            }
+            .gh-additions {
+                color: #1a7f37;
+            }
+            .gh-deletions {
+                color: #cf222e;
+            }
+            .gh-commit-bar {
+                display: flex;
+                gap: 2px;
+            }
+            .gh-commit-bar span {
+                display: inline-block;
+                width: 6px;
+                height: 6px;
+                border-radius: 1px;
+                background: #ddd;
+            }
+            .gh-commit-bar .bar-add {
+                background: #1a7f37;
+            }
+            .gh-commit-bar .bar-del {
+                background: #cf222e;
+            }
+            .gh-commit-meta {
+                display: flex;
+                align-items: center;
+                gap: 4px;
+                font-size: 0.7rem;
+                color: #888;
+            }
+            .gh-avatar {
+                width: 14px;
+                height: 14px;
+                border-radius: 50%;
+            }
+            .gh-author {
+                color: #333;
+                font-weight: 500;
+            }
+            .gh-commit-footer {
+                margin-top: 3px;
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                font-size: 0.7rem;
+            }
+            .gh-sha {
+                color: #0969da;
+                text-decoration: none;
+                font-family: ui-monospace, monospace;
+            }
+            .gh-sha:hover {
+                text-decoration: underline;
+            }
+            .gh-time {
+                color: #888;
+            }
+
             /* Lightbox */
             #lightbox {
                 position: fixed;
@@ -543,6 +668,19 @@
                     <strong>CellmFFI.xcframework:</strong> 33MB total (11MB per
                     platform: iOS, Simulator, macOS)<br/><strong>cellm-sdk.aar:</strong> 157KB + ~4.5MB .so
                 </p>
+                <div id="gh-commits-wrapper" class="gh-commits-wrapper" style="margin-top: 24px;">
+                    <div id="gh-first-commit" class="gh-first-commit">
+                        Loading latest commit...
+                    </div>
+                    <button id="gh-toggle-btn">
+                        <svg id="gh-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="transition:transform 0.2s ease;">
+                            <polyline points="6 9 12 15 18 9"></polyline>
+                        </svg>
+                        <span id="gh-toggle-text">Show 4 more commits</span>
+                    </button>
+                    <div id="gh-commits" class="gh-commits" style="display:none;">
+                    </div>
+                </div>
             </header>
 
             <div class="search-container">
@@ -1449,6 +1587,140 @@
                 e.preventDefault();
                 window.location.hash = "";
             });
+
+            function renderCommitHtml(d) {
+                if (!d) return '';
+                const msg = d.commit.message.split('\n')[0];
+                const additions = d.stats ? d.stats.additions : 0;
+                const deletions = d.stats ? d.stats.deletions : 0;
+                const total = additions + deletions || 1;
+                const addSeg = Math.round((additions / total) * 5);
+                const delSeg = Math.round((deletions / total) * 5);
+                let bars = '';
+                for (let j = 0; j < 5; j++) {
+                    if (j < addSeg) bars += '<span class="bar-add"></span>';
+                    else if (j < addSeg + delSeg) bars += '<span class="bar-del"></span>';
+                    else bars += '<span></span>';
+                }
+                const authorName = d.commit.author.name;
+                const avatar = d.author ? d.author.avatar_url : '';
+                const sha = d.sha.substring(0, 7);
+                const date = new Date(d.commit.author.date);
+                const timeAgo = formatTimeAgo(date);
+
+                return `
+                <div class="gh-commit">
+                    <div class="gh-commit-header">
+                        <span class="gh-commit-icon">
+                            <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+                                <circle cx="8" cy="8" r="3"/>
+                                <path d="M1 8h5M10 8h5"/>
+                            </svg>
+                        </span>
+                        <div class="gh-commit-title">${escapeHtml(msg)}</div>
+                    </div>
+                    <div class="gh-commit-stats">
+                        <span class="gh-additions">+${additions}</span>
+                        <span class="gh-deletions">-${deletions}</span>
+                        <div class="gh-commit-bar">${bars}</div>
+                    </div>
+                    <div class="gh-commit-meta">
+                        ${avatar ? `<img class="gh-avatar" src="${avatar}" alt="" />` : ''}
+                        <span class="gh-author">${escapeHtml(authorName)}</span>
+                        <span>authored and ${escapeHtml(authorName)} committed ${timeAgo}</span>
+                    </div>
+                    <div class="gh-commit-footer">
+                        <a href="https://github.com/jeffasante/cellm/commit/${d.sha}" class="gh-sha" target="_blank">${sha}</a>
+                        <span class="gh-time">${timeAgo}</span>
+                    </div>
+                </div>`;
+            }
+
+            document.getElementById('gh-toggle-btn').addEventListener('click', function() {
+                const panel = document.getElementById('gh-commits');
+                const chevron = document.getElementById('gh-chevron');
+                const text = document.getElementById('gh-toggle-text');
+                const count = text.dataset.count || '4';
+                if (panel.style.display === 'none') {
+                    panel.style.display = 'block';
+                    chevron.style.transform = 'rotate(180deg)';
+                    text.textContent = 'Hide commits';
+                } else {
+                    panel.style.display = 'none';
+                    chevron.style.transform = 'rotate(0deg)';
+                    text.textContent = 'Show ' + count + ' more commits';
+                }
+            });
+
+            async function loadCommits() {
+                const container = document.getElementById('gh-commits');
+                const firstContainer = document.getElementById('gh-first-commit');
+                const toggleText = document.getElementById('gh-toggle-text');
+                if (!container || !firstContainer) return;
+                try {
+                    const listRes = await fetch('https://api.github.com/repos/jeffasante/cellm/commits?per_page=5');
+                    if (!listRes.ok) throw new Error('GitHub API error');
+                    const commits = await listRes.json();
+                    const detailPromises = commits.map(c =>
+                        fetch(`https://api.github.com/repos/jeffasante/cellm/commits/${c.sha}`).then(r => r.ok ? r.json() : null)
+                    );
+                    const details = await Promise.all(detailPromises);
+
+                    const first = details[0];
+                    const rest = details.slice(1);
+
+                    if (first) {
+                        firstContainer.innerHTML = renderCommitHtml(first);
+                    } else {
+                        firstContainer.style.display = 'none';
+                    }
+
+                    let html = '';
+                    rest.forEach((d) => {
+                        if (!d) return;
+                        html += renderCommitHtml(d);
+                    });
+
+                    const remaining = rest.filter(Boolean).length;
+                    if (toggleText) {
+                        toggleText.dataset.count = remaining;
+                        toggleText.textContent = 'Show ' + remaining + ' more commits';
+                    }
+
+                    container.innerHTML = html || '<p style="color:#888;font-size:0.75rem;">No more commits.</p>';
+                    if (!remaining) {
+                        document.getElementById('gh-toggle-btn').style.display = 'none';
+                    }
+                } catch (e) {
+                    console.error('GitHub commits load failed', e);
+                    firstContainer.style.display = 'none';
+                    document.getElementById('gh-toggle-btn').style.display = 'none';
+                    container.style.display = 'none';
+                }
+            }
+
+            function escapeHtml(text) {
+                const div = document.createElement('div');
+                div.textContent = text;
+                return div.innerHTML;
+            }
+
+            function formatTimeAgo(date) {
+                const seconds = Math.floor((new Date() - date) / 1000);
+                let interval = seconds / 31536000;
+                if (interval > 1) return Math.floor(interval) + ' years ago';
+                interval = seconds / 2592000;
+                if (interval > 1) return Math.floor(interval) + ' months ago';
+                interval = seconds / 86400;
+                if (interval > 1) return Math.floor(interval) + ' days ago';
+                interval = seconds / 3600;
+                if (interval > 1) return Math.floor(interval) + ' hours ago';
+                interval = seconds / 60;
+                if (interval > 1) return Math.floor(interval) + ' minutes ago';
+                return 'just now';
+            }
+
+            loadCommits();
         </script>
     </body>
 </html>
