@@ -620,6 +620,57 @@ final class CellmVLMEngine {
     }
 }
 
+final class CellmConcurrentEngine {
+    private var handle: cellm_engine_t = 0
+    private let tokenizer: CellmTokenizer
+    let activeBackend: String
+
+    init(modelURL: URL, tokenizer: CellmTokenizer, tokensPerBlock: UInt32 = 16, totalBlocks: UInt32 = 256, topK: UInt32 = 40, temperature: Float = 0.2, repeatPenalty: Float = 1.08, repeatWindow: UInt32 = 96, seed: UInt64 = 1, backend: CellmBackend = .metal, kvEncoding: CellmKvEncoding = .f16, turboqInt8Dot: Bool = true, turboqQjlCorr: Bool = true) throws {
+        self.tokenizer = tokenizer
+        let path = modelURL.path
+        let h = path.withCString { cstr in
+            cellm_engine_create_v4(cstr, tokensPerBlock, totalBlocks, topK, temperature, repeatPenalty, repeatWindow, seed, backend.rawValue, kvEncoding.rawValue, turboqInt8Dot ? 1 : 0, turboqQjlCorr ? 1 : 0)
+        }
+        guard h != 0 else { throw CellmError.message(CellmFFI.lastError()) }
+        self.handle = h
+        self.activeBackend = CellmFFI.engineBackendName(h)
+    }
+
+    deinit {
+        if handle != 0 { cellm_engine_destroy(handle); handle = 0 }
+    }
+
+    func createSession() -> cellm_session_t { return cellm_session_create(handle) }
+    func cancelSession(_ session: cellm_session_t) { _ = cellm_session_cancel(handle, session) }
+
+    func submitTokensCached(session: cellm_session_t, tokens: [UInt32]) throws -> (next: UInt32, cacheHit: Bool) {
+        var next: UInt32 = 0, cacheHit: UInt32 = 0
+        let rc = tokens.withUnsafeBufferPointer { buf in
+            cellm_submit_tokens_cached(handle, session, buf.baseAddress, buf.count, &next, &cacheHit)
+        }
+        if rc != 0 { throw CellmError.message(CellmFFI.lastError()) }
+        return (next, cacheHit == 1)
+    }
+
+    func stepDecode() throws -> (session: cellm_session_t, token: UInt32)? {
+        var outSession: cellm_session_t = 0, tok: UInt32 = 0
+        let r = cellm_step_decode(handle, &outSession, &tok)
+        if r < 0 { throw CellmError.message(CellmFFI.lastError()) }
+        return r == 0 ? nil : (outSession, tok)
+    }
+
+    func setThermalLevel(_ level: CellmThermalLevel) throws {
+        let rc = cellm_engine_set_thermal_level(handle, level.rawValue)
+        if rc != 0 { throw CellmError.message(CellmFFI.lastError()) }
+    }
+
+    func kvStats() -> (used: UInt32, free: UInt32) {
+        var used: UInt32 = 0, free: UInt32 = 0
+        _ = cellm_engine_kv_stats(handle, &used, &free)
+        return (used, free)
+    }
+}
+
 enum CellmFFI {
     static func lastError() -> String {
         var buf = [CChar](repeating: 0, count: 4096)

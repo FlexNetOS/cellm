@@ -803,11 +803,11 @@ hf download Qwen/Qwen3.5-0.8B --local-dir models/hf/qwen3.5-0.8b
 
 
 ```bash
-# CPU
+# metal
 ./target/release/infer \
   --model models/to-huggingface/qwen3.5-0.8b-v1/qwen3.5-0.8b-f16.cellm \
   --tokenizer models/to-huggingface/qwen3.5-0.8b-v1/tokenizer.json \
-  --prompt "Hello, who are you?" \
+  --prompt "2 + 2?" \
   --chat --chat-format auto \
   --gen 64 --temperature 0 --backend metal --kv-encoding f16
 ```
@@ -843,6 +843,16 @@ hf download Qwen/Qwen3.5-0.8B --local-dir models/hf/qwen3.5-0.8b
   --model models/to-huggingface/qwen3.5-0.8b-v1/qwen3.5-0.8b-i4.cellm \
   --tokenizer models/to-huggingface/qwen3.5-0.8b-v1/tokenizer.json \
   --prompt "Hello, who are you?" \
+  --gen 64 --backend metal
+```
+
+
+```bash
+# METAL
+./target/release/infer \
+  --model models/to-huggingface/qwen3.5-0.8b-v1/qwen3.5-0.8b-i4.cellm \
+  --tokenizer models/to-huggingface/qwen3.5-0.8b-v1/tokenizer.json \
+  --prompt "2 + 2?" \
   --gen 64 --backend metal
 ```
 

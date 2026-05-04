@@ -23,6 +23,10 @@ struct CellmDemoApp: App {
                         .tabItem {
                             Label("Chat Bot", systemImage: "bubble.left.and.bubble.right")
                         }
+                    ConcurrentChatView()
+                        .tabItem {
+                            Label("Concurrent", systemImage: "rectangle.split.2x1")
+                        }
                 }
             }
         }

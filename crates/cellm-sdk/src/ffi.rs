@@ -24,6 +24,10 @@ fn last_error_cell() -> &'static Mutex<Option<String>> {
     LAST_ERROR.get_or_init(|| Mutex::new(None))
 }
 
+
+fn engine_guard(engine: cellm_engine_t) -> std::sync::MutexGuard<'static, Engine> {
+    unsafe { &*(engine as *mut std::sync::Mutex<Engine>) }.lock().unwrap_or_else(|poison| poison.into_inner())
+}
 fn set_last_error(msg: impl Into<String>) {
     let mut g = last_error_cell()
         .lock()
@@ -304,7 +308,7 @@ pub extern "C" fn cellm_engine_create(
         };
         let engine = Engine::new(Path::new(model_path), cfg)
             .map_err(|e| format!("engine_create failed: {e}"))?;
-        Ok::<cellm_engine_t, String>(Box::into_raw(Box::new(engine)) as u64)
+        Ok::<cellm_engine_t, String>(Box::into_raw(Box::new(std::sync::Mutex::new(engine))) as u64)
     })();
 
     match result {
@@ -322,7 +326,7 @@ pub extern "C" fn cellm_engine_destroy(engine: cellm_engine_t) {
         return;
     }
     unsafe {
-        drop(Box::from_raw(engine as *mut Engine));
+        drop(Box::from_raw(engine as *mut std::sync::Mutex<Engine>));
     }
 }
 
@@ -355,7 +359,7 @@ pub extern "C" fn cellm_engine_create_v2(
         };
         let engine = Engine::new(Path::new(model_path), cfg)
             .map_err(|e| format!("engine_create_v2 failed: {e}"))?;
-        Ok::<cellm_engine_t, String>(Box::into_raw(Box::new(engine)) as u64)
+        Ok::<cellm_engine_t, String>(Box::into_raw(Box::new(std::sync::Mutex::new(engine))) as u64)
     })();
 
     match result {
@@ -400,7 +404,7 @@ pub extern "C" fn cellm_engine_create_v3(
             };
             let engine = Engine::new(Path::new(model_path), cfg)
                 .map_err(|e| format!("engine_create_v3 failed: {e}"))?;
-            Ok::<cellm_engine_t, String>(Box::into_raw(Box::new(engine)) as u64)
+            Ok::<cellm_engine_t, String>(Box::into_raw(Box::new(std::sync::Mutex::new(engine))) as u64)
         })()
     }));
 
@@ -459,7 +463,7 @@ pub extern "C" fn cellm_engine_create_v4(
             };
             let engine = Engine::new(Path::new(model_path), cfg)
                 .map_err(|e| format!("engine_create_v4 failed: {e}"))?;
-            Ok::<cellm_engine_t, String>(Box::into_raw(Box::new(engine)) as u64)
+            Ok::<cellm_engine_t, String>(Box::into_raw(Box::new(std::sync::Mutex::new(engine))) as u64)
         })()
     }));
 
@@ -633,7 +637,8 @@ pub extern "C" fn cellm_session_create(engine: cellm_engine_t) -> SessionId {
         return 0;
     }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let e = unsafe { &mut *(engine as *mut Engine) };
+        let mut guard = engine_guard(engine);
+        let e = &mut *guard;
         e.create_session()
     }));
     match result {
@@ -654,7 +659,8 @@ pub extern "C" fn cellm_session_cancel(engine: cellm_engine_t, session: SessionI
         set_last_error("session_cancel: null engine".to_string());
         return -1;
     }
-    let e = unsafe { &mut *(engine as *mut Engine) };
+    let mut guard = engine_guard(engine);
+    let e = &mut *guard;
     match e.cancel_session(session) {
         Ok(_) => 0,
         Err(err) => {
@@ -670,7 +676,8 @@ pub extern "C" fn cellm_session_suspend(engine: cellm_engine_t, session: Session
         set_last_error("session_suspend: null engine".to_string());
         return -1;
     }
-    let e = unsafe { &mut *(engine as *mut Engine) };
+    let mut guard = engine_guard(engine);
+    let e = &mut *guard;
     match e.suspend_session(session) {
         Ok(_) => 0,
         Err(err) => {
@@ -686,7 +693,8 @@ pub extern "C" fn cellm_session_resume(engine: cellm_engine_t, session: SessionI
         set_last_error("session_resume: null engine".to_string());
         return -1;
     }
-    let e = unsafe { &mut *(engine as *mut Engine) };
+    let mut guard = engine_guard(engine);
+    let e = &mut *guard;
     match e.resume_session(session) {
         Ok(_) => 0,
         Err(err) => {
@@ -702,7 +710,8 @@ pub extern "C" fn cellm_session_reset(engine: cellm_engine_t, session: SessionId
         set_last_error("session_reset: null engine".to_string());
         return -1;
     }
-    let e = unsafe { &mut *(engine as *mut Engine) };
+    let mut guard = engine_guard(engine);
+    let e = &mut *guard;
     match e.reset_session(session) {
         Ok(_) => 0,
         Err(err) => {
@@ -729,7 +738,8 @@ pub extern "C" fn cellm_engine_set_thermal_level(engine: cellm_engine_t, level: 
         }
     };
 
-    let e = unsafe { &mut *(engine as *mut Engine) };
+    let mut guard = engine_guard(engine);
+    let e = &mut *guard;
     e.set_thermal_level(thermal);
     0
 }
@@ -756,7 +766,8 @@ pub extern "C" fn cellm_submit_tokens(
     }
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let e = unsafe { &mut *(engine as *mut Engine) };
+        let mut guard = engine_guard(engine);
+        let e = &mut *guard;
         let slice = unsafe { std::slice::from_raw_parts(tokens, token_count) };
         e.submit_tokens(session, slice)
     }));
@@ -804,7 +815,8 @@ pub extern "C" fn cellm_submit_tokens_cached(
     }
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let e = unsafe { &mut *(engine as *mut Engine) };
+        let mut guard = engine_guard(engine);
+        let e = &mut *guard;
         let slice = unsafe { std::slice::from_raw_parts(tokens, token_count) };
         e.submit_tokens_cached(session, slice)
     }));
@@ -845,7 +857,8 @@ pub extern "C" fn cellm_step_decode(
         return -1;
     }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let e = unsafe { &mut *(engine as *mut Engine) };
+        let mut guard = engine_guard(engine);
+        let e = &mut *guard;
         e.step_decode()
     }));
     match result {
@@ -886,7 +899,8 @@ pub extern "C" fn cellm_engine_kv_stats(
         return -1;
     }
 
-    let e = unsafe { &mut *(engine as *mut Engine) };
+    let guard = engine_guard(engine);
+    let e = &*guard;
     let st = e.stats();
     unsafe {
         *out_used_blocks = st.used_kv_blocks as u32;
@@ -909,7 +923,8 @@ pub extern "C" fn cellm_engine_backend_name(
         set_last_error("backend_name: null/empty output buffer".to_string());
         return 0;
     }
-    let e = unsafe { &*(engine as *const Engine) };
+    let guard = engine_guard(engine);
+    let e = &*guard;
     let msg = e.backend_name();
     let bytes = msg.as_bytes();
     let n = bytes.len().min(buf_len.saturating_sub(1));
@@ -926,7 +941,8 @@ pub extern "C" fn cellm_engine_is_litert_proxy(engine: cellm_engine_t) -> u32 {
         set_last_error("engine_is_litert_proxy: null engine".to_string());
         return 0;
     }
-    let e = unsafe { &*(engine as *const Engine) };
+    let guard = engine_guard(engine);
+    let e = &*guard;
     if e.is_litert_proxy() { 1 } else { 0 }
 }
 
@@ -948,7 +964,8 @@ pub extern "C" fn cellm_engine_set_scheduling_policy(
             return -1;
         }
     };
-    let e = unsafe { &mut *(engine as *mut Engine) };
+    let mut guard = engine_guard(engine);
+    let e = &mut *guard;
     e.set_scheduling_policy(sp);
     0
 }
@@ -958,7 +975,8 @@ pub extern "C" fn cellm_engine_scheduling_policy(engine: cellm_engine_t) -> u32 
     if engine == 0 {
         return 0;
     }
-    let e = unsafe { &*(engine as *const Engine) };
+    let guard = engine_guard(engine);
+    let e = &*guard;
     match e.scheduling_policy() {
         cellm_scheduler::SchedulingPolicy::Fair => 0,
         cellm_scheduler::SchedulingPolicy::LatencyFirst => 1,
@@ -971,7 +989,8 @@ pub extern "C" fn cellm_engine_total_tokens(engine: cellm_engine_t) -> u64 {
     if engine == 0 {
         return 0;
     }
-    let e = unsafe { &*(engine as *const Engine) };
+    let guard = engine_guard(engine);
+    let e = &*guard;
     e.stats().total_tokens_generated
 }
 
@@ -984,7 +1003,8 @@ pub extern "C" fn cellm_engine_tok_per_sec(
         set_last_error("tok_per_sec: null args".to_string());
         return -1;
     }
-    let e = unsafe { &*(engine as *const Engine) };
+    let guard = engine_guard(engine);
+    let e = &*guard;
     let st = e.stats();
     unsafe { *out_tok_per_sec = st.current_tok_per_sec; }
     0
@@ -996,7 +1016,8 @@ pub extern "C" fn cellm_engine_reset_stats_window(engine: cellm_engine_t) -> i32
         set_last_error("reset_stats_window: null engine".to_string());
         return -1;
     }
-    let e = unsafe { &mut *(engine as *mut Engine) };
+    let mut guard = engine_guard(engine);
+    let e = &mut *guard;
     e.reset_stats_window();
     0
 }
@@ -1017,7 +1038,8 @@ pub extern "C" fn cellm_engine_generate_text(
             return Err("engine_generate_text: null engine".to_string());
         }
         let prompt = cstr_to_str(prompt_utf8)?;
-        let e = unsafe { &mut *(engine as *mut Engine) };
+        let mut guard = engine_guard(engine);
+        let e = &mut *guard;
         let text = e
             .generate_text_litert(prompt)
             .map_err(|err| format!("engine_generate_text failed: {err}"))?;
@@ -1072,7 +1094,8 @@ pub extern "C" fn cellm_engine_generate_multimodal(
             Some(std::path::PathBuf::from(cstr_to_str(audio_path_utf8)?))
         };
 
-        let e = unsafe { &mut *(engine as *mut Engine) };
+        let mut guard = engine_guard(engine);
+        let e = &mut *guard;
         let text = e
             .generate_multimodal_litert(prompt, image_path.as_deref(), audio_path.as_deref())
             .map_err(|err| format!("engine_generate_multimodal failed: {err}"))?;
@@ -1120,7 +1143,8 @@ pub extern "C" fn cellm_vlm_describe_image(
         }
         let prompt = cstr_to_str(prompt_utf8)?;
         let img = unsafe { slice::from_raw_parts(image_bytes, image_len) };
-        let e = unsafe { &mut *(engine as *mut Engine) };
+        let mut guard = engine_guard(engine);
+        let e = &mut *guard;
         if !e.has_session(session) {
             return Err(format!("vlm_describe_image: unknown session id {session}"));
         }
