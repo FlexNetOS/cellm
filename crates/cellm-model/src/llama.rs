@@ -150,21 +150,11 @@ impl LlamaRunner {
             // Fused graph supports f16/f32/bf16. i8 kernels exist (encode_mv_i8)
             // but have a known numerical issue. Set CELLM_LLAMA_ENABLE_GRAPH_I8=1
             // to enable experimental i8 fused graph support.
-            let enable_i8 = std::env::var("CELLM_LLAMA_ENABLE_GRAPH_I8")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-            let has_unsupported_graph_dtype = self.file.header.tensors.iter().any(|t| {
-                let d = t.dtype.as_str();
-                if enable_i8 && d == "i8" { return false; }
-                d != "f16" && d != "f32" && d != "bf16"
-            });
-            if has_unsupported_graph_dtype {
-                eprintln!("llama: fused Metal graph disabled: model contains quantized weights not yet supported by the Metal graph kernels");
-            }
+            // i8/i4 weights dequantized to f16 during preload below
             let graph_enabled = std::env::var("CELLM_LLAMA_ENABLE_GRAPH")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(true);
-            if graph_enabled && !has_unsupported_graph_dtype {
+            if graph_enabled {
                 let gs_res = LlamaGraphState::new(
                     self.cfg.hidden_size,
                     self.cfg.num_attention_heads,
@@ -177,7 +167,45 @@ impl LlamaRunner {
                     Ok(mut gs) => {
                         println!("llama: detected tensor prefix: '{}'", self.tensor_prefix);
                         println!("llama: preloading weights into metal graph...");
+                        let dtype_map: std::collections::HashMap<&str, &str> = self.file.header.tensors.iter()
+                            .map(|t| (t.name.as_str(), t.dtype.as_str())).collect();
+                        let mut scale_seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+                        for t in &self.file.header.tensors {
+                            if t.name.ends_with(".qscale") {
+                                if let Some(base) = t.name.strip_suffix(".qscale") { scale_seen.insert(base); }
+                            }
+                        }
                         for (name, data) in self.file.all_tensors() {
+                            if name.ends_with(".qscale") { continue; }
+                            let dtype = dtype_map.get(name.as_str()).copied().unwrap_or("");
+                            if (dtype == "i8" || dtype == "i4") && scale_seen.contains(name.as_str()) {
+                                let qscale_name = format!("{name}.qscale");
+                                if let Ok(sbytes) = self.file.tensor_bytes(&qscale_name) {
+                                    let scales: &[u16] = bytemuck::cast_slice(sbytes);
+                                    let rows = scales.len();
+                                    let cols = if rows > 0 { data.len() / rows } else { 0 };
+                                    let mut f16_data: Vec<u16> = vec![0u16; data.len()];
+                                    for r in 0..rows {
+                                        let scale = half::f16::from_bits(scales[r]).to_f32();
+                                        let off = r * cols;
+                                        if dtype == "i8" {
+                                            for c in 0..cols {
+                                                let v = (data[off + c] as i8) as f32 * scale;
+                                                f16_data[off + c] = half::f16::from_f32(v).to_bits();
+                                            }
+                                        } else {
+                                            for c in 0..cols {
+                                                let b = data[off + c / 2];
+                                                let n = if c % 2 == 0 { b & 0xF } else { b >> 4 };
+                                                let v = (n as i8 - 8) as f32 * scale;
+                                                f16_data[off + c] = half::f16::from_f32(v).to_bits();
+                                            }
+                                        }
+                                    }
+                                    gs.preload_weight_f16(name.to_string(), bytemuck::cast_slice(&f16_data));
+                                    continue;
+                                }
+                            }
                             gs.preload_weight_f16(name.to_string(), data);
                         }
                         self.graph_state = Some(gs);
