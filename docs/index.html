@@ -1432,7 +1432,26 @@
                         text = text.replace(/✅|❌|⚠️|🚀/g, "");
 
                         // Render Markdown
-                        const html = marked.parse(text);
+                        let html = marked.parse(text);
+                        
+                        // Post-process: convert <img> to <video> for video files
+                        const tempDiv = document.createElement("div");
+                        tempDiv.innerHTML = html;
+                        tempDiv.querySelectorAll("img").forEach(img => {
+                            const src = img.getAttribute("src") || "";
+                            if (src.match(/\.(mp4|webm|ogg)$/i)) {
+                                const video = document.createElement("video");
+                                video.src = src;
+                                video.controls = true;
+                                video.loop = true;
+                                video.muted = true;
+                                video.autoplay = true;
+                                video.playsInline = true;
+                                img.parentNode.replaceChild(video, img);
+                            }
+                        });
+                        html = tempDiv.innerHTML;
+
                         contentView.innerHTML = html;
 
                         // Determine base directory for relative assets
@@ -1459,6 +1478,16 @@
                                             !val.startsWith("#") &&
                                             !val.startsWith("data:")
                                         ) {
+                                            let newPath = baseDir + val;
+                                            
+                                            // Specific fix for GitHub Pages serving from docs/
+                                            // When viewing ../README.md, baseDir is "../"
+                                            // Asset path in README is "docs/assets/..."
+                                            // Result is "../docs/assets/..." which fails at root
+                                            if (newPath.startsWith("../docs/")) {
+                                                newPath = newPath.replace("../docs/", "");
+                                            }
+
                                             // For links, we want them to stay relative to the root for navigation
                                             // unless they are internal anchors
                                             if (
@@ -1469,13 +1498,13 @@
                                                 if (!val.startsWith(baseDir)) {
                                                     el.setAttribute(
                                                         attr,
-                                                        baseDir + val,
+                                                        newPath,
                                                     );
                                                 }
                                             } else if (attr !== "href") {
                                                 el.setAttribute(
                                                     attr,
-                                                    baseDir + val,
+                                                    newPath,
                                                 );
                                             }
                                         }
