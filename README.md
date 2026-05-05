@@ -229,8 +229,10 @@ Then open `bindings/ios/CellmDemo` in Xcode.
 | Model | Size | Best For | Notes |
 |---|---|---|---|
 | **SmolLM2** | 135M-360M | Fast smoke tests, small devices | Best LLM starter model |
-| **Qwen2.5 / Qwen3.5** | 0.5B-0.8B | Multilingual, reasoning | DeltaNet layers supported (CPU ref) |
+| **LFM2.5** | 350M | Long-context, efficient inference | Linear attention, up to 256K context |
+| **Qwen2.5 / Qwen3.0 / Qwen3.5** | 0.5B-0.8B | Multilingual, reasoning | DeltaNet layers supported (CPU ref) |
 | **Gemma-3** | 1B | Quality vs size tradeoff | Metal path active, CPU-safe fallback |
+| **Bonsai** | 1.7B | High-quality local chat | 1-bit quantized; see `docs/bonsai_1bit_analysis.md` |
 | **Gemma-4** | 2B-4B | Larger mobile workloads | Experimental; see `docs/gemma4_*` |
 | **SmolVLM** | 256M | Vision-language (ONNX) | Native `.cellm` VLM path in progress |
 | **FunctionGemma** | 270M | Mobile actions / tool use | Experimental quality |
