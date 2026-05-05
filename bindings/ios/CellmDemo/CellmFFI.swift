@@ -199,6 +199,7 @@ final class CellmEngine {
         exerciseSuspendResume: Bool = false,
         onToken: ((String) -> Void)? = nil
     ) throws -> String {
+        if Task.isCancelled { throw CellmError.message("Generation cancelled before start") }
         if isLiteRtProxy {
             let text = try generateWithLiteRt(prompt: prompt, imageURL: imageURL, audioURL: audioURL)
             onToken?(text)
@@ -315,6 +316,10 @@ final class CellmEngine {
 
         for i in 0..<(maxNewTokens - 1) {
             if stopReason == "uppercase_constraint_satisfied" {
+                break
+            }
+            if Task.isCancelled {
+                stopReason = "cancelled"
                 break
             }
             var outSession: UInt64 = 0
@@ -508,6 +513,10 @@ final class CellmEngine {
     func resetSession() throws {
         let rc = cellm_session_reset(handle, session)
         if rc != 0 { throw CellmError.message(CellmFFI.lastError()) }
+    }
+
+    func cancel() {
+        _ = cellm_session_cancel(handle, session)
     }
 
     private static func hasLongDigitRun(_ piece: String, threshold: Int) -> Bool {

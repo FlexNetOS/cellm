@@ -11,7 +11,7 @@ struct ConcurrentChatView: View {
         let id = UUID()
         var title: String
         var msgs: [Msg] = []
-        var sessionId: cellm_session_t = 0
+        var sessionId: UInt64 = 0
         var generating = false
         var tokCount = 0
         var err: String?
@@ -36,7 +36,7 @@ struct ConcurrentChatView: View {
     @State private var newTitle = ""
     @State private var showNew = false
     @State private var pick: PickerTarget?
-    @Environment(.colorScheme) private var scheme
+    @Environment(\.colorScheme) private var scheme
 
     private enum PickerTarget: String, Identifiable {
         case llmModel, tokenizer
@@ -121,7 +121,7 @@ struct ConcurrentChatView: View {
                 } label: {
                     HStack(spacing: 4) {
                         Image(systemName: engine == nil ? "arrow.down.circle" : "checkmark.circle.fill")
-                            .foregroundStyle(engine == nil ? .secondary : .green)
+                            .foregroundStyle(engine == nil ? Color.secondary : .green)
                         Text(modelLabel.isEmpty ? "Select Model" : modelLabel)
                             .font(.subheadline.bold())
                         Image(systemName: "chevron.down").font(.caption2)
@@ -151,7 +151,7 @@ struct ConcurrentChatView: View {
                     Image(systemName: backendLabel == "metal" ? "bolt.fill" : "cpu").font(.caption2)
                     Text(backendLabel.uppercased()).font(.caption2.bold())
                 }
-                .foregroundStyle(backendLabel == "metal" ? .green : .secondary)
+                .foregroundStyle(backendLabel == "metal" ? .green : Color.secondary)
                 .padding(.horizontal, 8).padding(.vertical, 4)
                 .background((backendLabel == "metal" ? Color.green : Color.gray).opacity(0.12))
                 .clipShape(Capsule())
@@ -231,7 +231,6 @@ struct ConcurrentChatView: View {
                             HStack(spacing: 4) {
                                 if t.generating {
                                     Image(systemName: "circle.fill").font(.system(size: 6)).foregroundStyle(.green)
-                                        .symbolEffect(.pulse)
                                 }
                                 Text(t.title).font(.caption.bold()).lineLimit(1)
                             }
@@ -249,7 +248,7 @@ struct ConcurrentChatView: View {
                 .padding(.horizontal, 12)
             }
             Button { showNew = true } label: {
-                Image(systemName: "plus.circle.fill").font(.title3).foregroundStyle(.accent)
+                Image(systemName: "plus.circle.fill").font(.title3).foregroundColor(.accentColor)
                     .padding(.horizontal, 12)
             }
         }
@@ -274,7 +273,7 @@ struct ConcurrentChatView: View {
     // MARK: Logic
     private func createThread(_ title: String) {
         guard let eng = engine else { return }
-        let t = Thread(title: title, sessionId: eng.createSession(), msgs: [Msg(role: "Assistant", text: "Hi! Ready to chat.")])
+        let t = Thread(title: title, msgs: [Msg(role: "Assistant", text: "Hi! Ready to chat.")], sessionId: eng.createSession())
         threads.append(t)
         if selId == nil { selId = t.id }
     }
@@ -519,7 +518,7 @@ private struct ThreadComposer: View {
                 Image(systemName: "paperplane.fill").font(.title3)
                     .padding(12)
                     .background(text.isEmpty || isGenerating ? Color(.secondarySystemGroupedBackground) : Color.accentColor)
-                    .foregroundStyle(text.isEmpty || isGenerating ? .secondary : .white)
+                    .foregroundColor(text.isEmpty || isGenerating ? .secondary : .white)
                     .clipShape(Circle())
             }
             .disabled(text.isEmpty || isGenerating)
@@ -534,7 +533,7 @@ private struct SessionMgrSheet: View {
     let threads: [ConcurrentChatView.Thread]
     let kv: (used: UInt32, free: UInt32)
     let backend: String
-    @Environment(.dismiss) private var dismiss
+    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         NavigationStack {
@@ -592,29 +591,5 @@ private struct SessionMgrSheet: View {
 
 // MARK: - Helper for thread list access
 
-private extension ConcurrentChatView.Thread: @unchecked Sendable {}
-private extension ConcurrentChatView.Msg: @unchecked Sendable {}
-
-// MARK: - DocumentPicker (shared)
-
-private struct DocumentPicker: UIViewControllerRepresentable {
-    let allowed: [UTType]
-    let onPick: (URL) -> Void
-
-    func makeCoordinator() -> Coordinator { Coordinator(self) }
-    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
-        let vc = UIDocumentPickerViewController(forOpeningContentTypes: allowed, asCopy: true)
-        vc.delegate = context.coordinator
-        return vc
-    }
-    func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
-
-    class Coordinator: NSObject, UIDocumentPickerDelegate {
-        let parent: DocumentPicker
-        init(_ parent: DocumentPicker) { self.parent = parent }
-        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-            guard let url = urls.first else { return }
-            parent.onPick(url)
-        }
-    }
-}
+extension ConcurrentChatView.Thread: @unchecked Sendable {}
+extension ConcurrentChatView.Msg: @unchecked Sendable {}

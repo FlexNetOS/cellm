@@ -39,7 +39,15 @@ struct ChatView: View {
     }
     @State private var localModels: [LocalModelInfo] = []
 
-    @State private var messages: [ChatMessage] = []
+    private struct ChatThread: Identifiable {
+        let id = UUID()
+        var title: String
+        var messages: [ChatMessage] = []
+        var isGenerating = false
+        var errorText: String?
+    }
+    @State private var threads: [ChatThread] = [ChatThread(title: "Chat 1")]
+    @State private var selectedThreadId: UUID?
     @State private var inputText: String = ""
 
     @State private var llmModelURL: URL?
@@ -83,7 +91,7 @@ struct ChatView: View {
             VStack(spacing: 0) {
                 premiumHeader
                 
-                if messages.isEmpty && !isRunning {
+                if threads.isEmpty {
                     Spacer()
                     emptyStateHero
                     Spacer()
@@ -91,6 +99,7 @@ struct ChatView: View {
                     messagesView
                 }
                 
+                tabBar
                 premiumComposer
             }
         }
@@ -139,6 +148,7 @@ struct ChatView: View {
         .onChange(of: llmTokenizerURL) { _ in persistSharedSelection() }
         .onChange(of: scenePhase) { phase in
             guard phase != .active else { return }
+            cachedEngine?.cancel()
             generationTask?.cancel()
             generationTask = nil
             initTask?.cancel()
@@ -201,11 +211,11 @@ struct ChatView: View {
                         )
                     }
                     Button {
-                        // New Chat action
+                        createNewThread()
                     } label: {
-                        Image(systemName: "plus.circle")
+                        Image(systemName: "plus.circle.fill")
                             .font(.title3)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(Color.accentColor)
                     }
                 }
             }
@@ -234,11 +244,19 @@ struct ChatView: View {
                     Button("Pick Custom LLM...") { pickerTarget = .llmModel }
                     Button("Pick Custom Tokenizer...") { pickerTarget = .tokenizer }
                 }
+                Section("Manage") {
+                    Button(role: .destructive) {
+                        threads.removeAll()
+                        createNewThread()
+                    } label: {
+                        Label("Clear All Chats", systemImage: "trash")
+                    }
+                }
             } label: {
                 HStack(spacing: 4) {
                     Image(systemName: isCurrentModelReady ? "checkmark.circle.fill" : "arrow.down.circle.fill")
                         .font(.caption)
-                        .foregroundStyle(isCurrentModelReady ? .green : .primary)
+                        .foregroundStyle(isCurrentModelReady ? .green : Color.primary)
                     Text(selectedSampleLabel.isEmpty ? "Select Model" : selectedSampleLabel)
                         .font(.subheadline.bold())
                         .foregroundStyle(isCurrentModelReady ? .primary : .secondary)
@@ -261,7 +279,7 @@ struct ChatView: View {
                     Text(activeBackend.uppercased())
                         .font(.caption2.bold())
                 }
-                .foregroundStyle(activeBackend == "metal" ? .green : .secondary)
+                .foregroundStyle(activeBackend == "metal" ? .green : Color.secondary)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 4)
                 .background(
@@ -389,7 +407,7 @@ struct ChatView: View {
                         .font(.title3)
                         .padding(12)
                         .background(inputText.isEmpty || isRunning ? Color(.secondarySystemGroupedBackground) : Color.accentColor)
-                        .foregroundStyle(inputText.isEmpty || isRunning ? Color.secondary : Color.white)
+                        .foregroundColor(inputText.isEmpty || isRunning ? .secondary : .white)
                         .clipShape(Circle())
                 }
                 .disabled(inputText.isEmpty || isRunning)
@@ -399,18 +417,74 @@ struct ChatView: View {
         }
     }
 
+    private var tabBar: some View {
+        HStack(spacing: 0) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(threads) { t in
+                        Button {
+                            selectedThreadId = t.id
+                        } label: {
+                            HStack(spacing: 4) {
+                                if t.isGenerating {
+                                    Image(systemName: "circle.fill")
+                                        .font(.system(size: 6))
+                                        .foregroundStyle(.green)
+                                }
+                                Text(t.title)
+                                    .font(.caption.bold())
+                                    .lineLimit(1)
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .background(selectedThreadId == t.id ? Color.accentColor.opacity(0.15) : Color(.systemGray6))
+                            .foregroundStyle(selectedThreadId == t.id ? .primary : .secondary)
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 10)
+                                    .stroke(selectedThreadId == t.id ? Color.accentColor.opacity(0.4) : Color.clear, lineWidth: 1)
+                            )
+                        }
+                        .contextMenu {
+                            Button(role: .destructive) {
+                                deleteThread(t.id)
+                            } label: {
+                                Label("Delete Chat", systemImage: "trash")
+                            }
+                        }
+                    }
+                }
+                .padding(.horizontal, 12)
+            }
+            
+            Button {
+                createNewThread()
+            } label: {
+                Image(systemName: "plus.circle.fill")
+                    .font(.title3)
+                    .foregroundColor(.accentColor)
+                    .padding(.horizontal, 12)
+            }
+        }
+        .padding(.vertical, 8)
+        .background(Color(.systemBackground))
+        .overlay(Rectangle().frame(height: 0.5).foregroundStyle(Color(.separator)), alignment: .top)
+    }
+
     private var messagesView: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 10) {
-                    ForEach(messages) { msg in
-                        messageBubble(msg)
+                if let idx = activeThreadIndex {
+                    LazyVStack(alignment: .leading, spacing: 10) {
+                        ForEach(threads[idx].messages) { msg in
+                            messageBubble(msg)
+                        }
                     }
+                    .padding(12)
                 }
-                .padding(12)
             }
-            .onChange(of: messages.count) { _ in
-                if let last = messages.last {
+            .onChange(of: activeThreadMessagesCount) { _ in
+                if let idx = activeThreadIndex, let last = threads[idx].messages.last {
                     withAnimation(.easeOut(duration: 0.15)) {
                         proxy.scrollTo(last.id, anchor: .bottom)
                     }
@@ -418,6 +492,15 @@ struct ChatView: View {
             }
             .scrollDismissesKeyboard(.interactively)
         }
+    }
+
+    private var activeThreadIndex: Int? {
+        threads.firstIndex(where: { $0.id == (selectedThreadId ?? threads.first?.id) })
+    }
+
+    private var activeThreadMessagesCount: Int {
+        guard let idx = activeThreadIndex else { return 0 }
+        return threads[idx].messages.count
     }
 
     private var composer: some View {
@@ -496,9 +579,9 @@ struct ChatView: View {
     }
 
     private func messageBubble(_ msg: ChatMessage) -> some View {
-        VStack(alignment: msg.role == "User" ? .trailing : .leading, spacing: 6) {
+        VStack(alignment: msg.role == "User" ? .trailing : .leading, spacing: 4) {
             Text(msg.role)
-                .font(.caption)
+                .font(.caption2)
                 .foregroundStyle(.secondary)
             if let data = msg.imageData, let ui = UIImage(data: data) {
                 Image(uiImage: ui)
@@ -529,6 +612,7 @@ struct ChatView: View {
             return
         }
         dismissKeyboard()
+        guard let idx = activeThreadIndex else { return }
         errorText = nil
         runDiagnostics = ""
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -536,7 +620,8 @@ struct ChatView: View {
 
         let attachedImage = pendingImageData
         let attachedAudio = pendingAudioURL
-        messages.append(
+        
+        threads[idx].messages.append(
             ChatMessage(
                 role: "User",
                 text: text,
@@ -544,6 +629,15 @@ struct ChatView: View {
                 audioFileName: attachedAudio?.lastPathComponent
             )
         )
+        
+        // Auto-name thread if it's the first message
+        if threads[idx].title.starts(with: "Chat") && threads[idx].messages.count <= 2 {
+            let words = text.split(separator: " ").prefix(3).joined(separator: " ")
+            if !words.isEmpty {
+                threads[idx].title = words + (text.split(separator: " ").count > 3 ? "..." : "")
+            }
+        }
+
         inputText = ""
         pendingImage = nil
         pendingImageData = nil
@@ -551,12 +645,11 @@ struct ChatView: View {
         pendingAudioURL = nil
 
         isRunning = true
-        messages.append(ChatMessage(role: "Assistant", text: "", imageData: nil, audioFileName: nil))
-        let assistantIndex = messages.count - 1
+        threads[idx].isGenerating = true
+        threads[idx].messages.append(ChatMessage(role: "Assistant", text: "", imageData: nil, audioFileName: nil))
+        let assistantIndex = threads[idx].messages.count - 1
 
         let backend = selectedBackend
-        // Let model-specific prompt formatting in the engine handle role wrapping.
-        // Passing a raw transcript here can degrade quality for gemma_turn/chat templates.
         let textPrompt = text
         let imagePrompt = vlmPrompt(userText: text)
         let currentVLMModelURL = vlmModelURL
@@ -564,6 +657,7 @@ struct ChatView: View {
         let currentLLMTokenizerURL = llmTokenizerURL
         let currentAudioURL = attachedAudio
 
+        cachedEngine?.cancel()
         generationTask?.cancel()
         generationTask = Task.detached(priority: .userInitiated) {
             do {
@@ -627,16 +721,18 @@ struct ChatView: View {
                     )
                     let reply = try vlmEng.describe(imageBytes: imageBytes, prompt: imagePrompt)
                     await MainActor.run {
+                        guard let currentIdx = self.activeThreadIndex else { return }
                         activeBackend = vlmEng.activeBackend
                         runDiagnostics = (diag + ["mode=vlm_image"]).joined(separator: "\n")
-                        messages[assistantIndex] = ChatMessage(role: "Assistant", text: sanitizeVlmOutput(reply), imageData: nil, audioFileName: nil)
+                        if assistantIndex < self.threads[currentIdx].messages.count {
+                            self.threads[currentIdx].messages[assistantIndex] = ChatMessage(role: "Assistant", text: sanitizeVlmOutput(reply), imageData: nil, audioFileName: nil)
+                        }
+                        self.threads[currentIdx].isGenerating = false
                         isRunning = false
                     }
                     return
                 }
 
-                // Throttle UI updates to avoid CoreGraphics NaN from rapid SwiftUI relayout.
-                // Accumulate tokens and flush to the view at most every ~80ms.
                 let streamBuffer = StreamBuffer()
                 let systemPrompt = llmModelURL.lastPathComponent.contains("Bonsai")
                     ? "I am a 1-bit model developed by PrismML. I was created by the team at Caltech and is based in Pasadena, California."
@@ -653,15 +749,16 @@ struct ChatView: View {
                         let pending = streamBuffer.flushIfReady()
                         guard let pending, !pending.isEmpty else { return }
                         Task { @MainActor in
-                            guard assistantIndex < messages.count else { return }
-                            let existing = messages[assistantIndex].text
-                            messages[assistantIndex] = ChatMessage(role: "Assistant", text: existing + pending, imageData: nil, audioFileName: nil)
+                            guard let currentIdx = self.activeThreadIndex else { return }
+                            guard assistantIndex < self.threads[currentIdx].messages.count else { return }
+                            let existing = self.threads[currentIdx].messages[assistantIndex].text
+                            self.threads[currentIdx].messages[assistantIndex] = ChatMessage(role: "Assistant", text: existing + pending, imageData: nil, audioFileName: nil)
                         }
                     }
                 )
-                // Flush any remaining buffered tokens after generation completes.
                 let remaining = streamBuffer.flushAll()
                 await MainActor.run {
+                    guard let currentIdx = self.activeThreadIndex else { return }
                     activeBackend = eng.activeBackend
                     if let stats = eng.lastGenerationStats {
                         diag.append(
@@ -677,17 +774,22 @@ struct ChatView: View {
                         )
                     }
                     runDiagnostics = diag.joined(separator: "\n")
-                    messages[assistantIndex] = ChatMessage(role: "Assistant", text: prettyOutput(reply), imageData: nil, audioFileName: nil)
+                    if assistantIndex < self.threads[currentIdx].messages.count {
+                        self.threads[currentIdx].messages[assistantIndex] = ChatMessage(role: "Assistant", text: prettyOutput(reply + remaining), imageData: nil, audioFileName: nil)
+                    }
+                    self.threads[currentIdx].isGenerating = false
                     isRunning = false
                     generationTask = nil
                 }
             } catch {
                 await MainActor.run {
+                    guard let currentIdx = self.activeThreadIndex else { return }
                     isInitializing = false
                     errorText = String(describing: error)
-                    if assistantIndex < messages.count {
-                        messages[assistantIndex] = ChatMessage(role: "Assistant", text: "", imageData: nil, audioFileName: nil)
+                    if assistantIndex < self.threads[currentIdx].messages.count {
+                        self.threads[currentIdx].messages[assistantIndex] = ChatMessage(role: "Assistant", text: "Error: \(error)", imageData: nil, audioFileName: nil)
                     }
+                    self.threads[currentIdx].isGenerating = false
                     isRunning = false
                     generationTask = nil
                 }
@@ -696,7 +798,8 @@ struct ChatView: View {
     }
 
     private func conversationPrompt(maxTurns: Int, includeAssistantPlaceholder: Bool) -> String {
-        let recent = messages.suffix(maxTurns)
+        guard let idx = activeThreadIndex else { return "" }
+        let recent = threads[idx].messages.suffix(maxTurns)
         var lines: [String] = [
             "You are a helpful assistant. Keep answers concise and accurate."
         ]
@@ -815,12 +918,36 @@ struct ChatView: View {
         if vlmModelURL == nil {
             vlmModelURL = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smolvlmFileName)
         }
-        if messages.isEmpty {
-            messages = [
+        
+        // Init welcome message in first thread if empty
+        if !threads.isEmpty && threads[0].messages.isEmpty {
+            threads[0].messages = [
                 ChatMessage(role: "Assistant", text: "Hi. You can chat with text or attach an image.", imageData: nil, audioFileName: nil)
             ]
         }
         infoText = "Text uses LLM model/tokenizer. Image uses VLM."
+    }
+
+    private func createNewThread() {
+        let newTitle = "Chat \(threads.count + 1)"
+        let newThread = ChatThread(
+            title: newTitle,
+            messages: [ChatMessage(role: "Assistant", text: "Hi! How can I help you in this new thread?", imageData: nil, audioFileName: nil)]
+        )
+        threads.append(newThread)
+        selectedThreadId = newThread.id
+        try? cachedEngine?.resetSession()
+    }
+
+    private func deleteThread(_ id: UUID) {
+        guard let i = threads.firstIndex(where: { $0.id == id }) else { return }
+        threads.remove(at: i)
+        if selectedThreadId == id {
+            selectedThreadId = threads.first?.id
+        }
+        if threads.isEmpty {
+            createNewThread()
+        }
     }
 
     private func scanLocalModels() {
@@ -1016,6 +1143,7 @@ struct ChatView: View {
     }
 
     private func invalidateCachedEngine() {
+        cachedEngine?.cancel()
         cachedEngine = nil
         cachedTokenizer = nil
         cachedEngineModelURL = nil

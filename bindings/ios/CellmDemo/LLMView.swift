@@ -483,7 +483,7 @@ struct LLMView: View {
                 Text(isInstalled ? "Installed" : "Not installed")
                     .font(.caption)
                     .fontWeight(.semibold)
-                    .foregroundStyle(isInstalled ? .green : .secondary)
+                    .foregroundStyle(isInstalled ? .green : Color.secondary)
             }
             Text(sizeText)
                 .font(.footnote)
