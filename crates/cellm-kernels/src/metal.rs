@@ -37,6 +37,9 @@ fn load_or_compile_metallib(
     fast_math.hash(&mut hasher);
     let hash = format!("{:016x}", hasher.finish());
 
+    #[cfg(target_os = "ios")]
+    let cache_dir = std::env::temp_dir().join("cellm_shaders");
+    #[cfg(not(target_os = "ios"))]
     let cache_dir = std::env::var_os("HOME")
         .map(|h| std::path::PathBuf::from(h).join(".cache/cellm/shaders"))
         .unwrap_or_else(|| std::env::temp_dir().join("cellm_shaders"));
@@ -61,19 +64,26 @@ fn load_or_compile_metallib(
         .map_err(|e| anyhow::anyhow!("Compile failed: {e:?}"))?;
 
     // Serialize to disk
-    let _ = fs::create_dir_all(&cache_dir);
-    let url_str = format!("file://{}", cache_path.to_str().unwrap_or(""));
-    let url = metal::URL::new_with_string(&url_str);
-    unsafe {
-        use objc::runtime::Object;
-        let mut err: *mut Object = std::ptr::null_mut();
-        let _result: bool = msg_send![&*lib, serializeToURL: &*url error: &mut err];
-        if !err.is_null() {
-            let desc: *mut Object = msg_send![err, localizedDescription];
-            let cstr: *const std::ffi::c_char = msg_send![desc, UTF8String];
-            let msg = std::ffi::CStr::from_ptr(cstr).to_string_lossy();
-            eprintln!("cellm: warning: failed to serialize metallib to cache: {}", msg);
+    if let Some(path_str) = cache_path.to_str() {
+        if fs::create_dir_all(&cache_dir).is_err() {
+            eprintln!("cellm: warning: failed to create metallib cache dir: {:?}", cache_dir);
+        } else {
+            let url_str = format!("file://{}", path_str);
+            let url = metal::URL::new_with_string(&url_str);
+            unsafe {
+                use objc::runtime::Object;
+                let mut err: *mut Object = std::ptr::null_mut();
+                let _result: bool = msg_send![&*lib, serializeToURL: &*url error: &mut err];
+                if !err.is_null() {
+                    let desc: *mut Object = msg_send![err, localizedDescription];
+                    let cstr: *const std::ffi::c_char = msg_send![desc, UTF8String];
+                    let msg = std::ffi::CStr::from_ptr(cstr).to_string_lossy();
+                    eprintln!("cellm: warning: failed to serialize metallib to cache: {}", msg);
+                }
+            }
         }
+    } else {
+        eprintln!("cellm: warning: metallib cache path is not valid UTF-8, skipping cache");
     }
 
     Ok(lib)

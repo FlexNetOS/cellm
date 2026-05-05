@@ -50,6 +50,12 @@ android {
             output.outputFileName = "cellm-sdk-${variant.name}.aar"
         }
     }
+
+    testOptions {
+        unitTests.all {
+            jvmArgs '-Djava.library.path=/Users/jeff/Desktop/cellm/target/debug'
+        }
+    }
 }
 
 dependencies {
@@ -70,6 +76,7 @@ dependencies {
     testImplementation 'junit:junit:4.13.2'
     androidTestImplementation 'androidx.test.ext:junit:1.1.5'
 }
+
 
 task copyNativeLibs(type: Copy) {
     from '../../target/aarch64-linux-android/release'

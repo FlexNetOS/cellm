@@ -163,10 +163,12 @@ impl Engine {
         };
         if selected_backend == BackendKind::Metal {
             match &mut runner {
+                // Qwen and LFM models may have partial Metal support (e.g. LinearAttention layers
+                // fall back to CPU, but matmul still uses Metal). Partial support is fine — the
+                // runner sets up metal_ops internally even when enable_metal_full_backend returns
+                // false. Only hard-fail if the Metal backend can't be created at all.
                 Runner::Qwen(r) => {
-                    if !r.enable_metal_full_backend() {
-                        anyhow::bail!("Qwen full-metal backend requested but unavailable");
-                    }
+                    r.enable_metal_full_backend();
                 }
                 Runner::Gemma(r) => {
                     if !r.enable_metal_full_backend() {
@@ -179,9 +181,7 @@ impl Engine {
                     }
                 }
                 Runner::Lfm(r) => {
-                    if !r.enable_metal_full_backend() {
-                        anyhow::bail!("LFM full-metal backend requested but unavailable");
-                    }
+                    r.enable_metal_full_backend();
                 }
             }
         }

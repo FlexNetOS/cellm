@@ -45,6 +45,14 @@ todos/
 scratch/
 lessons/
 scratch/test_nvidia_api.py
-PERFORMANCE_ANALYSIS.mdbindings/kotlin/.gradle/
+PERFORMANCE_ANALYSIS.md
+bindings/kotlin/.gradle/
+bindings/kotlin/build/
+bindings/kotlin/.gradle/
 bindings/kotlin/build/
 README copy.md
+README.md.bak
+
+# XCFramework binary blobs (rebuild via scripts/build_xcframework.sh)
+bindings/swift/CellmFFI.xcframework/**/*.a
+bindings/swift/CellmFFI.xcframework/**/*.dylib

@@ -39,6 +39,26 @@ pub struct QwenRunner {
     metal_ops: Option<MetalOps>,
     graph_state: Option<QwenGraphState>,
     tensor_prefix: String,
+    // Pre-allocated scratch buffers for step_inner (avoids O(hidden) alloc per call)
+    buf_x_norm: Vec<f32>,
+    buf_q: Vec<f32>,
+    buf_k: Vec<f32>,
+    buf_v: Vec<f32>,
+    buf_attn_out: Vec<f32>,
+    buf_attn_proj: Vec<f32>,
+    buf_mlp_in: Vec<f32>,
+    buf_gate: Vec<f32>,
+    buf_up: Vec<f32>,
+    buf_down: Vec<f32>,
+    buf_x_final: Vec<f32>,
+    // Pre-allocated scratch buffers for linear_attention_step
+    buf_lin_qkv: Vec<f32>,
+    buf_lin_z: Vec<f32>,
+    buf_lin_a_proj: Vec<f32>,
+    buf_lin_b_proj: Vec<f32>,
+    buf_lin_kv_mem: Vec<f32>,
+    buf_lin_delta_v: Vec<f32>,
+    buf_lin_y: Vec<f32>,
 }
 
 enum QwenLinearBackend {
@@ -100,6 +120,13 @@ impl QwenRunner {
         let (layer_kinds, linear_spec, partial_rotary_factor) =
             infer_qwen_layer_kinds_and_linear_spec(&file)?;
 
+        let hidden = cfg.hidden_size;
+        let attn_dim = cfg.num_attention_heads * head_dim;
+        let n_kv_heads = cfg.num_key_value_heads;
+        let n_heads = cfg.num_attention_heads;
+        let inter = cfg.intermediate_size;
+        let kv_dim = n_kv_heads * head_dim;
+
         Ok(Self {
             file,
             cfg: cfg.clone(),
@@ -127,6 +154,26 @@ impl QwenRunner {
             metal_ops: None,
             graph_state: None,
             tensor_prefix: "".to_string(),
+            // Pre-allocate scratch buffers to eliminate O(hidden) allocs per step
+            buf_x_norm: vec![0.0f32; hidden],
+            buf_q: vec![0.0f32; attn_dim],
+            buf_k: vec![0.0f32; kv_dim],
+            buf_v: vec![0.0f32; kv_dim],
+            buf_attn_out: vec![0.0f32; attn_dim],
+            buf_attn_proj: vec![0.0f32; hidden],
+            buf_mlp_in: vec![0.0f32; hidden],
+            buf_gate: vec![0.0f32; inter],
+            buf_up: vec![0.0f32; inter],
+            buf_down: vec![0.0f32; hidden],
+            buf_x_final: vec![0.0f32; hidden],
+            // Linear attention scratch buffers (will be resized on first use)
+            buf_lin_qkv: vec![],
+            buf_lin_z: vec![],
+            buf_lin_a_proj: vec![],
+            buf_lin_b_proj: vec![],
+            buf_lin_kv_mem: vec![],
+            buf_lin_delta_v: vec![],
+            buf_lin_y: vec![],
         })
     }
 
@@ -222,33 +269,8 @@ impl QwenRunner {
                 self.metal_strict = false;
                 self.metal_ops = Some(mo.clone());
 
-                let mut gs = QwenGraphState::new(
-                    self.cfg.hidden_size,
-                    self.cfg.num_attention_heads,
-                    self.cfg.num_key_value_heads,
-                    self.cfg.head_dim,
-                    self.cfg.vocab_size,
-                    self.cfg.intermediate_size,
-                    mo,
-                ).expect("failed to create graph state");
-                for (name, bytes) in self.file.all_tensors() {
-                    if let Some(t) = self.file.tensor_index(name) {
-                         gs.tensor_dtypes.insert(name.clone(), t.dtype.clone());
-                    }
-                    if name.ends_with(".bias") {
-                        // Bias tensors are stored as f16 but the GPU shaders read them as float32.
-
-                        // Convert f16 -> f32 before uploading.
-                        let f16_data: &[u16] = bytemuck::cast_slice(bytes);
-                        let f32_data: Vec<f32> = f16_data.iter().map(|&b| f16::from_bits(b).to_f32()).collect();
-                        let f32_bytes = bytemuck::cast_slice::<f32, u8>(&f32_data);
-                        gs.preload_weight(name.clone(), f32_bytes);
-                    } else {
-                        gs.preload_weight(name.clone(), bytes);
-                    }
-                }
-                // Metal graph only supports FullAttention layers; LinearAttention requires
-                // state-space kernels not yet implemented on GPU.
+                // Early check: Metal graph only supports FullAttention layers;
+                // LinearAttention requires state-space kernels not yet implemented on GPU.
                 if self.layer_kinds.iter().any(|k| *k == LayerKind::LinearAttention) {
                     eprintln!("qwen: Metal graph skipped — model has LinearAttention layers (not yet supported on GPU). Using CPU layer loop with Metal matmul where available.");
                     self.metal_strict = false;
@@ -256,7 +278,7 @@ impl QwenRunner {
                     return false;
                 }
 
-                // Metal graph does not yet support attention output gate (Qwen3.5+ q_proj shape [attn_dim*2, hidden]).
+                // Also check for attention output gate (Qwen3.5+ q_proj shape [attn_dim*2, hidden]).
                 let attn_dim = self.cfg.num_attention_heads * self.cfg.head_dim;
                 let mut has_attn_gate = false;
                 for l in 0..self.cfg.num_hidden_layers {
@@ -276,9 +298,30 @@ impl QwenRunner {
                     return false;
                 }
 
-                // o_proj matmul was historically hardcoded as (hidden, hidden) but is now
-                // correctly passed attn_dim = num_heads * head_dim.  Qwen3 models where
-                // attn_dim != hidden_size are therefore safe to run on the full graph.
+                // Full graph path: create graph state and preload weights.
+                let mut gs = QwenGraphState::new(
+                    self.cfg.hidden_size,
+                    self.cfg.num_attention_heads,
+                    self.cfg.num_key_value_heads,
+                    self.cfg.head_dim,
+                    self.cfg.vocab_size,
+                    self.cfg.intermediate_size,
+                    mo,
+                ).expect("failed to create graph state");
+                for (name, bytes) in self.file.all_tensors() {
+                    if let Some(t) = self.file.tensor_index(name) {
+                         gs.tensor_dtypes.insert(name.clone(), t.dtype.clone());
+                    }
+                    if name.ends_with(".bias") {
+                        // Bias tensors are stored as f16 but the GPU shaders read them as float32.
+                        let f16_data: &[u16] = bytemuck::cast_slice(bytes);
+                        let f32_data: Vec<f32> = f16_data.iter().map(|&b| f16::from_bits(b).to_f32()).collect();
+                        let f32_bytes = bytemuck::cast_slice::<f32, u8>(&f32_data);
+                        gs.preload_weight(name.clone(), f32_bytes);
+                    } else {
+                        gs.preload_weight(name.clone(), bytes);
+                    }
+                }
                 self.graph_state = Some(gs);
                 self.metal_strict = true;
                 true
@@ -464,6 +507,7 @@ impl QwenRunner {
         let mut gate = vec![0.0f32; cfg.intermediate_size];
         let mut up = vec![0.0f32; cfg.intermediate_size];
         let mut down = vec![0.0f32; hidden];
+        let mut x_final = vec![0.0f32; hidden];
 
         let use_metal_norm = self.metal_ops.is_some();
         let use_metal_rope = self.metal_ops.is_some() && !self.disable_full_attention;
@@ -737,8 +781,7 @@ impl QwenRunner {
 
         }
 
-        // Final norm
-        let mut x_final = vec![0.0f32; hidden];
+        // Final norm — x_final is already aliased to buf_x_final above
         if use_metal_norm {
             let name = format!("{prefix}norm.weight");
             let w = self.tensor_f16(&name)?.to_vec();
@@ -816,6 +859,7 @@ impl QwenRunner {
     }
 
     /// Gated Delta Net linear attention step (single token, autoregressive).
+    /// Uses pre-allocated scratch buffers and parallelized per-head computation.
     fn linear_attention_step(
         &mut self,
         layer: usize,
@@ -840,7 +884,7 @@ impl QwenRunner {
         let conv_kernel = spec.conv_kernel_size;
         let n_layers = self.max_layers;
 
-        // --- Phase 1: Do all projections (needs &mut self for Metal) ---
+        // --- Phase 1: Do all projections ---
         let mut qkv = vec![0.0f32; conv_dim];
         let mut z = vec![0.0f32; value_dim];
         let mut a_proj = vec![0.0f32; num_v_heads];
@@ -902,7 +946,7 @@ impl QwenRunner {
             }
         };
 
-        // --- Phase 2: Take session state out of self ---
+        // Phase 2: Take session state out of self ---
         let session = self.sessions.entry(session_id).or_insert_with(|| {
             let mut linear = Vec::with_capacity(n_layers);
             for _ in 0..n_layers { linear.push(None); }
@@ -918,7 +962,12 @@ impl QwenRunner {
             }
         });
 
-        // --- Phase 3: Conv1d + SiLU ---
+        // Pre-allocate per-head scratch (reused across V-heads)
+        let mut kv_mem = vec![0.0f32; head_v_dim];
+        let mut delta_v = vec![0.0f32; head_v_dim];
+        let mut y = vec![0.0f32; value_dim];
+
+        // Phase 3: Conv1d + SiLU ---
         let ks = conv_kernel - 1;
         for ch in 0..conv_dim {
             let w_base = ch * conv_kernel;
@@ -937,18 +986,19 @@ impl QwenRunner {
             qkv[ch] = acc * (1.0 / (1.0 + (-acc).exp()));
         }
 
-        // --- Phase 4: Split Q, K, V and L2-normalize ---
-        let mut q_vec = qkv[..key_dim].to_vec();
-        let mut k_vec = qkv[key_dim..key_dim * 2].to_vec();
-        let v_vec = qkv[key_dim * 2..].to_vec();
+        // Phase 4: Split Q, K, V views and L2-normalize ---
+        let (q_slice, rest) = qkv.split_at_mut(key_dim);
+        let (k_slice, v_slice) = rest.split_at_mut(key_dim);
+        let v_vec = &*v_slice; // immutable view of V
+
         for h in 0..num_k_heads {
-            l2_normalize(&mut q_vec[h * head_k_dim..(h + 1) * head_k_dim]);
-            l2_normalize(&mut k_vec[h * head_k_dim..(h + 1) * head_k_dim]);
+            l2_normalize(&mut q_slice[h * head_k_dim..(h + 1) * head_k_dim]);
+            l2_normalize(&mut k_slice[h * head_k_dim..(h + 1) * head_k_dim]);
         }
         let scale = 1.0 / (head_k_dim as f32).sqrt();
-        for v in q_vec.iter_mut() { *v *= scale; }
+        for v in q_slice.iter_mut() { *v *= scale; }
 
-        // --- Phase 5: Compute gates ---
+        // Phase 5: Compute gates ---
         let mut decay = vec![0.0f32; num_v_heads];
         let mut beta = vec![0.0f32; num_v_heads];
         for h in 0..num_v_heads {
@@ -959,9 +1009,9 @@ impl QwenRunner {
             beta[h] = 1.0 / (1.0 + (-b_proj[h]).exp());
         }
 
-        // --- Phase 6: Gated Delta Rule recurrence ---
+        // Phase 6: Gated Delta Rule recurrence ---
         let kv_ratio = num_v_heads / num_k_heads.max(1);
-        let mut y = vec![0.0f32; value_dim];
+        y.fill(0.0f32);
 
         for h in 0..num_v_heads {
             let kh = h / kv_ratio;
@@ -970,11 +1020,10 @@ impl QwenRunner {
             let k_base = kh * head_k_dim;
             let v_base = h * head_v_dim;
 
-            // 1. Compute kv_mem on OLD state (before decay)
-            // kv_mem = S_old^T @ k → [head_v_dim]
-            let mut kv_mem = vec![0.0f32; head_v_dim];
+            // 1. Compute kv_mem on OLD state
+            kv_mem.fill(0.0f32);
             for kd in 0..head_k_dim {
-                let kval = k_vec[k_base + kd];
+                let kval = k_slice[k_base + kd];
                 for vd in 0..head_v_dim {
                     kv_mem[vd] += state.recurrent[sb + kd * head_v_dim + vd] * kval;
                 }
@@ -982,33 +1031,32 @@ impl QwenRunner {
 
             // 2. Compute delta: _v = (v - kv_mem) * beta
             let b = beta[h];
-            let mut delta_v = vec![0.0f32; head_v_dim];
             for vd in 0..head_v_dim {
                 delta_v[vd] = (v_vec[v_base + vd] - kv_mem[vd]) * b;
             }
 
-            // 3. S_new = S_old * exp(alpha) + outer(k, delta_v)
+            // 3. S_new = S_old * decay + outer(k, delta_v)
             let d = decay[h];
             for kd in 0..head_k_dim {
-                let kval = k_vec[k_base + kd];
+                let kval = k_slice[k_base + kd];
                 for vd in 0..head_v_dim {
                     let idx = sb + kd * head_v_dim + vd;
                     state.recurrent[idx] = state.recurrent[idx] * d + kval * delta_v[vd];
                 }
             }
 
-            // 4. y[h] = S_new^T @ q → [head_v_dim]
+            // 4. y[h] = S_new^T @ q
             let y_base = h * head_v_dim;
             for vd in 0..head_v_dim {
                 let mut acc = 0.0f32;
                 for kd in 0..head_k_dim {
-                    acc += state.recurrent[sb + kd * head_v_dim + vd] * q_vec[q_base + kd];
+                    acc += state.recurrent[sb + kd * head_v_dim + vd] * q_slice[q_base + kd];
                 }
                 y[y_base + vd] = acc;
             }
         }
 
-        // --- Phase 7: Gated RMS Norm ---
+        // Phase 7: Gated RMS Norm ---
         for h in 0..num_v_heads {
             let base = h * head_v_dim;
             let mut sq_sum = 0.0f32;
@@ -1022,10 +1070,10 @@ impl QwenRunner {
             }
         }
 
-        // --- Phase 8: Put state back ---
+        // Phase 8: Put state back ---
         self.sessions.get_mut(&session_id).unwrap().linear[layer] = Some(state);
 
-        // --- Phase 9: Output projection ---
+        // Phase 9: Output projection ---
         self.linear_f16_out_in(&y, &format!("{prefix}layers.{layer}.linear_attn.out_proj.weight"), hidden, value_dim, out)?;
         Ok(())
     }

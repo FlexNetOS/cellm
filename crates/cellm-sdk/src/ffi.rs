@@ -11,7 +11,7 @@ use cellm_cache::KvEncodingKind;
 use cellm_kernels::MetalKernels;
 use cellm_scheduler::ThermalLevel;
 use serde_json::Value;
-use tokenizers::Tokenizer;
+use tokenizers::{AddedToken, Tokenizer};
 
 thread_local! {
     static LAST_VLM_TIMINGS_MS: RefCell<Option<(f64, f64, f64, f64)>> = const { RefCell::new(None) };
@@ -486,17 +486,44 @@ pub extern "C" fn cellm_engine_create_v4(
 }
 
 fn load_tokenizer(path: &std::path::Path) -> Result<Tokenizer, String> {
-    match Tokenizer::from_file(path) {
-        Ok(t) => Ok(t),
+    let mut tok = match Tokenizer::from_file(path) {
+        Ok(t) => t,
         Err(e) => {
             let normalized = try_normalize_tokenizer_json(path)?;
             if let Some(p) = normalized {
-                return Tokenizer::from_file(&p)
-                    .map_err(|e| format!("load tokenizer failed (normalized {:?}): {e}", p));
+                Tokenizer::from_file(&p)
+                    .map_err(|e| format!("load tokenizer failed (normalized {:?}): {e}", p))?
+            } else {
+                return Err(format!("load tokenizer failed: {e}"));
             }
-            Err(format!("load tokenizer failed: {e}"))
+        }
+    };
+
+    // Explicitly register all added_tokens from the tokenizer JSON, because the
+    // tokenizers crate sometimes fails to link them into the vocabulary during
+    // deserialization (especially on iOS where paths and file access differ).
+    // Without this, special tokens like <|im_start|>, <|im_end|>, <image|> etc.
+    // may decode as empty strings, producing garbled output.
+    if let Ok(bytes) = std::fs::read(path) {
+        if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+            if let Some(arr) = v.get("added_tokens").and_then(|x| x.as_array()) {
+                let mut added = Vec::new();
+                for item in arr {
+                    let Some(content) = item.get("content").and_then(|x| x.as_str()) else { continue; };
+                    let Some(id) = item.get("id").and_then(|x| x.as_u64()) else { continue; };
+                    // Only add tokens that aren't already in the vocab with the correct ID
+                    if tok.token_to_id(content) != Some(id as u32) {
+                        added.push(AddedToken::from(content.to_string(), true));
+                    }
+                }
+                if !added.is_empty() {
+                    tok.add_tokens(&added);
+                }
+            }
         }
     }
+
+    Ok(tok)
 }
 
 fn load_added_token_ids(path: &std::path::Path) -> Result<HashMap<String, u32>, String> {
@@ -1161,9 +1188,9 @@ pub extern "C" fn cellm_vlm_describe_image(
                 seed: sampling.seed,
                 repeat_penalty: sampling.repeat_penalty as f32,
                 repeat_window: sampling.repeat_window,
-                // Keep VLM generations concise by default to reduce latency and loop risk
-                // on mobile; callers can expose a longer budget if needed.
-                max_new_tokens: 16,
+                // Default to 64 tokens for useful descriptions; callers can override
+                // via cellm_engine_create_v4 sampling params or env CELLM_VLM_MAX_TOKENS.
+                max_new_tokens: 64,
                 min_new_tokens: 1,
             },
         )

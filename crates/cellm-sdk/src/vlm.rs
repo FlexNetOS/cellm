@@ -18,7 +18,7 @@ use image::RgbImage;
 use ndarray::{Array2, Array3, Array4, Array5, Axis};
 use rand::prelude::*;
 use serde_json::Value;
-use tokenizers::Tokenizer;
+use tokenizers::{AddedToken, Tokenizer};
 use crate::BackendKind;
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -177,7 +177,20 @@ pub fn describe_image_with_cellm_timed(
             .tensor_index("model.connector.modality_projection.proj.weight")
             .is_some();
     if !is_gemma4_vision && !is_idefics3_vision {
-        anyhow::bail!("This model does not support image input");
+        anyhow::bail!("This model does not support image input (gemma4_vision={}, idefics3_vision={})", is_gemma4_vision, is_idefics3_vision);
+    }
+
+    if std::env::var("CELLM_VLM_DEBUG_LOAD").is_ok() {
+        let h = &file.header;
+        eprintln!("CELLM_VLM_DEBUG_LOAD: model_type={} source_architectures={:?}",
+            h.model_type, h.source_architectures);
+        eprintln!("CELLM_VLM_DEBUG_LOAD: vocab_size={} hidden={} layers={} heads={}/{} head_dim={:?}",
+            h.vocab_size, h.hidden_dim, h.num_layers, h.num_heads, h.num_kv_heads, h.head_dim);
+        eprintln!("CELLM_VLM_DEBUG_LOAD: has_vision={} has_text={}",
+            file.tensor_index("model.vision_model.embeddings.patch_embedding.weight").is_some()
+                || file.tensor_index("model.vision_tower.patch_embedder.input_proj.weight").is_some(),
+            file.tensor_index("model.embed_tokens.weight").is_some()
+                || file.tensor_index("language_model.model.embed_tokens.weight").is_some());
     }
     let model_type = effective_text_model_type(&file.header);
     let gemma4_mode = std::env::var("CELLM_VLM_GEMMA4_MODE").unwrap_or_else(|_| "placeholder".to_string());
@@ -948,6 +961,8 @@ fn run_decode_cellm(
     let debug_gen = std::env::var("CELLM_GEN_DEBUG").is_ok();
     if debug_gen { eprintln!("GEN_DEBUG: first token (from prefill) = {}", next); }
     let mut generated = Vec::new();
+    // Store first 20 token IDs for debugging via env CELLM_VLM_DEBUG_TOKENS
+    let capture_tokens = std::env::var("CELLM_VLM_DEBUG_TOKENS").is_ok();
     let mut same_token_run = 0usize;
     let mut last_token: Option<i64> = None;
     for step in 0..cfg.max_new_tokens {
@@ -997,6 +1012,14 @@ fn run_decode_cellm(
             &mut rng,
         )?;
         recent.push(generated[generated.len() - 1] as u32);
+    }
+
+    if capture_tokens && !generated.is_empty() {
+        let max_show = generated.len().min(20);
+        eprintln!("CELLM_VLM_DEBUG_TOKENS: first {} generated token IDs:", max_show);
+        for (i, &tid) in generated.iter().enumerate().take(max_show) {
+            eprintln!("  tok[{}] = {}", i, tid);
+        }
     }
 
     Ok((generated, decode_start.elapsed().as_secs_f64() * 1000.0))
@@ -4269,17 +4292,44 @@ fn resolve_tokenizer_path(model_path: &Path) -> Result<PathBuf> {
 }
 
 fn load_tokenizer(path: &Path) -> Result<Tokenizer> {
-    match Tokenizer::from_file(path) {
-        Ok(t) => Ok(t),
+    let mut tok = match Tokenizer::from_file(path) {
+        Ok(t) => t,
         Err(e) => {
             let normalized = try_normalize_tokenizer_json(path)?;
             if let Some(p) = normalized {
-                return Tokenizer::from_file(&p)
-                    .map_err(|e| anyhow::anyhow!("load tokenizer failed (normalized {:?}): {e}", p));
+                Tokenizer::from_file(&p)
+                    .map_err(|e| anyhow::anyhow!("load tokenizer failed (normalized {:?}): {e}", p))?
+            } else {
+                return Err(anyhow::anyhow!("load tokenizer failed: {e}"));
             }
-            Err(anyhow::anyhow!("load tokenizer failed: {e}"))
+        }
+    };
+
+    // Explicitly register all added_tokens from the tokenizer JSON, because the
+    // tokenizers crate sometimes fails to link them into the vocabulary during
+    // deserialization (especially on iOS where paths and file access differ).
+    // Without this, special tokens like <|im_start|>, <|im_end|>, <image|> etc.
+    // may decode as empty strings, producing garbled output.
+    if let Ok(bytes) = std::fs::read(path) {
+        if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+            if let Some(arr) = v.get("added_tokens").and_then(|x| x.as_array()) {
+                let mut added = Vec::new();
+                for item in arr {
+                    let Some(content) = item.get("content").and_then(|x| x.as_str()) else { continue; };
+                    let Some(id) = item.get("id").and_then(|x| x.as_u64()) else { continue; };
+                    // Only add tokens that aren't already in the vocab with the correct ID
+                    if tok.token_to_id(content) != Some(id as u32) {
+                        added.push(tokenizers::AddedToken::from(content.to_string(), true));
+                    }
+                }
+                if !added.is_empty() {
+                    tok.add_tokens(&added);
+                }
+            }
         }
     }
+
+    Ok(tok)
 }
 
 fn try_normalize_tokenizer_json(path: &Path) -> Result<Option<PathBuf>> {
