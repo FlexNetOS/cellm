@@ -149,10 +149,17 @@ impl LlamaRunner {
         {
             // The fused graph path can regress latency for short prompts and is still
             // experimental. Keep it opt-in so default Metal runs stay fast/stable.
+            let has_unsupported_graph_dtype = self.file.header.tensors.iter().any(|t| {
+                let d = t.dtype.as_str();
+                d != "f16" && d != "f32" && d != "bf16"
+            });
+            if has_unsupported_graph_dtype {
+                eprintln!("llama: fused Metal graph disabled: model contains quantized weights ({}) not yet supported by the Metal graph kernels", self.file.header.tensors.iter().find(|t| { let d = t.dtype.as_str(); d != "f16" && d != "f32" && d != "bf16" }).map(|t| t.dtype.as_str()).unwrap_or("unknown"));
+            }
             let graph_enabled = std::env::var("CELLM_LLAMA_ENABLE_GRAPH")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(true);
-            if graph_enabled {
+            if graph_enabled && !has_unsupported_graph_dtype {
                 let gs_res = LlamaGraphState::new(
                     self.cfg.hidden_size,
                     self.cfg.num_attention_heads,
