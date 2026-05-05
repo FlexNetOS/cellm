@@ -962,9 +962,6 @@ impl QwenRunner {
             }
         });
 
-        // Pre-allocate per-head scratch (reused across V-heads)
-        let mut kv_mem = vec![0.0f32; head_v_dim];
-        let mut delta_v = vec![0.0f32; head_v_dim];
         let mut y = vec![0.0f32; value_dim];
 
         // Phase 3: Conv1d + SiLU ---
@@ -1009,30 +1006,38 @@ impl QwenRunner {
             beta[h] = 1.0 / (1.0 + (-b_proj[h]).exp());
         }
 
-        // Phase 6: Gated Delta Rule recurrence ---
+        // --- Phase 6: Gated Delta Rule recurrence (parallel across V-heads) ---
+        // par_chunks_mut gives each thread a disjoint mutable slice of state and y.
         let kv_ratio = num_v_heads / num_k_heads.max(1);
-        y.fill(0.0f32);
+        let head_state_stride = head_k_dim * head_v_dim;
 
-        for h in 0..num_v_heads {
+        use rayon::prelude::*;
+        state.recurrent
+            .par_chunks_mut(head_state_stride)
+            .zip(y[..value_dim].par_chunks_mut(head_v_dim))
+            .enumerate()
+            .for_each(|(h, (state_h, y_h))| {
             let kh = h / kv_ratio;
-            let sb = h * head_k_dim * head_v_dim;
             let q_base = kh * head_k_dim;
             let k_base = kh * head_k_dim;
             let v_base = h * head_v_dim;
 
-            // 1. Compute kv_mem on OLD state
-            kv_mem.fill(0.0f32);
+            // Local scratch per thread
+            let mut loc_kv_mem = vec![0.0f32; head_v_dim];
+            let mut loc_delta_v = vec![0.0f32; head_v_dim];
+
+            // 1. kv_mem = S_old^T @ k
             for kd in 0..head_k_dim {
                 let kval = k_slice[k_base + kd];
                 for vd in 0..head_v_dim {
-                    kv_mem[vd] += state.recurrent[sb + kd * head_v_dim + vd] * kval;
+                    loc_kv_mem[vd] += state_h[kd * head_v_dim + vd] * kval;
                 }
             }
 
-            // 2. Compute delta: _v = (v - kv_mem) * beta
+            // 2. delta_v = (v - kv_mem) * beta
             let b = beta[h];
             for vd in 0..head_v_dim {
-                delta_v[vd] = (v_vec[v_base + vd] - kv_mem[vd]) * b;
+                loc_delta_v[vd] = (v_vec[v_base + vd] - loc_kv_mem[vd]) * b;
             }
 
             // 3. S_new = S_old * decay + outer(k, delta_v)
@@ -1040,35 +1045,38 @@ impl QwenRunner {
             for kd in 0..head_k_dim {
                 let kval = k_slice[k_base + kd];
                 for vd in 0..head_v_dim {
-                    let idx = sb + kd * head_v_dim + vd;
-                    state.recurrent[idx] = state.recurrent[idx] * d + kval * delta_v[vd];
+                    let idx = kd * head_v_dim + vd;
+                    state_h[idx] = state_h[idx] * d + kval * loc_delta_v[vd];
                 }
             }
 
             // 4. y[h] = S_new^T @ q
-            let y_base = h * head_v_dim;
             for vd in 0..head_v_dim {
                 let mut acc = 0.0f32;
                 for kd in 0..head_k_dim {
-                    acc += state.recurrent[sb + kd * head_v_dim + vd] * q_slice[q_base + kd];
+                    acc += state_h[kd * head_v_dim + vd] * q_slice[q_base + kd];
                 }
-                y[y_base + vd] = acc;
+                y_h[vd] = acc;
             }
-        }
+        });
 
-        // Phase 7: Gated RMS Norm ---
-        for h in 0..num_v_heads {
-            let base = h * head_v_dim;
+        // --- Phase 7: Gated RMS Norm (parallel across V-heads) ---
+        let norm_w_slice = &norm_w[..head_v_dim];
+        y[..value_dim]
+            .par_chunks_mut(head_v_dim)
+            .enumerate()
+            .for_each(|(h, y_h)| {
+            let z_h = &z[h * head_v_dim..(h + 1) * head_v_dim];
             let mut sq_sum = 0.0f32;
-            for vd in 0..head_v_dim { sq_sum += y[base + vd] * y[base + vd]; }
+            for vd in 0..head_v_dim { sq_sum += y_h[vd] * y_h[vd]; }
             let inv_rms = 1.0 / (sq_sum / head_v_dim as f32 + eps).sqrt();
             for vd in 0..head_v_dim {
-                let normed = y[base + vd] * inv_rms * norm_w[vd];
-                let z_val = z[base + vd];
+                let normed = y_h[vd] * inv_rms * norm_w_slice[vd];
+                let z_val = z_h[vd];
                 let silu_z = z_val * (1.0 / (1.0 + (-z_val).exp()));
-                y[base + vd] = normed * silu_z;
+                y_h[vd] = normed * silu_z;
             }
-        }
+        });
 
         // Phase 8: Put state back ---
         self.sessions.get_mut(&session_id).unwrap().linear[layer] = Some(state);
