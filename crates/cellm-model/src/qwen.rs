@@ -1006,7 +1006,7 @@ impl QwenRunner {
             beta[h] = 1.0 / (1.0 + (-b_proj[h]).exp());
         }
 
-        // --- Phase 6: Gated Delta Rule recurrence (parallel across V-heads) ---
+        // Phase 6: Gated Delta Rule recurrence (parallel across V-heads)
         // par_chunks_mut gives each thread a disjoint mutable slice of state and y.
         let kv_ratio = num_v_heads / num_k_heads.max(1);
         let head_state_stride = head_k_dim * head_v_dim;
@@ -1060,7 +1060,7 @@ impl QwenRunner {
             }
         });
 
-        // --- Phase 7: Gated RMS Norm (parallel across V-heads) ---
+        // Phase 7: Gated RMS Norm (parallel across V-heads)
         let norm_w_slice = &norm_w[..head_v_dim];
         y[..value_dim]
             .par_chunks_mut(head_v_dim)
@@ -1078,7 +1078,7 @@ impl QwenRunner {
             }
         });
 
-        // Phase 8: Put state back ---
+        // Phase 8: Put state back
         self.sessions.get_mut(&session_id).unwrap().linear[layer] = Some(state);
 
         // Phase 9: Output projection ---
