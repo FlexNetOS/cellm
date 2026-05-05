@@ -147,12 +147,15 @@ impl LlamaRunner {
     pub fn enable_metal_full_backend(&mut self) -> bool {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
-            // The fused graph path can regress latency for short prompts and is still
-            // experimental. Keep it opt-in so default Metal runs stay fast/stable.
             // Fused graph supports f16/f32/bf16. i8 kernels exist (encode_mv_i8)
-            // but have a correctness bug — tracking.
+            // but have a known numerical issue. Set CELLM_LLAMA_ENABLE_GRAPH_I8=1
+            // to enable experimental i8 fused graph support.
+            let enable_i8 = std::env::var("CELLM_LLAMA_ENABLE_GRAPH_I8")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
             let has_unsupported_graph_dtype = self.file.header.tensors.iter().any(|t| {
                 let d = t.dtype.as_str();
+                if enable_i8 && d == "i8" { return false; }
                 d != "f16" && d != "f32" && d != "bf16"
             });
             if has_unsupported_graph_dtype {
