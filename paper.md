@@ -83,6 +83,42 @@ nce, and how these properties enable quantum algorithms to achieve exponential s
   --chat --gen 100 --backend metal
 
 
+```bash
+
+./target/release/infer \
+  --model models/to-huggingface/qwen2.5-0.5b-int8-v1/qwen2.5-0.5b-int8-v1.cellm \
+  --tokenizer models/to-huggingface/qwen2.5-0.5b-int8-v1/tokenizer.json \
+  --prompt "You rewrite outreach messages. Do not add new facts.
+
+Return only one message.
+
+Rules:
+- Under 45 words.
+- Warm, simple, human.
+- Do not mention AI.
+- Do not invent events, meetings, help, or promises.
+- Do not say “recent” unless last_contacted is known.
+- Use only the base draft and contact facts.
+- Keep the same intent.
+
+Contact facts:
+name: Sarah
+role: Professional
+workplace: Accra Tech Summit
+relationship_strength: 2/5
+last_contacted: never
+known_context: Met at Accra Tech Summit
+capabilities: Contract Review, Firebase, Flutter, Swift
+channel: Messages
+intent: Reconnect
+
+Base draft:
+Hi Sarah, hope you’re doing well. We met at Accra Tech Summit, and I realized I never properly followed up. I’d love to reconnect sometime this week if you have a free moment.
+
+Rewrite the base draft." \
+  --chat --gen 100 --backend metal
+  
+```
 ---
 
 ## Qwen 3 0.6B int4

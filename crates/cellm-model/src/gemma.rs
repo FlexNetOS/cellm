@@ -300,6 +300,9 @@ impl GemmaRunner {
                             self.sliding_window,
                             self.sliding_window_pattern,
                             true, // is_gemma3
+                            self.is_gemma4_text,
+                            self.gemma4_shared_kv_layers,
+                            self.gemma4_sliding_mask.clone(),
                             self.rope_theta_sliding,
                             self.rmsnorm_weight_is_offset,
                             self.tensor_prefix.clone(),
@@ -312,6 +315,28 @@ impl GemmaRunner {
                                         .map(|t| t.dtype.clone())
                                         .unwrap_or_else(|| "f16".to_string());
                                     gs.preload_weight(name.to_string(), data, dtype);
+                                }
+                                // TEST: compare GPU i4 vs CPU i4 for first weight
+                                if self.is_gemma4_text {
+                                    // Find first q_proj weight and compare
+                                    for (name, data) in self.file.all_tensors() {
+                                        if name.contains("layers.0.self_attn.q_proj.weight") && !name.ends_with(".qscale") {
+                                            let qs_name = format!("{name}.qscale");
+                                            if let Ok(qs_data) = self.file.tensor_bytes(&qs_name) {
+                                                let meta = self.file.tensor_index(name).unwrap();
+                                                let rows = meta.shape[0];
+                                                let cols = meta.shape[1];
+                                                let qscale: &[u16] = bytemuck::cast_slice(qs_data);
+                                                // CPU dot_i4_scaled_row for row 0, input = ones
+                                                let x_cpu: Vec<f32> = vec![1.0f32; cols];
+                                                let scale_cpu = half::f16::from_bits(qscale[0]).to_f32();
+                                                let row_bytes = &data[0..cols/2];
+                                                let cpu_dot = dot_i4_scaled_row(row_bytes, &x_cpu, scale_cpu);
+                                                eprintln!("TEST i4: {} rows={} cols={} scale={} cpu_dot={}", name, rows, cols, scale_cpu, cpu_dot);
+                                            }
+                                            break;
+                                        }
+                                    }
                                 }
                                 self.graph_state = Some(gs);
                                 println!("gemma: fused Metal graph enabled (Gemma3, {} layers)",

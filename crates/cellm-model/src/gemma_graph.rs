@@ -66,6 +66,13 @@ pub struct GemmaGraphState {
     pub sliding_window: usize,
     pub sliding_window_pattern: usize,
     pub is_gemma3: bool,
+    pub is_gemma4: bool,
+    pub gemma4_shared_kv_layers: usize,
+    pub gemma4_sliding_mask: Vec<bool>,
+
+    // PLE (Per-Layer Embedding input) buffer
+    pub ple_buf: Option<Buffer>,
+    pub ple_per_layer_dim: usize,
     pub rope_theta_sliding: f32,
     pub rmsnorm_weight_is_offset: bool,
     pub tensor_prefix: String,
@@ -84,6 +91,9 @@ impl GemmaGraphState {
         sliding_window: usize,
         sliding_window_pattern: usize,
         is_gemma3: bool,
+        is_gemma4: bool,
+        gemma4_shared_kv_layers: usize,
+        gemma4_sliding_mask: Vec<bool>,
         rope_theta_sliding: f32,
         rmsnorm_weight_is_offset: bool,
         tensor_prefix: String,
@@ -136,6 +146,11 @@ impl GemmaGraphState {
             sliding_window,
             sliding_window_pattern,
             is_gemma3,
+            is_gemma4,
+            gemma4_shared_kv_layers,
+            gemma4_sliding_mask,
+            ple_buf: None,
+            ple_per_layer_dim: 0,
             rope_theta_sliding,
             rmsnorm_weight_is_offset,
             tensor_prefix,
@@ -163,6 +178,23 @@ impl GemmaGraphState {
         self.weights.get(name)
             .or_else(|| if name.starts_with("model.") { self.weights.get(&name[6..]) } else { None })
             .or_else(|| self.weights.get(&format!("model.{name}")))
+    }
+
+    /// For Gemma4 shared-KV layers: returns the source layer index whose KV
+    /// cache to use, or `None` if this layer manages its own KV.
+    fn gemma4_kv_source_layer(&self, layer: usize) -> Option<usize> {
+        if !self.is_gemma4 || self.gemma4_shared_kv_layers == 0 {
+            return None;
+        }
+        let max_layers = self.layer_specs.len();
+        let first_shared = max_layers.saturating_sub(self.gemma4_shared_kv_layers);
+        if layer < first_shared {
+            return None;
+        }
+        let is_sliding = self.gemma4_sliding_mask.get(layer).copied().unwrap_or(false);
+        (0..first_shared)
+            .rev()
+            .find(|&i| self.gemma4_sliding_mask.get(i).copied().unwrap_or(false) == is_sliding)
     }
 
     /// Whether layer `l` uses full (global) attention.
