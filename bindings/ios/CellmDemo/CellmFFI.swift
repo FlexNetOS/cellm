@@ -516,7 +516,7 @@ final class CellmEngine {
     }
 
     func cancel() {
-        _ = cellm_session_cancel(handle, session)
+        _ = cellm_session_suspend(handle, session)
     }
 
     private static func hasLongDigitRun(_ piece: String, threshold: Int) -> Bool {
