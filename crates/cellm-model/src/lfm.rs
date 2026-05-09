@@ -277,6 +277,18 @@ impl LfmGraphState {
         let seq = page_table.token_count();
         let num_layers = cfg.num_hidden_layers;
 
+        // DEBUG: limit layers via env var LFM_DEBUG_MAX_LAYERS
+        let debug_max_layers = std::env::var("LFM_DEBUG_MAX_LAYERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(num_layers)
+            .min(num_layers);
+        let debug_logits = std::env::var("LFM_DEBUG_GRAPH").map(|v| v == "1").unwrap_or(false);
+
+        // Override num_layers for the loop (only process up to debug_max_layers)
+        let original_num_layers = num_layers;
+        let num_layers = debug_max_layers;
+
         // Get KV storage reference once for all attention layers
         let kv_store = kv_cache.storage().as_any()
             .downcast_ref::<cellm_cache::kvcache::MetalKvStorage>()
@@ -568,6 +580,17 @@ impl LfmGraphState {
                     hidden,
                 );
             }
+            // Hidden state statistics
+            let mean = x_cpu.iter().sum::<f32>() / hidden as f32;
+            let variance = x_cpu.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / hidden as f32;
+            let std = variance.sqrt();
+            let max_val = x_cpu.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let min_val = x_cpu.iter().cloned().fold(f32::INFINITY, f32::min);
+            let l2_norm = x_cpu.iter().map(|v| v * v).sum::<f32>().sqrt();
+            eprintln!("LFM_DEBUG_STATE: pos={pos} mean={mean:.4} std={std:.4} max={max_val:.4} min={min_val:.4} l2={l2_norm:.4}");
+
+            // Also dump the first 8 values
+            eprintln!("LFM_DEBUG_STATE:   x[..8] = {:?}", &x_cpu[..8.min(hidden)]);
 
             // Read final norm weight (f16)
             let w_final_buf = self.get_weight("model.embedding_norm.weight");
@@ -833,13 +856,6 @@ impl LfmRunner {
                         self.conv_kernel_size,
                         num_conv_layers,
                     );
-                    // Preload all weights into the graph state (f16 + i4 MLX-style)
-                    for (name, data) in self.file.all_tensors() {
-                        let dtype = self.file.tensor_index(&name)
-                            .map(|t| t.dtype.clone())
-                            .unwrap_or_else(|| "f16".to_string());
-                        gs.preload_weight(name.clone(), data, dtype);
-                    }
                     // MLX i4 weights: per-ops Metal path (dequant cache)
                     // Fused graph + mlx_i4 kernel verified correct per-matmul
                     // but needs debugging for full 16-layer pipeline (hidden state diverges).
