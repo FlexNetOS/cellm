@@ -557,6 +557,161 @@ impl LfmGraphState {
                 "LfmGraphState: divergence at pos {pos} (NaNs={nan_count}, Infs={inf_count})")));
         }
 
+        // DEBUG: compare graph output vs CPU reference
+        if std::env::var("LFM_DEBUG_GRAPH").map(|v| v == "1").unwrap_or(false) {
+            // Read buf_x (pre-norm hidden state from GPU, already committed+waited)
+            let mut x_cpu = vec![0.0f32; hidden];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.buf_x.contents() as *const f32,
+                    x_cpu.as_mut_ptr(),
+                    hidden,
+                );
+            }
+
+            // Read final norm weight (f16)
+            let w_final_buf = self.get_weight("model.embedding_norm.weight");
+            let w_final_len = w_final_buf.length() as usize / 2; // f16 = 2 bytes per element
+            let w_final_u16: &[u16] = unsafe {
+                std::slice::from_raw_parts(w_final_buf.contents() as *const u16, w_final_len)
+            };
+
+            // CPU RMSNorm: normed[i] = x_cpu[i] * rms * w_final[i]
+            let ss: f32 = x_cpu.iter().map(|v| v * v).sum();
+            let rms = (ss / hidden as f32 + cfg.rms_norm_eps).sqrt().recip();
+            let mut normed = vec![0.0f32; hidden];
+            for i in 0..hidden {
+                normed[i] = x_cpu[i] * rms * half::f16::from_bits(w_final_u16[i]).to_f32();
+            }
+
+            let embed_name = "model.embed_tokens.weight";
+            let embed_dtype = self.tensor_dtypes.get(embed_name)
+                .map(|s| s.as_str()).unwrap_or("f16");
+
+            const DEBUG_VOCAB_HEAD: usize = 10;
+            let head = DEBUG_VOCAB_HEAD.min(cfg.vocab_size as usize);
+
+            let mut cpu_logits = vec![0.0f32; head];
+
+            if embed_dtype == "u32" {
+                // MLX i4: dequantize each row on CPU
+                let w_embed = self.get_weight(embed_name);
+                let w_embed_len = w_embed.length() as usize / 4; // u32 = 4 bytes
+                let w_u32: &[u32] = unsafe {
+                    std::slice::from_raw_parts(w_embed.contents() as *const u32, w_embed_len)
+                };
+
+                let scales_name = "model.embed_tokens.scales";
+                let biases_name = "model.embed_tokens.biases";
+
+                let s_buf = self.i4_scales.get(scales_name)
+                    .unwrap_or_else(|| panic!("LFM_DEBUG: missing {scales_name}"));
+                let b_buf = self.i4_biases.get(biases_name)
+                    .unwrap_or_else(|| panic!("LFM_DEBUG: missing {biases_name}"));
+
+                let s_len = s_buf.length() as usize / 4;
+                let b_len = b_buf.length() as usize / 4;
+                let s_f32: &[f32] = unsafe {
+                    std::slice::from_raw_parts(s_buf.contents() as *const f32, s_len)
+                };
+                let b_f32: &[f32] = unsafe {
+                    std::slice::from_raw_parts(b_buf.contents() as *const f32, b_len)
+                };
+
+                let group_size = 64usize;
+                let groups_per_row = (hidden + group_size - 1) / group_size;
+                let packed_per_row = hidden / 8;
+
+                for i in 0..head {
+                    let mut acc = 0.0f32;
+                    let row_off = i * packed_per_row;
+                    for g in 0..groups_per_row {
+                        let g_start = g * group_size;
+                        let g_end = (g_start + group_size).min(hidden);
+                        let scale = s_f32[i * groups_per_row + g];
+                        let bias = b_f32[i * groups_per_row + g];
+                        for j in g_start..g_end {
+                            let packed = w_u32[row_off + j / 8];
+                            let nibble = (packed >> ((j % 8) * 4)) & 0xF;
+                            let w_val = (nibble as f32) * scale + bias;
+                            acc += w_val * normed[j];
+                        }
+                    }
+                    cpu_logits[i] = acc;
+                }
+            } else {
+                // f16 embeddings
+                let w_embed = self.get_weight(embed_name);
+                let w_embed_len = w_embed.length() as usize / 2;
+                let w_u16: &[u16] = unsafe {
+                    std::slice::from_raw_parts(w_embed.contents() as *const u16, w_embed_len)
+                };
+
+                for i in 0..head {
+                    let mut acc = 0.0f32;
+                    let row_off = i * hidden;
+                    for j in 0..hidden {
+                        let w = half::f16::from_bits(w_u16[row_off + j]).to_f32();
+                        acc += w * normed[j];
+                    }
+                    cpu_logits[i] = acc;
+                }
+            }
+
+            // Compare GPU vs CPU logits for the first `head` vocab entries
+            let diff_sum: f32 = (0..head).map(|i| (logits[i] - cpu_logits[i]).abs()).sum();
+            let gpu_top1 = (0..cfg.vocab_size as usize)
+                .max_by(|&a, &b| logits[a].partial_cmp(&logits[b]).unwrap()).unwrap_or(0);
+            let cpu_top1 = (0..head)
+                .max_by(|&a, &b| cpu_logits[a].partial_cmp(&cpu_logits[b]).unwrap()).unwrap_or(0);
+
+            eprintln!("LFM_DEBUG: pos={pos} vocab_size={vocab_sz} diff_first{hd}={diff_sum:.6} gpu_top1={gpu_top1} cpu_top1_within{hd}={cpu_top1}",
+                hd = head, vocab_sz = cfg.vocab_size);
+
+            // Always compute CPU logit at gpu_top1 for comparison
+            if gpu_top1 < cfg.vocab_size as usize && gpu_top1 >= head {
+                let mut cpu_at_gpu_top = 0.0f32;
+                if embed_dtype == "u32" {
+                    let w_embed = self.get_weight(embed_name);
+                    let w_embed_len = w_embed.length() as usize / 4;
+                    let w_u32: &[u32] = unsafe {
+                        std::slice::from_raw_parts(w_embed.contents() as *const u32, w_embed_len)
+                    };
+                    let s_buf = self.i4_scales.get("model.embed_tokens.scales").unwrap();
+                    let b_buf = self.i4_biases.get("model.embed_tokens.biases").unwrap();
+                    let s_f32: &[f32] = unsafe { std::slice::from_raw_parts(s_buf.contents() as *const f32, s_buf.length() as usize / 4) };
+                    let b_f32: &[f32] = unsafe { std::slice::from_raw_parts(b_buf.contents() as *const f32, b_buf.length() as usize / 4) };
+                    let packed_per_row = hidden / 8;
+                    let groups_per_row = (hidden + 63) / 64;
+                    let i = gpu_top1;
+                    let mut acc = 0.0f32;
+                    let row_off = i * packed_per_row;
+                    for j in 0..hidden {
+                        let packed = w_u32[row_off + j / 8];
+                        let nibble = (packed >> ((j % 8) * 4)) & 0xF;
+                        let g = j / 64;
+                        let w_val = (nibble as f32) * s_f32[i * groups_per_row + g] + b_f32[i * groups_per_row + g];
+                        acc += w_val * normed[j];
+                    }
+                    cpu_at_gpu_top = acc;
+                }
+                eprintln!("LFM_DEBUG:   logits[{}] gpu={:.6} cpu={:.6} gpu_vs_cpu_diff={:.6}",
+                    gpu_top1, logits[gpu_top1], cpu_at_gpu_top,
+                    (logits[gpu_top1] - cpu_at_gpu_top).abs());
+            }
+
+            if diff_sum > 1.0 {
+                eprintln!("LFM_DEBUG: gpu_logits[..{head}] = {:?}", &logits[..head]);
+                eprintln!("LFM_DEBUG: cpu_logits[..{head}] = {:?}", &cpu_logits);
+                let scatter: [usize; 5] = [100, 1000, 5000, 10000, 20000];
+                for &idx in &scatter {
+                    if idx < cfg.vocab_size as usize {
+                        eprintln!("LFM_DEBUG:   logits[{idx}] gpu={:.6} cpu=N/A (not computed)", logits[idx]);
+                    }
+                }
+            }
+        }
+
         Ok(Some(logits))
         })
     }
@@ -685,10 +840,10 @@ impl LfmRunner {
                             .unwrap_or_else(|| "f16".to_string());
                         gs.preload_weight(name.clone(), data, dtype);
                     }
-                    // MLX i4 weights: use per-ops Metal path (dequant cache)
-                    // The fused graph infrastructure (mv_mlx_i4 kernel, encode_mv_auto) is ready
-                    // but needs debugging for the full 16-layer pipeline.
-                    eprintln!("lfm: i4 quantized weights; MLX i4 kernel ready, using per-ops Metal");
+                    // MLX i4 weights: per-ops Metal path (dequant cache)
+                    // Fused graph + mlx_i4 kernel verified correct per-matmul
+                    // but needs debugging for full 16-layer pipeline (hidden state diverges).
+                    eprintln!("lfm: i4 quantized weights; using per-ops Metal (fused graph debug wip)");
                     self.metal_ops = Some(ops);
                     true
                 }
