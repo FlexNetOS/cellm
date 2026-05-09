@@ -1371,6 +1371,40 @@ kernel void batch_rms_norm_f16w(
         out_token[i] = x_token[i] * inv_rms * wi;
     }
 }
+
+// MLX-style i4 matrix-vector product.
+// Weight format: u32 packed (8 x 4-bit values per u32), with f32 scales and biases.
+// Dequant: value = nibble * scale + bias  (asymmetric, unsigned 0..15)
+// Group size is typically 64.
+kernel void mv_mlx_i4(
+    device const uint*   w        [[buffer(0)]],
+    device const float*  scales   [[buffer(1)]],
+    device const float*  biases   [[buffer(2)]],
+    device const float*  x        [[buffer(3)]],
+    device       float*  o        [[buffer(4)]],
+    constant     uint&   rows     [[buffer(5)]],
+    constant     uint&   cols     [[buffer(6)]],
+    constant     uint&   group_size [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= rows) return;
+    uint groups_per_row = (cols + group_size - 1) / group_size;
+    uint packed_per_row = cols / 8;
+    device const uint* row_ptr = w + gid * packed_per_row;
+    float acc = 0.0f;
+    for (uint j = 0; j < cols; j++) {
+        uint packed_idx = j / 8;
+        uint nibble_idx = j % 8;
+        uint packed = row_ptr[packed_idx];
+        uint nibble = (packed >> (nibble_idx * 4)) & 0xF;
+        uint g = j / group_size;
+        float scale = scales[gid * groups_per_row + g];
+        float bias  = biases[gid * groups_per_row + g];
+        float val = (float)nibble * scale + bias;
+        acc += val * x[j];
+    }
+    o[gid] = acc;
+}
 "#;
 
 const COPY_SHADER: &str = r#"
@@ -1402,6 +1436,7 @@ pub struct MetalOps {
     pub pso_mv_f16: ComputePipelineState,
     pub pso_mv_i8: ComputePipelineState,
     pub pso_mv_i4: ComputePipelineState,
+    pub pso_mv_mlx_i4: ComputePipelineState,
     pub pso_mv_qkv_f16: ComputePipelineState,
     pub pso_mv_qkv_i8: ComputePipelineState,
     pub pso_mv2_f16: ComputePipelineState,
@@ -1446,6 +1481,7 @@ impl Clone for MetalOps {
             pso_mv_f16: self.pso_mv_f16.clone(),
             pso_mv_i8: self.pso_mv_i8.clone(),
             pso_mv_i4: self.pso_mv_i4.clone(),
+            pso_mv_mlx_i4: self.pso_mv_mlx_i4.clone(),
             pso_mv_qkv_f16: self.pso_mv_qkv_f16.clone(),
             pso_mv_qkv_i8: self.pso_mv_qkv_i8.clone(),
             pso_mv2_f16: self.pso_mv2_f16.clone(),
@@ -1581,6 +1617,7 @@ impl MetalOps {
     pub fn encode_qkv_i8(&self, _enc: &(), _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: usize, _: usize, _: usize) {}
     pub fn encode_mv_q1(&self, _enc: &(), _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: usize, _: usize) {}
     pub fn encode_mv_i4(&self, _enc: &(), _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: usize, _: usize, _: usize) {}
+    pub fn encode_mv_mlx_i4(&self, _enc: &(), _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: usize, _: usize, _: usize) {}
     pub fn logits_i4(&self, _: &[f32], _: &[u8], _: &[u16], _: usize, _: usize, _: usize, _: &str, _: &mut [f32]) -> anyhow::Result<()> {
         anyhow::bail!("Metal not available on this platform")
     }
@@ -1629,6 +1666,7 @@ impl MetalOps {
         let pso_mv_f16 = build_pso_ops(&device, &lib, "mv_f16")?;
         let pso_mv_i8 = build_pso_ops(&device, &lib, "mv_i8")?;
         let pso_mv_i4 = build_pso_ops(&device, &lib, "mv_i4")?;
+        let pso_mv_mlx_i4 = build_pso_ops(&device, &lib, "mv_mlx_i4")?;
         let pso_mv_qkv_f16 = build_pso_ops(&device, &lib, "mv_qkv_f16")?;
         let pso_mv_qkv_i8 = build_pso_ops(&device, &lib, "mv_qkv_i8")?;
         let pso_mv2_f16 = build_pso_ops(&device, &lib, "mv2_f16")?;
@@ -1657,7 +1695,7 @@ impl MetalOps {
 
         Ok(Self {
             device, queue, _lib: lib.clone(),
-            pso_rms_norm, pso_rope_adj, pso_rope_half, pso_mv_f16, pso_mv_i8, pso_mv_i4, pso_mv_qkv_f16, pso_mv_qkv_i8, pso_mv2_f16, pso_mv2_i8,
+            pso_rms_norm, pso_rope_adj, pso_rope_half, pso_mv_f16, pso_mv_i8, pso_mv_i4, pso_mv_mlx_i4, pso_mv_qkv_f16, pso_mv_qkv_i8, pso_mv2_f16, pso_mv2_i8,
             pso_add_f32, pso_mul_f32, pso_silu_mul_f32, pso_gelu_mul_f32, pso_mv_q1, pso_lfm_conv, pso_mv_f32, pso_attention_gqa, pso_attention_gqa_fast, pso_scatter_f32, pso_copy_f32, pso_batch_mv_f16,
             pso_batch_rope_half, pso_batch_rope_adj, pso_batch_write_kv, pso_batch_rms_norm,
             x_buf: Mutex::new(None), out_buf: Mutex::new(None),
@@ -2539,6 +2577,26 @@ impl MetalOps {
         enc.set_bytes(6, 4, (&g as *const u32).cast());
         let w = self.pso_mv_i4.thread_execution_width() as u64;
         enc.dispatch_threads(MTLSize { width: rs as u64, height: 1, depth: 1 }, MTLSize { width: w.min(rs as u64), height: 1, depth: 1 });
+    }
+
+    pub fn encode_mv_mlx_i4(&self, enc: &metal::ComputeCommandEncoderRef,
+        w: &metal::Buffer, scales: &metal::Buffer, biases: &metal::Buffer,
+        x: &metal::Buffer, out: &metal::Buffer,
+        rows: usize, cols: usize, group_size: usize)
+    {
+        let r = rows as u32; let c = cols as u32; let gs = group_size as u32;
+        enc.set_compute_pipeline_state(&self.pso_mv_mlx_i4);
+        enc.set_buffer(0, Some(w), 0);
+        enc.set_buffer(1, Some(scales), 0);
+        enc.set_buffer(2, Some(biases), 0);
+        enc.set_buffer(3, Some(x), 0);
+        enc.set_buffer(4, Some(out), 0);
+        enc.set_bytes(5, 4, (&r as *const u32).cast());
+        enc.set_bytes(6, 4, (&c as *const u32).cast());
+        enc.set_bytes(7, 4, (&gs as *const u32).cast());
+        let w = self.pso_mv_mlx_i4.thread_execution_width() as u64;
+        enc.dispatch_threads(MTLSize { width: rows as u64, height: 1, depth: 1 },
+            MTLSize { width: w.min(rows as u64), height: 1, depth: 1 });
     }
 
     pub fn logits_i4(&self, x: &[f32], w_u8: &[u8], s_f16: &[u16], vocab: usize, hidden: usize, gs: usize, cache_key: &str, out: &mut [f32]) -> anyhow::Result<()> {

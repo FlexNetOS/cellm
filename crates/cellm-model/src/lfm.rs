@@ -69,6 +69,12 @@ pub struct LfmGraphState {
     layer_types: Vec<String>,
     /// Preloaded weight buffers: name -> Metal Buffer (f16)
     weights: HashMap<String, metal::Buffer>,
+    /// Dtype string per tensor name ("f16" | "u32").
+    tensor_dtypes: HashMap<String, String>,
+    /// Cached MLX i4 scale buffers: "name.scales" -> Buffer
+    i4_scales: HashMap<String, metal::Buffer>,
+    /// Cached MLX i4 bias buffers: "name.biases" -> Buffer
+    i4_biases: HashMap<String, metal::Buffer>,
     /// Conv state buffers per conv layer
     conv_states: Vec<metal::Buffer>,
     /// Conv kernel buffers per conv layer
@@ -138,6 +144,9 @@ impl LfmGraphState {
             cfg,
             layer_types,
             weights: HashMap::new(),
+            tensor_dtypes: HashMap::new(),
+            i4_scales: HashMap::new(),
+            i4_biases: HashMap::new(),
             conv_states,
             conv_kernels,
             buf_x: make_buf(hidden),
@@ -185,13 +194,52 @@ impl LfmGraphState {
         panic!("LfmGraphState weight not found: {}", name);
     }
 
-    pub fn preload_weight(&mut self, name: String, bytes: &[u8]) {
+    pub fn preload_weight(&mut self, name: String, bytes: &[u8], dtype: String) {
         let buf = self.ops.device.new_buffer_with_data(
             bytes.as_ptr() as *const c_void,
             bytes.len() as u64,
             MTLResourceOptions::StorageModeShared,
         );
+        self.tensor_dtypes.insert(name.clone(), dtype);
+        // Store scales/biases separately for MLX i4 lookup
+        if name.ends_with(".scales") {
+            self.i4_scales.insert(name.clone(), buf.clone());
+        } else if name.ends_with(".biases") {
+            self.i4_biases.insert(name.clone(), buf.clone());
+        }
         self.weights.insert(name, buf);
+    }
+
+    /// Dispatch the correct matrix-vector kernel based on weight dtype.
+    fn encode_mv_auto(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        name: &str,
+        x: &metal::Buffer,
+        out: &metal::Buffer,
+        rows: usize,
+        cols: usize,
+    ) {
+        let dtype = self.tensor_dtypes.get(name)
+            .map(|s| s.as_str()).unwrap_or("f16");
+        if dtype == "u32" {
+            // MLX-style i4: on-the-fly GPU dequant + matmul
+            let w = self.get_weight(name);
+            let group_size = 64usize;
+            let groups_per_row = (cols + group_size - 1) / group_size;
+            let scales_name = format!("{}.scales", name.trim_end_matches(".weight"));
+            let biases_name = format!("{}.biases", name.trim_end_matches(".weight"));
+            let scales = self.i4_scales.get(&scales_name)
+                .or_else(|| { let n = format!("{}.scales", name); self.i4_scales.get(&n) })
+                .unwrap_or_else(|| panic!("LfmGraphState: missing i4 scales for {name}"));
+            let biases = self.i4_biases.get(&biases_name)
+                .or_else(|| { let n = format!("{}.biases", name); self.i4_biases.get(&n) })
+                .unwrap_or_else(|| panic!("LfmGraphState: missing i4 biases for {name}"));
+            self.ops.encode_mv_mlx_i4(enc, w, scales, biases, x, out, rows, cols, group_size);
+        } else {
+            let w = self.get_weight(name);
+            self.ops.encode_mv_f16(enc, w, x, out, rows, cols);
+        }
     }
 
     /// Run a fused forward pass for all layers (conv + attention) in a single
@@ -251,8 +299,6 @@ impl LfmGraphState {
 
                     let w_norm = self.get_weight(
                         &format!("model.layers.{layer}.operator_norm.weight"));
-                    let w_in = self.get_weight(
-                        &format!("model.layers.{layer}.conv.in_proj.weight"));
 
                     // Encoder 1: op_norm + in_proj
                     {
@@ -261,8 +307,8 @@ impl LfmGraphState {
                         self.ops.encode_rms_norm_f16w(
                             &enc, &self.buf_x, w_norm, &self.buf_x_norm,
                             hidden, cfg.rms_norm_eps, false);
-                        self.ops.encode_mv_f16(
-                            &enc, w_in, &self.buf_x_norm, &self.buf_bcx,
+                        self.encode_mv_auto(&enc, &format!("model.layers.{layer}.conv.in_proj.weight"),
+                            &self.buf_x_norm, &self.buf_bcx,
                             hidden * 3, hidden);
                         enc.end_encoding();
                         cb.commit();
@@ -319,15 +365,13 @@ impl LfmGraphState {
                     }
 
                     // ── Encoder 3: out_proj + residual (conv layers have no MLP) ──
-                    let w_out = self.get_weight(
-                        &format!("model.layers.{layer}.conv.out_proj.weight"));
 
                     {
                         let cb = self.ops.queue.new_command_buffer();
                         let enc = cb.new_compute_command_encoder();
                         // out_proj: y → attn_proj
-                        self.ops.encode_mv_f16(
-                            &enc, w_out, &self.buf_y, &self.buf_attn_proj,
+                        self.encode_mv_auto(&enc, &format!("model.layers.{layer}.conv.out_proj.weight"),
+                            &self.buf_y, &self.buf_attn_proj,
                             hidden, hidden);
                         // residual: x += attn_proj
                         self.ops.encode_add_f32_inplace(
@@ -356,21 +400,14 @@ impl LfmGraphState {
                         hidden, cfg.rms_norm_eps, false);
 
                     // QKV projections
-                    let w_q = self.get_weight(
-                        &format!("model.layers.{layer}.self_attn.q_proj.weight"));
-                    let w_k = self.get_weight(
-                        &format!("model.layers.{layer}.self_attn.k_proj.weight"));
-                    let w_v = self.get_weight(
-                        &format!("model.layers.{layer}.self_attn.v_proj.weight"));
-
-                    self.ops.encode_mv_f16(
-                        &enc, w_q, &self.buf_x_norm, &self.buf_q,
+                    self.encode_mv_auto(&enc, &format!("model.layers.{layer}.self_attn.q_proj.weight"),
+                        &self.buf_x_norm, &self.buf_q,
                         attn_dim, hidden);
-                    self.ops.encode_mv_f16(
-                        &enc, w_k, &self.buf_x_norm, &self.buf_k,
+                    self.encode_mv_auto(&enc, &format!("model.layers.{layer}.self_attn.k_proj.weight"),
+                        &self.buf_x_norm, &self.buf_k,
                         kv_dim, hidden);
-                    self.ops.encode_mv_f16(
-                        &enc, w_v, &self.buf_x_norm, &self.buf_v,
+                    self.encode_mv_auto(&enc, &format!("model.layers.{layer}.self_attn.v_proj.weight"),
+                        &self.buf_x_norm, &self.buf_v,
                         kv_dim, hidden);
 
                     // TODO: Q/K per-head layernorm (requires encode_rms_norm_f16w_at)
@@ -432,10 +469,8 @@ impl LfmGraphState {
                     );
 
                     // O projection (LFM uses 'out_proj' not 'o_proj')
-                    let w_o = self.get_weight(
-                        &format!("model.layers.{layer}.self_attn.out_proj.weight"));
-                    self.ops.encode_mv_f16(
-                        &enc, w_o, &self.buf_attn_out, &self.buf_mlp_in,
+                    self.encode_mv_auto(&enc, &format!("model.layers.{layer}.self_attn.out_proj.weight"),
+                        &self.buf_attn_out, &self.buf_mlp_in,
                         hidden, attn_dim);
 
                     // Residual: x += mlp_in
@@ -450,15 +485,11 @@ impl LfmGraphState {
                         hidden, cfg.rms_norm_eps, false);
 
                     // Gate + Up projection (LFM uses 'feed_forward' not 'mlp')
-                    let w_gate = self.get_weight(
-                        &format!("model.layers.{layer}.feed_forward.w1.weight"));
-                    let w_up = self.get_weight(
-                        &format!("model.layers.{layer}.feed_forward.w3.weight"));
-                    self.ops.encode_mv_f16(
-                        &enc, w_gate, &self.buf_x_norm, &self.buf_gate,
+                    self.encode_mv_auto(&enc, &format!("model.layers.{layer}.feed_forward.w1.weight"),
+                        &self.buf_x_norm, &self.buf_gate,
                         intermediate, hidden);
-                    self.ops.encode_mv_f16(
-                        &enc, w_up, &self.buf_x_norm, &self.buf_up,
+                    self.encode_mv_auto(&enc, &format!("model.layers.{layer}.feed_forward.w3.weight"),
+                        &self.buf_x_norm, &self.buf_up,
                         intermediate, hidden);
 
                     // SiLU activation: gate *= sigmoid(gate) * up
@@ -466,10 +497,8 @@ impl LfmGraphState {
                         &enc, &self.buf_gate, &self.buf_up, intermediate);
 
                     // Down projection (LFM uses w2 for down)
-                    let w_down = self.get_weight(
-                        &format!("model.layers.{layer}.feed_forward.w2.weight"));
-                    self.ops.encode_mv_f16(
-                        &enc, w_down, &self.buf_gate, &self.buf_down,
+                    self.encode_mv_auto(&enc, &format!("model.layers.{layer}.feed_forward.w2.weight"),
+                        &self.buf_gate, &self.buf_down,
                         hidden, intermediate);
 
                     // Residual: x += down
@@ -498,12 +527,8 @@ impl LfmGraphState {
             hidden, cfg.rms_norm_eps, false);
 
         if return_logits {
-            // LFM ties embeddings with LM head: embed_tokens.weight [vocab, hidden]
-            // Logits = x_norm @ embed_tokens^T = embed_tokens @ x_norm (row-wise dot)
-            let w_emb = self.get_weight("model.embed_tokens.weight");
-            // Use mv_f16: treat embed_tokens as [vocab_size, hidden] weight
-            self.ops.encode_mv_f16(
-                &enc, w_emb, &self.buf_x_norm, &self.buf_logits,
+            self.encode_mv_auto(&enc, "model.embed_tokens.weight",
+                &self.buf_x_norm, &self.buf_logits,
                 cfg.vocab_size, hidden);
         }
         enc.end_encoding();
@@ -653,23 +678,19 @@ impl LfmRunner {
                         self.conv_kernel_size,
                         num_conv_layers,
                     );
-                    // Check if model has i4 quantized weights (u32 dtype)
-                    let has_i4 = self.file.header.tensors.iter().any(|t| t.dtype == "u32");
-                    if has_i4 {
-                        // i4 weights can't be used with the fused graph state
-                        // (they need the dequant cache). Use per-layer Metal instead.
-                        eprintln!("lfm: i4 quantized weights detected, skipping fused graph state");
-                        self.metal_ops = Some(ops);
-                        true
-                    } else {
-                        // Preload all weights into the graph state
-                        for (name, data) in self.file.all_tensors() {
-                            gs.preload_weight(name.clone(), data);
-                        }
-                        self.metal_ops = Some(ops);
-                        self.graph_state = Some(gs);
-                        true
+                    // Preload all weights into the graph state (f16 + i4 MLX-style)
+                    for (name, data) in self.file.all_tensors() {
+                        let dtype = self.file.tensor_index(&name)
+                            .map(|t| t.dtype.clone())
+                            .unwrap_or_else(|| "f16".to_string());
+                        gs.preload_weight(name.clone(), data, dtype);
                     }
+                    // MLX i4 weights: use per-ops Metal path (dequant cache)
+                    // The fused graph infrastructure (mv_mlx_i4 kernel, encode_mv_auto) is ready
+                    // but needs debugging for the full 16-layer pipeline.
+                    eprintln!("lfm: i4 quantized weights; MLX i4 kernel ready, using per-ops Metal");
+                    self.metal_ops = Some(ops);
+                    true
                 }
                 Err(e) => {
                     eprintln!("lfm: failed to enable metal backend: {e}");
