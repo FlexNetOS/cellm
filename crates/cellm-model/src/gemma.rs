@@ -262,17 +262,17 @@ impl GemmaRunner {
     pub fn enable_metal_full_backend(&mut self) -> bool {
         match (MetalKernels::create_matmul(), MetalOps::create()) {
             (Ok(ctx), Ok(ops)) => {
-                // Attempt to build the fused graph for Gemma3 text models.
-                // Gemma4 is excluded because it uses mixed i4 quantization and complex
-                // per-layer features (shared-KV, PLE, layer-output-scale) not yet supported.
+                // Attempt to build the fused graph for Gemma3 and Gemma4 text models.
+                // Gemma4 uses i4 quantization, boolean sliding-window mask, V-norm,
+                // logit softcapping, and per-layer features (shared-KV, PLE, etc.).
                 #[cfg(any(target_os = "macos", target_os = "ios"))]
-                if self.is_gemma3_text && !self.is_gemma4_text {
+                if self.is_gemma3_text || self.is_gemma4_text {
                     let has_unsupported_graph_dtype = self.file.header.tensors.iter().any(|t| {
                         let d = t.dtype.as_str();
-                        d == "i4" || d == "i2"
+                        d == "i2"
                     });
                     if has_unsupported_graph_dtype {
-                        eprintln!("gemma: fused Metal graph disabled: model contains i4/i2 quantized weights not yet supported by the Metal graph kernels");
+                        eprintln!("gemma: fused Metal graph disabled: model contains i2 quantized weights not yet supported by the Metal graph kernels");
                     }
                     let graph_enabled = std::env::var("CELLM_GEMMA_ENABLE_GRAPH")
                         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -290,6 +290,11 @@ impl GemmaRunner {
                             }
                         }).collect();
 
+                        let ple_layer_dim = if self.is_gemma4_text {
+                            self.per_layer_input.as_ref().map(|s| s.per_layer_dim).unwrap_or(0)
+                        } else {
+                            0
+                        };
                         match GemmaGraphState::new(
                             self.cfg.hidden_size,
                             self.cfg.vocab_size,
@@ -307,8 +312,12 @@ impl GemmaRunner {
                             self.rmsnorm_weight_is_offset,
                             self.tensor_prefix.clone(),
                             ops.clone(),
+                            ple_layer_dim,
                         ) {
                             Ok(mut gs) => {
+                                eprintln!("gemma: graph params: shared_kv={} sliding_mask={:?}",
+                                    self.gemma4_shared_kv_layers,
+                                    self.gemma4_sliding_mask.iter().map(|&b| if b {'s'} else {'f'}).collect::<String>());
                                 println!("gemma: preloading weights into fused Metal graph...");
                                 for (name, data) in self.file.all_tensors() {
                                     let dtype = self.file.tensor_index(name)
@@ -333,13 +342,24 @@ impl GemmaRunner {
                                                 let row_bytes = &data[0..cols/2];
                                                 let cpu_dot = dot_i4_scaled_row(row_bytes, &x_cpu, scale_cpu);
                                                 eprintln!("TEST i4: {} rows={} cols={} scale={} cpu_dot={}", name, rows, cols, scale_cpu, cpu_dot);
+                                                // Also test GPU via logits_i4 (use local `ops` since self.metal_ops is not yet set)
+                                                let mut gpu_out = vec![0.0f32; rows];
+                                                let qs_u16: &[u16] = bytemuck::cast_slice(qs_data);
+                                                match ops.logits_i4(&x_cpu, data, qs_u16, rows, cols, cols, name, &mut gpu_out) {
+                                                    Ok(_) => {
+                                                        let gpu_dot = gpu_out[0];
+                                                        eprintln!("TEST i4 GPU compare: cpu={} gpu={} diff={}", cpu_dot, gpu_dot, (cpu_dot - gpu_dot).abs());
+                                                    }
+                                                    Err(e) => eprintln!("TEST i4 GPU failed: {e}"),
+                                                }
                                             }
                                             break;
                                         }
                                     }
                                 }
                                 self.graph_state = Some(gs);
-                                println!("gemma: fused Metal graph enabled (Gemma3, {} layers)",
+                                let model_family = if self.is_gemma4_text { "Gemma4" } else { "Gemma3" };
+                                println!("gemma: fused Metal graph enabled ({model_family}, {} layers)",
                                     self.cfg.num_hidden_layers);
                             }
                             Err(e) => {
@@ -426,7 +446,7 @@ impl GemmaRunner {
     fn step_topk_batched(
         &mut self,
         _x0: &[f32],
-        _per_layer_input: Option<&[f32]>,
+        per_layer_input_data: Option<&[f32]>,
         _pos: usize,
         _page_table: &mut PageTable,
         _kv_cache: &mut KVCache,
@@ -438,7 +458,7 @@ impl GemmaRunner {
     fn step_topk_batched(
         &mut self,
         x0: &[f32],
-        _per_layer_input: Option<&[f32]>,
+        per_layer_input_data: Option<&[f32]>,
         pos: usize,
         page_table: &mut PageTable,
         kv_cache: &mut KVCache,
@@ -903,7 +923,12 @@ impl GemmaRunner {
         {
             let mut disable_graph = false;
             let graph_logits: Option<Vec<f32>> = 'graph: {
-                if per_layer_input.is_some() {
+                // Skip graph for non-Gemma4 models with PLE (not supported on those models)
+                if !self.is_gemma4_text && per_layer_input.is_some() {
+                    break 'graph None;
+                }
+                // Skip graph for Gemma4 PLE when explicitly disabled by env var
+                if self.is_gemma4_text && self.gemma4_disable_per_layer_input && per_layer_input.is_some() {
                     break 'graph None;
                 }
                 if kv_cache.encoding() == cellm_cache::KvEncodingKind::TurboQuant {
@@ -914,6 +939,7 @@ impl GemmaRunner {
                         x0, &cfg, kv_cache, page_table,
                         pos, token_off, block_id as u32,
                         top_k > 0,
+                        per_layer_input,
                     ) {
                         Ok(Some(logits)) => {
                             if logits.iter().any(|v| !v.is_finite()) {
@@ -2805,7 +2831,7 @@ fn dot_i2_scaled_row(row_packed: &[u8], x: &[f32], scale: f32) -> f32 {
     acc
 }
 
-fn gelu_tanh_f32(x: f32) -> f32 {
+pub(crate) fn gelu_tanh_f32(x: f32) -> f32 {
     let k = 0.797_884_6f32;
     let c = 0.044_715f32;
     0.5f32 * x * (1.0f32 + (k * (x + c * x * x * x)).tanh())

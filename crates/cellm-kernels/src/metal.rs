@@ -510,6 +510,15 @@ kernel void add_f32_inplace(
     if (gid < n) a[gid] += b[gid];
 }
 
+kernel void mul_f32_inplace(
+    device float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid < n) a[gid] *= b[gid];
+}
+
 kernel void silu_mul_f32_inplace(
     device float* a [[buffer(0)]],
     device const float* b [[buffer(1)]],
@@ -1398,6 +1407,7 @@ pub struct MetalOps {
     pub pso_mv2_f16: ComputePipelineState,
     pub pso_mv2_i8: ComputePipelineState,
     pub pso_add_f32: ComputePipelineState,
+    pub pso_mul_f32: ComputePipelineState,
     pub pso_silu_mul_f32: ComputePipelineState,
     pub pso_gelu_mul_f32: ComputePipelineState,
     pub pso_mv_q1: ComputePipelineState,
@@ -1441,6 +1451,7 @@ impl Clone for MetalOps {
             pso_mv2_f16: self.pso_mv2_f16.clone(),
             pso_mv2_i8: self.pso_mv2_i8.clone(),
             pso_add_f32: self.pso_add_f32.clone(),
+            pso_mul_f32: self.pso_mul_f32.clone(),
             pso_silu_mul_f32: self.pso_silu_mul_f32.clone(),
             pso_gelu_mul_f32: self.pso_gelu_mul_f32.clone(),
             pso_mv_q1: self.pso_mv_q1.clone(),
@@ -1535,6 +1546,7 @@ impl MetalOps {
     pub fn encode_qkv_i8_bias_at(&self, _enc: &(), _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: &MetalBuffer, _: u64, _: Option<&MetalBuffer>, _: u64, _: Option<&MetalBuffer>, _: u64, _: Option<&MetalBuffer>, _: u64, _: &MetalBuffer, _: u64, _: &MetalBuffer, _: u64, _: &MetalBuffer, _: u64, _: usize, _: usize, _: usize) {}
     pub fn encode_add_f32_inplace(&self, _enc: &(), _: &MetalBuffer, _: &MetalBuffer, _: usize) {}
     pub fn encode_add_f32_inplace_at(&self, _enc: &(), _: &MetalBuffer, _: u64, _: &MetalBuffer, _: u64, _: usize) {}
+    pub fn encode_mul_f32_inplace(&self, _enc: &(), _: &MetalBuffer, _: &MetalBuffer, _: usize) {}
     pub fn encode_scatter_f32(&self, _enc: &(), _: &MetalBuffer, _: &MetalBuffer, _: usize, _: usize) {}
     pub fn encode_copy_f32(&self, _enc: &(), _: &MetalBuffer, _: &MetalBuffer, _: usize, _: usize, _: usize) {}
     pub fn encode_silu_mul_f32_inplace(&self, _enc: &(), _: &MetalBuffer, _: &MetalBuffer, _: usize) {}
@@ -1622,6 +1634,7 @@ impl MetalOps {
         let pso_mv2_f16 = build_pso_ops(&device, &lib, "mv2_f16")?;
         let pso_mv2_i8 = build_pso_ops(&device, &lib, "mv2_i8")?;
         let pso_add_f32 = build_pso_ops(&device, &lib, "add_f32_inplace")?;
+        let pso_mul_f32 = build_pso_ops(&device, &lib, "mul_f32_inplace")?;
         let pso_silu_mul_f32 = build_pso_ops(&device, &lib, "silu_mul_f32_inplace")?;
         let pso_gelu_mul_f32 = build_pso_ops(&device, &lib, "gelu_tanh_mul_f32_inplace")?;
         let pso_mv_q1 = build_pso_ops(&device, &lib, "mv_q1_0_g128")?;
@@ -1645,7 +1658,7 @@ impl MetalOps {
         Ok(Self {
             device, queue, _lib: lib.clone(),
             pso_rms_norm, pso_rope_adj, pso_rope_half, pso_mv_f16, pso_mv_i8, pso_mv_i4, pso_mv_qkv_f16, pso_mv_qkv_i8, pso_mv2_f16, pso_mv2_i8,
-            pso_add_f32, pso_silu_mul_f32, pso_gelu_mul_f32, pso_mv_q1, pso_lfm_conv, pso_mv_f32, pso_attention_gqa, pso_attention_gqa_fast, pso_scatter_f32, pso_copy_f32, pso_batch_mv_f16,
+            pso_add_f32, pso_mul_f32, pso_silu_mul_f32, pso_gelu_mul_f32, pso_mv_q1, pso_lfm_conv, pso_mv_f32, pso_attention_gqa, pso_attention_gqa_fast, pso_scatter_f32, pso_copy_f32, pso_batch_mv_f16,
             pso_batch_rope_half, pso_batch_rope_adj, pso_batch_write_kv, pso_batch_rms_norm,
             x_buf: Mutex::new(None), out_buf: Mutex::new(None),
             tensor_cache: Mutex::new(HashMap::new()),
@@ -2113,6 +2126,15 @@ impl MetalOps {
         enc.set_buffer(0, Some(a), a_offset); enc.set_buffer(1, Some(b), b_offset);
         enc.set_bytes(2, 4, (&n32 as *const u32).cast());
         let w = self.pso_add_f32.thread_execution_width() as u64;
+        enc.dispatch_threads(MTLSize { width: n as u64, height: 1, depth: 1 }, MTLSize { width: w.min(n as u64), height: 1, depth: 1 });
+    }
+
+    pub fn encode_mul_f32_inplace(&self, enc: &metal::ComputeCommandEncoderRef, a: &metal::BufferRef, b: &metal::BufferRef, n: usize) {
+        let n32 = n as u32;
+        enc.set_compute_pipeline_state(&self.pso_mul_f32);
+        enc.set_buffer(0, Some(a), 0); enc.set_buffer(1, Some(b), 0);
+        enc.set_bytes(2, 4, (&n32 as *const u32).cast());
+        let w = self.pso_mul_f32.thread_execution_width() as u64;
         enc.dispatch_threads(MTLSize { width: n as u64, height: 1, depth: 1 }, MTLSize { width: w.min(n as u64), height: 1, depth: 1 });
     }
 
