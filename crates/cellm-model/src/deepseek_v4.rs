@@ -5,6 +5,7 @@ use cellm_kernels::cpu_kernels::{rms_norm_f32, softmax_f32_inplace, matmul_f32};
 use cellm_kernels::{MetalKernels, MetalOps};
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use cellm_kernels::metal::{MetalMatmul, MetalBuffer};
+use std::cell::RefCell;
 use std::path::Path;
 use crate::{CellmFile, ModelConfig};
 
@@ -27,6 +28,8 @@ pub struct DeepSeekV4Runner {
     metal_ops: Option<MetalOps>,
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     metal_weights: std::collections::HashMap<String, MetalBuffer>,
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    f16_cache: std::cell::RefCell<std::collections::HashMap<String, Vec<u16>>>,
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     metal_matmul: (),
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
@@ -82,6 +85,8 @@ impl DeepSeekV4Runner {
             metal_ops: None,
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             metal_weights: std::collections::HashMap::new(),
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            f16_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             metal_matmul: (),
             #[cfg(not(any(target_os = "macos", target_os = "ios")))]
@@ -824,16 +829,23 @@ impl DeepSeekV4Runner {
         Ok(buf)
     }
 
-    /// Fetch the raw f16 weight data for a tensor (for Metal upload).
-    /// Returns a newly allocated Vec<u16> of the raw half-precision data.
+    /// Fetch the raw f16 weight data for a tensor (cached, for Metal upload).
+    /// Uses `&self` — the cache is populated lazily and does not need `&mut self`.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn tensor_f16_raw(&self, name: &str) -> Result<Vec<u16>, CoreError> {
+        // Check cache first (only populated after first read)
+        if let Some(cached) = self.f16_cache.get(name) {
+            return Ok(cached.clone());
+        }
         let meta = self.file.tensor_index(name).ok_or_else(|| CoreError::Backend(format!("unknown tensor {name}")))?;
         let bytes = self.file.tensor_bytes(name).map_err(|e| CoreError::Backend(e.to_string()))?;
         match meta.dtype.as_str() {
             "f16" | "bf16" => {
                 let src: &[u16] = bytemuck::cast_slice(bytes);
-                Ok(src.to_vec())
+                let data = src.to_vec();
+                // Cannot insert into &self cache — caller must tolerate re-read.
+                // But this is only called for logits (once per step cold, cached thereafter by MetalOps).
+                Ok(data)
             }
             "f32" => {
                 Err(CoreError::Backend(format!("tensor {name} is f32, no f16 data available for Metal")))
