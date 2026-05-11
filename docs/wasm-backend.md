@@ -4,7 +4,7 @@ This document describes how the cellm LLM inference engine was ported to
 WebAssembly, the design decisions involved, and how the pieces fit together.
 
 > [!TIP]
-> **[Try the Live WebAssembly Demo](wasm/index.html)**
+> **<a href="wasm/index.html" target="_blank">Try the Live WebAssembly Demo</a>**
 
 ## Architecture Overview
 

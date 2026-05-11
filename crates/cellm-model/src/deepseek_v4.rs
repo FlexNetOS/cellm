@@ -80,6 +80,8 @@ impl DeepSeekV4Runner {
             metal_matmul: None,
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             metal_ops: None,
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            metal_weights: std::collections::HashMap::new(),
             #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             metal_matmul: (),
             #[cfg(not(any(target_os = "macos", target_os = "ios")))]
@@ -775,7 +777,20 @@ impl DeepSeekV4Runner {
         if self.metal_matmul.is_some() {
             let w = self.tensor_f32(name)?.to_vec();
             if let Some(ref mm) = self.metal_matmul {
-                if mm.matmul_row_major_f32(&w, out_dim, in_dim, x, 1, out).is_ok() {
+                use std::collections::hash_map::Entry;
+                let w_buf = match self.metal_weights.entry(name.to_string()) {
+                    Entry::Occupied(e) => e.into_mut(),
+                    Entry::Vacant(e) => {
+                        let buf = mm.upload_f32(&w).map_err(|e|
+                            CoreError::Backend(format!("metal upload {name}: {e}"))
+                        )?;
+                        e.insert(buf)
+                    }
+                };
+                let x_buf = mm.upload_f32(x).map_err(|e|
+                    CoreError::Backend(format!("metal upload x: {e}"))
+                )?;
+                if mm.matmul_row_major_f32_with_b_buffer(w_buf, out_dim, in_dim, &x_buf, 1, out).is_ok() {
                     return Ok(());
                 }
             }
