@@ -953,24 +953,24 @@ DeepSeek-V4 introduces a high-efficiency architecture featuring:
   --gen 32 --backend cpu
 
   ./target/release/infer \
-  --model models/nanowhale-100m.cellm \
-  --tokenizer models/nanowhale-100m/tokenizer.json \
+  --model models/to-huggingface/nanowhale-100m-v1/nanowhale-100m-v1.cellm \
+  --tokenizer models/to-huggingface/nanowhale-100m-v1/tokenizer.json \
   --prompt "What are 3 benefits of exercise?" \
   --gen 32 --backend cpu
 
 
   ./target/release/infer \
-  --model models/nanowhale-100m.cellm \
-  --tokenizer models/nanowhale-100m/tokenizer.json \
-  --prompt "<｜begin▁of▁sentence｜><｜User｜>what's sycophancy?<｜Assistant｜>" \
+  --model models/to-huggingface/nanowhale-100m-v1/nanowhale-100m-v1.cellm \
+  --tokenizer models/to-huggingface/nanowhale-100m-v1/tokenizer.json \
+  --prompt "<｜begin of sentence｜><｜User｜>what's sycophancy?<｜Assistant｜>" \
   --gen 100 --temperature 0 --backend cpu --kv-encoding f16
 
 
 
   ./target/release/infer \
-  --model models/nanowhale-100m.cellm \
-  --tokenizer models/nanowhale-100m/tokenizer.json \
-  --prompt "<｜begin▁of▁sentence｜><｜User｜>what's sycophancy?<｜Assistant｜>" \
+  --model models/to-huggingface/nanowhale-100m-v1/nanowhale-100m-v1.cellm \
+  --tokenizer models/to-huggingface/nanowhale-100m-v1/tokenizer.json \
+  --prompt "<｜begin of sentence｜><｜User｜>what's sycophancy?<｜Assistant｜>" \
   --gen 100 --temperature 0 --backend metal --kv-encoding f16
 ```
 

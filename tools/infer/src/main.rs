@@ -246,8 +246,12 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
                     println!("LLM backend: CPU (LFM Metal init failed, falling back)");
                 }
             }
-            Runner::DeepSeekV4(_) => {
-                println!("LLM backend: CPU (DeepSeekV4 fallback path)");
+            Runner::DeepSeekV4(r) => {
+                if r.enable_metal_full_backend() {
+                    println!("LLM backend: metal (DeepSeekV4 matmul + ops)");
+                } else {
+                    println!("LLM backend: CPU (DeepSeekV4 fallback path)");
+                }
             }
         }
         println!("Startup: metal init {:.2}s", t_stage.elapsed().as_secs_f64());
