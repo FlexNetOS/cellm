@@ -51,6 +51,7 @@ impl GraniteRunner {
             rms_norm_eps: h.rms_norm_eps,
             rope_theta: h.rope_theta,
             attention_softcap: 0.0,
+            ..ModelConfig::default()
         };
 
         // Extract MuP multipliers from source_text_config if available

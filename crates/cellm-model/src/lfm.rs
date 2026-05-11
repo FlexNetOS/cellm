@@ -798,6 +798,93 @@ impl LfmRunner {
             rms_norm_eps: h.rms_norm_eps,
             rope_theta: h.rope_theta,
             attention_softcap: 0.0,
+            ..ModelConfig::default()
+        };
+
+        // Initialize conv state cache
+        // For each conv layer, store the last kernel_size Bx vectors for causal conv
+        let num_conv_layers = layer_types.iter().filter(|t| *t == "conv").count();
+        let conv_states: Vec<Vec<f32>> = (0..num_conv_layers)
+            .map(|_| vec![0.0f32; conv_kernel_size * cfg.hidden_size])
+            .collect();
+
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let (metal_ops, graph_state) = (None, None);
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let (metal_ops, graph_state) = ((), ());
+
+        Ok(Self {
+            file,
+            cfg: cfg.clone(),
+            max_layers: cfg.num_hidden_layers,
+            eos_token_id: h.eos_token_id,
+            layer_types,
+            conv_kernel_size,
+            conv_states,
+            weight_cache: HashMap::new(),
+            lru_order: Vec::new(),
+            metal_ops,
+            graph_state,
+        })
+    }
+
+    pub fn from_file(file: CellmFile) -> Result<Self, CoreError> {
+        let h = file.header.clone();
+
+        // Parse layer types from source_text_config if available
+        let layer_types: Vec<String> = h.source_text_config
+            .as_ref()
+            .and_then(|cfg: &Value| cfg.get("layer_types"))
+            .and_then(|v: &Value| v.as_array())
+            .map(|arr: &Vec<Value>| {
+                arr.iter()
+                    .filter_map(|v: &Value| v.as_str().map(|s: &str| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_else(|| {
+                // Default LFM2.5-350M pattern: 16 layers
+                vec![
+                    "conv", "conv", "full_attention", "conv", "conv", "full_attention",
+                    "conv", "conv", "full_attention", "conv", "full_attention", "conv",
+                    "full_attention", "conv", "full_attention", "conv",
+                ]
+                .into_iter()
+                .map(|s: &str| s.to_string())
+                .collect()
+            });
+
+        // Get conv kernel size (L_cache in config)
+        let conv_kernel_size: usize = h.source_text_config
+            .as_ref()
+            .and_then(|cfg: &Value| cfg.get("conv_L_cache"))
+            .and_then(|v: &Value| v.as_u64())
+            .map(|v: u64| v as usize)
+            .unwrap_or(3);
+
+        let cfg = ModelConfig {
+            vocab_size: h.vocab_size,
+            hidden_size: h.hidden_dim,
+            num_hidden_layers: h.num_layers,
+            num_attention_heads: h.num_heads,
+            num_key_value_heads: h.num_kv_heads,
+            head_dim: h.head_dim.unwrap_or_else(|| {
+                // Infer from k_proj if possible
+                for t in &h.tensors {
+                    if t.name.contains("self_attn.k_proj.weight") && t.shape.len() == 2 {
+                        let kv_dim = t.shape[0];
+                        let kv_heads = h.num_kv_heads.max(1);
+                        if kv_dim % kv_heads == 0 {
+                            return kv_dim / kv_heads;
+                        }
+                    }
+                }
+                h.hidden_dim / h.num_heads
+            }),
+            intermediate_size: h.intermediate_size,
+            rms_norm_eps: h.rms_norm_eps,
+            rope_theta: h.rope_theta,
+            attention_softcap: 0.0,
+            ..ModelConfig::default()
         };
 
         // Initialize conv state cache

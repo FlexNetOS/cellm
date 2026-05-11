@@ -666,7 +666,7 @@
                     "
                 >
                     <strong>CellmFFI.xcframework:</strong> 33MB total (11MB per
-                    platform: iOS, Simulator, macOS)<br/><strong>cellm-sdk.aar:</strong> 157KB + ~4.5MB .so
+                    platform: iOS, Simulator, macOS)<br/><strong>cellm-sdk.aar:</strong> 157KB + ~4.5MB .so<br/><strong>cellm-wasm:</strong> 2.6MB .wasm + 21KB JS glue <a href="../crates/cellm-wasm/www/index.html" style="color: #0969da; text-decoration: none; margin-left: 8px; border-bottom: 1px solid rgba(9, 105, 218, 0.3); transition: border-color 0.2s ease;" onmouseover="this.style.borderColor='#0969da'" onmouseout="this.style.borderColor='rgba(9, 105, 218, 0.3)'">[Launch Demo]</a>
                 </p>
                 <div id="gh-commits-wrapper" class="gh-commits-wrapper" style="margin-top: 24px;">
                     <div id="gh-first-commit" class="gh-first-commit">
@@ -1194,6 +1194,43 @@
                         </div>
                         <div class="project-meta">
                             Vulkan compute backend, SPIR-V shader pipeline, and Kotlin AAR bindings for Android.
+                        </div>
+                    </a>
+                    <a href="wasm-backend.md" class="project-item">
+                        <div
+                            style="
+                                display: flex;
+                                justify-content: space-between;
+                                align-items: baseline;
+                            "
+                        >
+                            <div class="project-title">
+                                WebAssembly Backend
+                                <span
+                                    style="
+                                        font-size: 0.65rem;
+                                        background: #000;
+                                        color: #fff;
+                                        padding: 2px 6px;
+                                        border-radius: 10px;
+                                        margin-left: 8px;
+                                        vertical-align: middle;
+                                    "
+                                    >NEW</span
+                                >
+                            </div>
+                            <div
+                                style="
+                                    font-size: 0.85rem;
+                                    color: var(--text-secondary);
+                                "
+                            >
+                                May 11, 2026
+                            </div>
+                        </div>
+                        <div class="project-meta">
+                            SIMD-accelerated WASM compute backend, rayon-based
+                            threading, and JS bindings for browser inference.
                         </div>
                     </a>
                     <a href="building-the-android-aar.md" class="project-item">

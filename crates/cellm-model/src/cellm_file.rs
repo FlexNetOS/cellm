@@ -1,10 +1,13 @@
 // Author: Jeffrey Asante (https://jeffasante.github.io/)
 use std::collections::HashMap;
+#[cfg(not(target_arch = "wasm32"))]
 use std::fs::File;
+#[cfg(all(unix, not(target_arch = "wasm32")))]
 use std::os::unix::io::FromRawFd;
 use std::path::Path;
 
 use cellm_core::CoreError;
+#[cfg(not(target_arch = "wasm32"))]
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -47,6 +50,17 @@ pub struct CellmHeader {
     pub source_vision_config: Option<Value>,
     pub source_projector_config: Option<Value>,
     pub tensors: Vec<CellmTensorIndex>,
+    // DeepSeek-V4 specifics
+    pub hc_mult: Option<usize>,
+    pub hc_sinkhorn_iters: Option<usize>,
+    pub o_groups: Option<usize>,
+    pub o_lora_rank: Option<usize>,
+    pub q_lora_rank: Option<usize>,
+    pub qk_rope_head_dim: Option<usize>,
+    pub n_routed_experts: Option<usize>,
+    pub num_experts_per_tok: Option<usize>,
+    pub moe_intermediate_size: Option<usize>,
+    pub hc_eps: Option<f32>,
 }
 
 pub struct CellmFile {
@@ -56,6 +70,7 @@ pub struct CellmFile {
 }
 
 enum CellmData {
+    #[cfg(not(target_arch = "wasm32"))]
     Mmap(Mmap),
     Owned(Vec<u8>),
 }
@@ -63,12 +78,14 @@ enum CellmData {
 impl CellmData {
     fn as_slice(&self) -> &[u8] {
         match self {
+            #[cfg(not(target_arch = "wasm32"))]
             CellmData::Mmap(m) => m,
             CellmData::Owned(v) => v,
         }
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[cfg(target_os = "android")]
 fn open_model_file(path: &Path) -> Result<File, CoreError> {
     use std::os::unix::ffi::OsStrExt;
@@ -84,12 +101,14 @@ fn open_model_file(path: &Path) -> Result<File, CoreError> {
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[cfg(not(target_os = "android"))]
 fn open_model_file(path: &Path) -> Result<File, CoreError> {
     File::open(path).map_err(|e| CoreError::Backend(format!("cellm load: open failed: {e}")))
 }
 
 impl CellmFile {
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn load(path: &Path) -> Result<Self, CoreError> {
         let f = open_model_file(path)?;
         let file_data = match unsafe { Mmap::map(&f) } {
@@ -195,6 +214,13 @@ impl CellmFile {
         Ok(Self { data: file_data, header, tensors })
     }
 
+    #[cfg(target_arch = "wasm32")]
+    pub fn load(_path: &Path) -> Result<Self, CoreError> {
+        Err(CoreError::Backend(
+            "cellm load: file-based loading not available on WASM. Use CellmFile::load_from_bytes instead.".into(),
+        ))
+    }
+
     pub fn tensor_index(&self, name: &str) -> Option<&CellmTensorIndex> {
         self.tensors.get(name)
     }
@@ -215,6 +241,62 @@ impl CellmFile {
         let start = t.offset_bytes as usize;
         let end = start + t.nbytes as usize;
         Ok(&self.data.as_slice()[start..end])
+    }
+
+    pub fn load_from_bytes(bytes: &[u8]) -> Result<Self, CoreError> {
+        Self::load_from_vec(bytes.to_vec())
+    }
+
+    pub fn load_from_vec(bytes: Vec<u8>) -> Result<Self, CoreError> {
+        if bytes.len() < 10 {
+            return Err(CoreError::Backend("cellm load: file too small".into()));
+        }
+        if &bytes[0..5] != b"CELLM" {
+            return Err(CoreError::Backend("cellm load: bad magic".into()));
+        }
+        let version = bytes[5];
+        if version != 1 {
+            return Err(CoreError::Backend(format!(
+                "cellm load: unsupported version {version}"
+            )));
+        }
+
+        let header_len =
+            u32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]) as usize;
+        let header_start = 10usize;
+        let header_end = header_start + header_len;
+        if header_end > bytes.len() {
+            return Err(CoreError::Backend(
+                "cellm load: header length out of range".into(),
+            ));
+        }
+
+        let header: CellmHeader = serde_json::from_slice(&bytes[header_start..header_end])
+            .map_err(|e| CoreError::Backend(format!("cellm load: header json parse failed: {e}")))?;
+
+        let mut tensors = HashMap::with_capacity(header.tensors.len());
+        for t in &header.tensors {
+            tensors.insert(t.name.clone(), t.clone());
+        }
+
+        for t in header.tensors.iter() {
+            let start = t.offset_bytes as usize;
+            let end = start + t.nbytes as usize;
+            if end > bytes.len() {
+                return Err(CoreError::Backend(format!(
+                    "cellm load: tensor {} out of range (end={} file_len={})",
+                    t.name,
+                    end,
+                    bytes.len()
+                )));
+            }
+        }
+
+        Ok(Self {
+            data: CellmData::Owned(bytes),
+            header,
+            tensors,
+        })
     }
 
     pub fn has_tensor(&self, name: &str) -> bool {

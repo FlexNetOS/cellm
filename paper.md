@@ -157,7 +157,7 @@ cargo run --release --bin convert -- \
 ```sh
 # Basic inference with sampling (recommended for 0.6B model)
 ./target/release/infer \
-  --model models/Qwen3-0.6B.cellm \
+  --model models/to-huggingface/qwen3-0.6b-v1/qwen3-0.6b-int8.cellm \
   --tokenizer models/Qwen3-0.6B/tokenizer.json \
   --prompt "Explain consciousness:" \
   --gen 50 --temperature 0.7 --top-k 40 --backend metal
@@ -205,7 +205,7 @@ cargo run --release --bin convert -- \
   # f16 - chat mode (works)
 ./target/release/infer \
   --model models/Qwen3-0.6B-new.cellm \
-  --tokenizer models/Qwen3-0.6B/tokenizer.json \
+  --tokenizer models/to-huggingface/qwen3-0.6b-v1/tokenizer.json \
   --prompt "who is elon musk" \
   --chat --chat-format auto \
   --gen 50 --temperature 0.7 --top-k 40 \
@@ -217,8 +217,8 @@ cargo run --release --bin convert -- \
 
 ```sh
 ./target/release/infer \
-  --model models/Qwen3-0.6B.cellm \
-  --tokenizer models/Qwen3-0.6B/tokenizer.json \
+  --model models/to-huggingface/qwen3-0.6b-v1/qwen3-0.6b-int8.cellm \
+  --tokenizer models/to-huggingface/qwen3-0.6b-v1/tokenizer.json \
   --prompt "What is the capital of France?" \
   --gen 20 --backend cpu
 ```
@@ -918,3 +918,63 @@ hf download Qwen/Qwen3.5-0.8B --local-dir models/hf/qwen3.5-0.8b
 - int4 is the smallest quantization that preserves quality at 0.8B
 - 1-bit and int2 require quantization-aware training for coherent output at this model size
 
+---
+
+## DeepSeek-V4 (Nanowhale-100m)
+
+DeepSeek-V4 architecture (HC + MLA + MoE) research model.
+
+```sh
+# CPU — Nanowhale-100m (f16)
+./target/release/infer \
+  --model models/nanowhale-100m.cellm \
+  --tokenizer models/nanowhale-100m/tokenizer.json \
+  --prompt "what's sycophancy?" \
+  --chat --gen 100 --temperature 0 --backend cpu --kv-encoding f16
+```
+---
+
+## DeepSeek-V4 (MLA + MoE)
+
+### Overview
+
+DeepSeek-V4 introduces a high-efficiency architecture featuring:
+- **MLA (Multi-head Latent Attention)**: Dramatically reduces KV cache size via low-rank compression.
+- **MoE (Mixture of Experts)**: Utilizes a sparse "DeepSeekMoE" architecture for high capacity with low active FLOPs.
+- **Multi-Token Prediction**: (Not yet utilized in current runner).
+
+### Inference (CPU)
+
+```sh
+./target/release/infer \
+  --model models/deepseek-v4-toy.cellm \
+  --tokenizer models/deepseek-v4-toy/tokenizer.json \
+  --prompt "The capital of France is" \
+  --gen 32 --backend cpu
+
+  ./target/release/infer \
+  --model models/nanowhale-100m.cellm \
+  --tokenizer models/nanowhale-100m/tokenizer.json \
+  --prompt "What are 3 benefits of exercise?" \
+  --gen 32 --backend cpu
+
+
+  ./target/release/infer \
+  --model models/nanowhale-100m.cellm \
+  --tokenizer models/nanowhale-100m/tokenizer.json \
+  --prompt "<｜begin▁of▁sentence｜><｜User｜>what's sycophancy?<｜Assistant｜>" \
+  --gen 100 --temperature 0 --backend cpu --kv-encoding f16
+
+
+
+  ./target/release/infer \
+  --model models/nanowhale-100m.cellm \
+  --tokenizer models/nanowhale-100m/tokenizer.json \
+  --prompt "<｜begin▁of▁sentence｜><｜User｜>what's sycophancy?<｜Assistant｜>" \
+  --gen 100 --temperature 0 --backend metal --kv-encoding f16
+```
+
+### Notes
+- Current runner implementation is CPU-only.
+- Supports MLA with Sinkhorn normalization and MoE expert routing.
+- Optimized for large-scale efficient inference.

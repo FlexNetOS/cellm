@@ -96,6 +96,7 @@ impl GemmaRunner {
             rope_theta: h.rope_theta,
             head_dim: h.head_dim.unwrap_or(0),
             attention_softcap: 0.0,
+            ..ModelConfig::default()
         };
 
         let tensor_prefix = detect_gemma_prefix(&file)?;

@@ -83,6 +83,20 @@ cellm_engine_t cellm_engine_create_v4(
 
 void cellm_engine_destroy(cellm_engine_t engine);
 
+// Scheduling policy control.
+// 0=Fair (round-robin), 1=LatencyFirst (prefill priority), 2=ThroughputFirst.
+int32_t cellm_engine_set_scheduling_policy(cellm_engine_t engine, uint32_t policy);
+uint32_t cellm_engine_scheduling_policy(cellm_engine_t engine);
+
+// Lifetime tokens generated.
+uint64_t cellm_engine_total_tokens(cellm_engine_t engine);
+
+// Current tokens/sec (since last stats window reset).
+int32_t cellm_engine_tok_per_sec(cellm_engine_t engine, double* out_tok_per_sec);
+
+// Reset the tok/s measurement window.
+int32_t cellm_engine_reset_stats_window(cellm_engine_t engine);
+
 // Returns active backend name ("cpu" or "metal"), bytes written excluding null terminator.
 size_t cellm_engine_backend_name(
     cellm_engine_t engine,

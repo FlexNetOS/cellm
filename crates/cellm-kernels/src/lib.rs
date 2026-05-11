@@ -5,6 +5,7 @@ pub mod cpu;
 pub mod cpu_kernels;
 pub mod metal;
 pub mod vulkan;
+pub mod wasm;
 
 pub use cpu::SIMDKernels;
 pub use metal::MetalKernels;

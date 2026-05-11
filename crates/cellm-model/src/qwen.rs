@@ -69,6 +69,10 @@ enum QwenLinearBackend {
 impl QwenRunner {
     pub fn load(path: &Path) -> Result<Self, CoreError> {
         let file = CellmFile::load(path)?;
+        Self::from_file(file)
+    }
+
+    pub fn from_file(file: CellmFile) -> Result<Self, CoreError> {
         let h = file.header.clone();
 
         // Try to infer head_dim from k_proj tensor shape if not explicitly stored
@@ -99,6 +103,7 @@ impl QwenRunner {
             rms_norm_eps: h.rms_norm_eps,
             rope_theta: h.rope_theta,
             attention_softcap: 0.0,
+            ..ModelConfig::default()
         };
 
         if !has_tensor_file(&file, "language_model.model.embed_tokens.weight")

@@ -9,6 +9,29 @@ use cellm_model::{gemma::GemmaRunner, llama::LlamaRunner, qwen::QwenRunner, lfm:
 use cellm_scheduler::{BatchDetector, BatchGroup, BatchSessionInfo, PolicyExecutor, RoundRobinScheduler, SchedulingPlan, SchedulingPolicy, Session as SchedSession, SessionState, ThermalLevel, ThermalPolicy};
 use serde_json::Value;
 
+#[cfg(not(target_arch = "wasm32"))]
+type StatsInstant = std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+type StatsInstant = ();
+
+#[cfg(not(target_arch = "wasm32"))]
+fn stats_instant_now() -> StatsInstant {
+    std::time::Instant::now()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn stats_instant_now() -> StatsInstant {}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn stats_elapsed_secs(snapshot: &StatsInstant) -> Option<f64> {
+    Some(snapshot.elapsed().as_secs_f64())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn stats_elapsed_secs(_: &StatsInstant) -> Option<f64> {
+    None
+}
+
 pub type SessionId = u64;
 
 pub mod ffi;
@@ -107,6 +130,15 @@ impl Runner {
             Runner::Lfm(r) => Some(token) == r.eos_token_id,
         }
     }
+
+    pub fn eos_token_id(&self) -> Option<u32> {
+        match self {
+            Runner::Llama(r) => r.eos_token_id,
+            Runner::Gemma(r) => r.eos_token_id,
+            Runner::Qwen(r) => r.eos_token_id,
+            Runner::Lfm(r) => r.eos_token_id,
+        }
+    }
 }
 
 
@@ -119,6 +151,7 @@ pub struct Engine {
     model_path: PathBuf,
     cfg: ModelConfig,
     runner: Runner,
+    bos_token_id: Option<u32>,
     backend: BackendKind,
     kv_cache: KVCache,
     sessions: HashMap<SessionId, EngineSession>,
@@ -136,7 +169,7 @@ pub struct Engine {
     /// Total tokens generated across all sessions (lifetime).
     total_tokens_generated: u64,
     /// Timestamp of the last stats snapshot for tok/s calculation.
-    last_stats_snapshot: std::time::Instant,
+    last_stats_snapshot: StatsInstant,
     /// Tokens generated since last stats snapshot.
     tokens_since_snapshot: u64,
     /// Cached tokens-per-second from the most recent stats() call.
@@ -217,6 +250,7 @@ impl Engine {
             model_path: model_path.to_path_buf(),
             cfg,
             runner,
+            bos_token_id: header.bos_token_id,
             backend: selected_backend,
             kv_cache,
             sessions: HashMap::new(),
@@ -232,7 +266,7 @@ impl Engine {
             repeat_window: engine_cfg.repeat_window,
             seed: engine_cfg.seed,
             total_tokens_generated: 0,
-            last_stats_snapshot: std::time::Instant::now(),
+            last_stats_snapshot: stats_instant_now(),
             tokens_since_snapshot: 0,
             cached_tok_per_sec: 0.0,
         })
@@ -247,6 +281,99 @@ impl Engine {
             BackendKind::Cpu => "cpu",
             BackendKind::Metal => "metal",
         }
+    }
+
+    /// Construct an Engine from an in-memory model buffer (for WASM targets).
+    ///
+    /// This mirrors `new()` but uses `CellmFile::load_from_bytes` and the runners'
+    /// `from_file` constructors to avoid filesystem access.
+    pub fn from_bytes(model_bytes: &[u8], engine_cfg: EngineConfig) -> anyhow::Result<Self> {
+        Self::from_vec(model_bytes.to_vec(), engine_cfg)
+    }
+
+    /// Construct an Engine from owned in-memory model bytes.
+    ///
+    /// This is the preferred WASM path because JavaScript already copies the
+    /// selected file into WASM memory; keeping ownership avoids another large copy.
+    pub fn from_vec(model_bytes: Vec<u8>, engine_cfg: EngineConfig) -> anyhow::Result<Self> {
+        apply_turboquant_runtime_config(&engine_cfg);
+        let selected_backend = resolve_backend(engine_cfg.backend);
+        let file = CellmFile::load_from_vec(model_bytes)?;
+        let header = file.header.clone();
+
+        let text_model_type = effective_text_model_type(&header);
+
+        // Compute head_dim from tensor metadata before consuming `file`.
+        let head_dim = match text_model_type.as_str() {
+            "llama" | "smollm3" => header.hidden_dim / header.num_heads,
+            t if t.starts_with("gemma") => {
+                let hd = infer_gemma_kv_head_dim(&file)?;
+                hd
+            }
+            t if t.starts_with("qwen") => {
+                let hd = infer_qwen_kv_head_dim(&file)?;
+                hd
+            }
+            t if t.starts_with("lfm") => header.hidden_dim / header.num_heads,
+            _ => header.hidden_dim / header.num_heads.max(1),
+        };
+
+        let mut runner = match text_model_type.as_str() {
+            "llama" | "smollm3" => anyhow::bail!(
+                "in-memory Engine loading is not implemented for {text_model_type}"
+            ),
+            t if t.starts_with("gemma") => anyhow::bail!(
+                "in-memory Engine loading is not implemented for {t}"
+            ),
+            t if t.starts_with("qwen") => Runner::Qwen(QwenRunner::from_file(file)?),
+            t if t.starts_with("lfm") => Runner::Lfm(LfmRunner::from_file(file)?),
+            other => anyhow::bail!(
+                "unsupported model_type for Engine: model_type={} effective_text_model_type={other}",
+                header.model_type
+            ),
+        };
+
+        let cfg = match &runner {
+            Runner::Llama(r) => r.config().clone(),
+            Runner::Gemma(r) => r.config().clone(),
+            Runner::Qwen(r) => r.config().clone(),
+            Runner::Lfm(r) => r.config().clone(),
+        };
+
+        let layout = KvCacheLayout {
+            total_blocks: engine_cfg.total_blocks,
+            tokens_per_block: engine_cfg.tokens_per_block,
+            num_layers: cfg.num_hidden_layers,
+            num_kv_heads: cfg.num_key_value_heads,
+            head_dim,
+        };
+        let storage_kind = KvStorageKind::Cpu;
+        let kv_cache = KVCache::new_with_kind_and_encoding(layout, storage_kind, engine_cfg.kv_encoding)?;
+
+        Ok(Self {
+            model_path: std::path::PathBuf::new(),
+            cfg,
+            runner,
+            bos_token_id: header.bos_token_id,
+            backend: selected_backend,
+            kv_cache,
+            sessions: HashMap::new(),
+            session_meta: HashMap::new(),
+            next_session_id: 1,
+            rr: RoundRobinScheduler::new(),
+            policy_exec: PolicyExecutor::new(engine_cfg.scheduling_policy),
+            batch_detector: BatchDetector::new(),
+            thermal: ThermalPolicy::default(),
+            top_k: engine_cfg.top_k,
+            temperature: engine_cfg.temperature,
+            repeat_penalty: engine_cfg.repeat_penalty,
+            repeat_window: engine_cfg.repeat_window,
+            seed: engine_cfg.seed,
+            total_tokens_generated: 0,
+            last_stats_snapshot: stats_instant_now(),
+            tokens_since_snapshot: 0,
+            cached_tok_per_sec: 0.0,
+        })
     }
 
     pub fn generate_text_litert(&mut self, _prompt: &str) -> anyhow::Result<String> {
@@ -342,6 +469,8 @@ impl Engine {
             meta.transition(SessionState::Decoding)
                 .map_err(|e| anyhow::anyhow!("session transition failed: {e:?}"))?;
             self.rr.add(id);
+            self.total_tokens_generated += 1;
+            self.tokens_since_snapshot += 1;
             return Ok((s.cached_last_token.unwrap_or(0), true));
         }
         if cache_trace {
@@ -412,6 +541,8 @@ impl Engine {
         meta.transition(SessionState::Decoding)
             .map_err(|e| anyhow::anyhow!("session transition failed: {e:?}"))?;
         self.rr.add(id);
+        self.total_tokens_generated += 1;
+        self.tokens_since_snapshot += 1;
         Ok((next, false))
     }
 
@@ -538,7 +669,7 @@ impl Engine {
     }
 
     pub fn stats(&self) -> EngineStats {
-        let elapsed = self.last_stats_snapshot.elapsed().as_secs_f64();
+        let elapsed = stats_elapsed_secs(&self.last_stats_snapshot).unwrap_or(0.0);
         let tok_per_sec = if elapsed > 0.0 {
             self.tokens_since_snapshot as f64 / elapsed
         } else {
@@ -557,7 +688,7 @@ impl Engine {
 
     /// Reset the tok/s measurement window (called by the consumer after reading stats).
     pub fn reset_stats_window(&mut self) {
-        self.last_stats_snapshot = std::time::Instant::now();
+        self.last_stats_snapshot = stats_instant_now();
         self.tokens_since_snapshot = 0;
     }
 
@@ -590,6 +721,41 @@ impl Engine {
             repeat_penalty: self.repeat_penalty,
             repeat_window: self.repeat_window,
         }
+    }
+
+    /// Total number of tokens generated so far across all sessions (lifetime).
+    pub fn total_tokens_generated(&self) -> u64 {
+        self.total_tokens_generated
+    }
+
+    /// Number of active (non-terminated) sessions.
+    pub fn num_active_sessions(&self) -> usize {
+        self.sessions.len()
+    }
+
+    /// Number of free KV cache blocks remaining.
+    pub fn num_free_blocks(&self) -> usize {
+        self.kv_cache.allocator().free_count()
+    }
+
+    /// Number of buffered (undecoded) tokens pending for a session.
+    pub fn pending_tokens(&self, id: SessionId) -> usize {
+        self.sessions
+            .get(&id)
+            .map(|s| s.pending_out.len())
+            .unwrap_or(0)
+    }
+
+    pub fn eos_token_id(&self) -> Option<u32> {
+        self.runner.eos_token_id()
+    }
+
+    pub fn bos_token_id(&self) -> Option<u32> {
+        self.bos_token_id
+    }
+
+    pub fn is_stop_token(&self, token: u32) -> bool {
+        self.runner.is_stop_token(token)
     }
 
     fn seed_for_session(&self, id: SessionId) -> u64 {

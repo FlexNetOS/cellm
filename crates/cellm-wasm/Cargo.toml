@@ -1,0 +1,30 @@
+[package]
+name = "cellm-wasm"
+version = "0.1.0"
+edition = "2021"
+description = "WebAssembly bindings for cellm LLM inference engine."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+cellm-core = { path = "../cellm-core" }
+cellm-cache = { path = "../cellm-cache" }
+cellm-model = { path = "../cellm-model" }
+cellm-scheduler = { path = "../cellm-scheduler" }
+cellm-kernels = { path = "../cellm-kernels" }
+cellm-sdk = { path = "../cellm-sdk" }
+anyhow = { workspace = true }
+rayon = { workspace = true }
+half = { workspace = true }
+bytemuck = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+tokenizers = { version = "0.19", default-features = false, features = ["unstable_wasm"] }
+wasm-bindgen = "0.2"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook = "0.1"
+getrandom = { version = "0.2", features = ["js"] }
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["console"] }
