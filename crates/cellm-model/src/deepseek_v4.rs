@@ -713,12 +713,16 @@ impl DeepSeekV4Runner {
         Ok(())
     }
 
+    // Minimum matmul element count to justify GPU upload/dispatch overhead.
+    // For tiny matrices (hidden=320), the ~0.1ms GPU dispatch latency far exceeds
+    // the ~0.001ms CPU cost of a direct 320×320 matmul. 70K ≈ 265×265.
+    const MIN_METAL_MATMUL: usize = 70_000;
+
     fn linear_dims(&mut self, name: &str, x: &[f32], out_dim: usize, in_dim: usize, out: &mut [f32]) -> Result<(), CoreError> {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
-        if self.metal_matmul.is_some() {
+        if self.metal_matmul.is_some() && out_dim * in_dim >= Self::MIN_METAL_MATMUL {
             let w = self.tensor_f32(name)?.to_vec();
             if let Some(ref mm) = self.metal_matmul {
-                // Get or create cached Metal weight buffer via Entry API (avoids borrow conflict)
                 use std::collections::hash_map::Entry;
                 let w_buf = match self.metal_weights.entry(name.to_string()) {
                     Entry::Occupied(e) => e.into_mut(),
@@ -752,10 +756,13 @@ impl DeepSeekV4Runner {
         Ok(())
     }
 
+    // Minimum hidden dimension for GPU RMSNorm. Below this, CPU is faster.
+    const MIN_METAL_RMS: usize = 1024;
+
     fn rmsnorm(&mut self, name: &str, x: &[f32], out: &mut [f32]) -> Result<(), CoreError> {
         let eps = self.cfg.rms_norm_eps;
         #[cfg(any(target_os = "macos", target_os = "ios"))]
-        if self.metal_ops.is_some() {
+        if self.metal_ops.is_some() && x.len() >= Self::MIN_METAL_RMS {
             if let Ok(w_f16) = self.tensor_f16_raw(name) {
                 if let Some(ref ops) = self.metal_ops {
                     if ops.rms_norm_f16w(x, &w_f16, eps, false, name, out).is_ok() {
@@ -774,7 +781,7 @@ impl DeepSeekV4Runner {
         let out_dim = meta.shape[0];
         let in_dim = meta.shape[1];
         #[cfg(any(target_os = "macos", target_os = "ios"))]
-        if self.metal_matmul.is_some() {
+        if self.metal_matmul.is_some() && out_dim * in_dim >= Self::MIN_METAL_MATMUL {
             let w = self.tensor_f32(name)?.to_vec();
             if let Some(ref mm) = self.metal_matmul {
                 use std::collections::hash_map::Entry;

@@ -243,6 +243,63 @@
                 <button id="devLoadBtn" type="button">Load Qwen Debug Model</button>
             </div>
             <div id="status" class="status">Waiting for model file...</div>
+            <div
+                id="presets"
+                style="
+                    margin-top: 1rem;
+                    border-top: 1px solid #eee;
+                    padding-top: 1rem;
+                "
+            >
+                <h3
+                    style="
+                        font-size: 0.7rem;
+                        color: #888;
+                        text-transform: uppercase;
+                        margin-bottom: 0.5rem;
+                        letter-spacing: 0.05em;
+                    "
+                >
+                    Suggested Models (Hugging Face)
+                </h3>
+                <div
+                    id="presetList"
+                    style="display: flex; flex-wrap: wrap; gap: 0.5rem"
+                >
+                    <button
+                        class="preset-btn"
+                        data-model="https://huggingface.co/jeffasante/cellm-models/resolve/main/qwen2.5-0.5b-int8-v1/qwen2.5-0.5b-int8-v1.cellm?download=true"
+                        data-tok="https://huggingface.co/jeffasante/cellm-models/resolve/main/qwen2.5-0.5b-int8-v1/tokenizer.json?download=true"
+                        style="background: #f5f5f5; color: #000; border: 1px solid #ddd;"
+                    >
+                        Qwen2.5-0.5B (8bit)
+                    </button>
+                    <button
+                        class="preset-btn"
+                        data-model="https://huggingface.co/jeffasante/cellm-models/resolve/main/lfm2.5-350m-v1/lfm2.5-350m-v1.cellm?download=true"
+                        data-tok="https://huggingface.co/jeffasante/cellm-models/resolve/main/lfm2.5-350m-v1/tokenizer.json?download=true"
+                        style="background: #f5f5f5; color: #000; border: 1px solid #ddd;"
+                    >
+                        LFM-350M
+                    </button>
+                    <button
+                        class="preset-btn"
+                        data-model="https://huggingface.co/jeffasante/cellm-models/resolve/main/smollm2-360m-int8-v1/smollm2-360m-int8-v1.cellm?download=true"
+                        data-tok="https://huggingface.co/jeffasante/cellm-models/resolve/main/smollm2-360m-int8-v1/tokenizer.json?download=true"
+                        style="background: #f5f5f5; color: #000; border: 1px solid #ddd;"
+                    >
+                        SmolLM2-360M
+                    </button>
+                    <button
+                        class="preset-btn"
+                        data-model="https://huggingface.co/jeffasante/cellm-models/resolve/main/Bonsai-1.7B_v2/Bonsai-1.7B_v2.cellm?download=true"
+                        data-tok="https://huggingface.co/jeffasante/cellm-models/resolve/main/Bonsai-1.7B_v2/tokenizer.json?download=true"
+                        style="background: #f5f5f5; color: #000; border: 1px solid #ddd;"
+                    >
+                        Bonsai-1.7B
+                    </button>
+                </div>
+            </div>
         </div>
 
         <div class="card" id="inferCard" style="display: none">
@@ -427,6 +484,39 @@ Hello, how are you today?</textarea
                     status.classList.add("error");
                     devLoadBtn.disabled = false;
                     checkReady();
+                });
+            });
+
+            document.querySelectorAll(".preset-btn").forEach((btn) => {
+                btn.addEventListener("click", async () => {
+                    const modelUrl = btn.dataset.model;
+                    const tokenizerUrl = btn.dataset.tok;
+                    if (!modelUrl || !tokenizerUrl) return;
+
+                    // Disable all presets during load
+                    document
+                        .querySelectorAll(".preset-btn")
+                        .forEach((b) => (b.disabled = true));
+                    devLoadBtn.disabled = true;
+                    loadBtn.disabled = true;
+
+                    try {
+                        status.classList.remove("error");
+                        status.textContent = `Fetching model from Hugging Face...`;
+                        modelBytes = await fetchBytes(modelUrl);
+                        status.textContent = `Model fetched (${(modelBytes.length / 1e6).toFixed(1)} MB). Fetching tokenizer...`;
+                        tokenizerJson = await fetchText(tokenizerUrl);
+                        await loadEngine();
+                    } catch (err) {
+                        status.textContent = `Error: ${err}`;
+                        status.classList.add("error");
+                    } finally {
+                        document
+                            .querySelectorAll(".preset-btn")
+                            .forEach((b) => (b.disabled = false));
+                        devLoadBtn.disabled = false;
+                        checkReady();
+                    }
                 });
             });
 
