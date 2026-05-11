@@ -11,7 +11,10 @@ pub mod gemma_graph;
 pub mod qwen;
 pub mod granite;
 pub mod lfm;
+pub mod deepseek_v4;
 pub mod batched;
+
+pub use deepseek_v4::DeepSeekV4Runner;
 
 #[derive(Clone, Debug)]
 pub struct ModelConfig {
@@ -25,4 +28,43 @@ pub struct ModelConfig {
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
     pub attention_softcap: f32,
+
+    // DeepSeek-V4 specifics
+    pub hc_mult: Option<usize>,
+    pub hc_sinkhorn_iters: Option<usize>,
+    pub o_groups: Option<usize>,
+    pub o_lora_rank: Option<usize>,
+    pub q_lora_rank: Option<usize>,
+    pub qk_rope_head_dim: Option<usize>,
+    pub n_routed_experts: Option<usize>,
+    pub num_experts_per_tok: Option<usize>,
+    pub moe_intermediate_size: Option<usize>,
+    pub hc_eps: Option<f32>,
+}
+
+impl Default for ModelConfig {
+    fn default() -> Self {
+        Self {
+            vocab_size: 0,
+            hidden_size: 0,
+            num_hidden_layers: 0,
+            num_attention_heads: 0,
+            num_key_value_heads: 0,
+            head_dim: 0,
+            intermediate_size: 0,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10000.0,
+            attention_softcap: 0.0,
+            hc_mult: None,
+            hc_sinkhorn_iters: None,
+            o_groups: None,
+            o_lora_rank: None,
+            q_lora_rank: None,
+            qk_rope_head_dim: None,
+            n_routed_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            hc_eps: None,
+        }
+    }
 }

@@ -486,10 +486,14 @@ pub extern "C" fn cellm_engine_create_v4(
 }
 
 fn load_tokenizer(path: &std::path::Path) -> Result<Tokenizer, String> {
-    let mut tok = match Tokenizer::from_file(path) {
+    // Strip virtual added_tokens (IDs >= 128000) from JSON before loading to
+    // suppress hundreds of tokenizers crate warnings about tokens not in vocab.
+    let cleaned = try_strip_virtual_added_tokens(path)?;
+    let load_path = cleaned.as_deref().unwrap_or(path);
+    let mut tok = match Tokenizer::from_file(load_path) {
         Ok(t) => t,
         Err(e) => {
-            let normalized = try_normalize_tokenizer_json(path)?;
+            let normalized = try_normalize_tokenizer_json(load_path)?;
             if let Some(p) = normalized {
                 Tokenizer::from_file(&p)
                     .map_err(|e| format!("load tokenizer failed (normalized {:?}): {e}", p))?
@@ -499,11 +503,8 @@ fn load_tokenizer(path: &std::path::Path) -> Result<Tokenizer, String> {
         }
     };
 
-    // Explicitly register all added_tokens from the tokenizer JSON, because the
-    // tokenizers crate sometimes fails to link them into the vocabulary during
-    // deserialization (especially on iOS where paths and file access differ).
-    // Without this, special tokens like <|im_start|>, <|im_end|>, <image|> etc.
-    // may decode as empty strings, producing garbled output.
+    // Explicitly register any remaining added_tokens that the tokenizers crate
+    // failed to link into the vocabulary during deserialization.
     if let Ok(bytes) = std::fs::read(path) {
         if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
             if let Some(arr) = v.get("added_tokens").and_then(|x| x.as_array()) {
@@ -511,7 +512,8 @@ fn load_tokenizer(path: &std::path::Path) -> Result<Tokenizer, String> {
                 for item in arr {
                     let Some(content) = item.get("content").and_then(|x| x.as_str()) else { continue; };
                     let Some(id) = item.get("id").and_then(|x| x.as_u64()) else { continue; };
-                    // Only add tokens that aren't already in the vocab with the correct ID
+                    // Skip virtual tokens not in the BPE vocabulary
+                    if id >= 128000 { continue; }
                     if tok.token_to_id(content) != Some(id as u32) {
                         added.push(AddedToken::from(content.to_string(), true));
                     }
@@ -524,6 +526,35 @@ fn load_tokenizer(path: &std::path::Path) -> Result<Tokenizer, String> {
     }
 
     Ok(tok)
+}
+
+/// Strip added_tokens entries with IDs >= 128000 from the tokenizer JSON.
+fn try_strip_virtual_added_tokens(path: &std::path::Path) -> Result<Option<std::path::PathBuf>, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read tokenizer failed: {e}"))?;
+    let mut v: Value = serde_json::from_slice(&bytes).map_err(|e| format!("parse tokenizer failed: {e}"))?;
+
+    let Some(arr) = v.get_mut("added_tokens").and_then(|x| x.as_array_mut()) else {
+        return Ok(None);
+    };
+
+    let has_virtual = arr.iter().any(|item| {
+        item.get("id").and_then(|x| x.as_u64()).map_or(false, |id| id >= 128000)
+    });
+    if !has_virtual {
+        return Ok(None);
+    }
+
+    arr.retain(|item| {
+        item.get("id").and_then(|x| x.as_u64()).map_or(true, |id| id < 128000)
+    });
+
+    let tmp = std::env::temp_dir().join(format!(
+        "cellm_tokenizer_cleaned_{}.json",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, serde_json::to_vec(&v).map_err(|e| format!("json serialize: {e}"))?)
+        .map_err(|e| format!("write cleaned tokenizer: {e}"))?;
+    Ok(Some(tmp))
 }
 
 fn load_added_token_ids(path: &std::path::Path) -> Result<HashMap<String, u32>, String> {

@@ -8,7 +8,7 @@ use anyhow::Result;
 use clap::Parser;
 use cellm_cache::{KVCache, KvEncodingKind, PageTable};
 use cellm_core::KvCacheLayout;
-use cellm_model::{gemma::GemmaRunner, lfm::LfmRunner, llama::LlamaRunner, qwen::QwenRunner, granite::GraniteRunner, CellmFile};
+use cellm_model::{gemma::GemmaRunner, lfm::LfmRunner, llama::LlamaRunner, qwen::QwenRunner, granite::GraniteRunner, deepseek_v4::DeepSeekV4Runner, CellmFile};
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
@@ -168,6 +168,7 @@ Please convert from the original non-MLX Hugging Face checkpoint (e.g. Qwen/Qwen
         Qwen(QwenRunner),
         Granite(GraniteRunner),
         Lfm(LfmRunner),
+        DeepSeekV4(DeepSeekV4Runner),
     }
 
     let text_model_type = effective_text_model_type(&header);
@@ -190,6 +191,7 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
         t if t.starts_with("qwen") => Runner::Qwen(QwenRunner::load(&args.model)?),
         "granitemoehybrid" => Runner::Granite(GraniteRunner::load(&args.model)?),
         "lfm2" | "lfm" => Runner::Lfm(LfmRunner::load(&args.model)?),
+        "deepseek_v4" | "deepseek_v3" => Runner::DeepSeekV4(DeepSeekV4Runner::load(&args.model)?),
         _ => {
             anyhow::bail!(
                 "infer supports only llama/smollm3/gemma/qwen/granite/lfm right now. Detected model_type={:?} effective_text_model_type={:?} architectures={:?} quantization_config={:?}.",
@@ -244,6 +246,9 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
                     println!("LLM backend: CPU (LFM Metal init failed, falling back)");
                 }
             }
+            Runner::DeepSeekV4(_) => {
+                println!("LLM backend: CPU (DeepSeekV4 fallback path)");
+            }
         }
         println!("Startup: metal init {:.2}s", t_stage.elapsed().as_secs_f64());
     }
@@ -255,6 +260,7 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
             Runner::Qwen(r) => r.set_max_layers(n),
             Runner::Granite(r) => r.set_max_layers(n),
             Runner::Lfm(r) => r.set_max_layers(n),
+            Runner::DeepSeekV4(r) => r.set_max_layers(n),
         }
     }
 
@@ -264,6 +270,7 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
         Runner::Qwen(r) => r.config().clone(),
         Runner::Granite(r) => r.config().clone(),
         Runner::Lfm(r) => r.config().clone(),
+        Runner::DeepSeekV4(r) => r.config().clone(),
     };
     println!("Model: {:?}", args.model);
     println!(
@@ -281,6 +288,7 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
         Runner::Qwen(r) => r.max_layers(),
         Runner::Granite(r) => r.max_layers(),
         Runner::Lfm(r) => r.max_layers(),
+        Runner::DeepSeekV4(r) => r.max_layers(),
     };
     println!("Max layers (active): {}", active_layers);
 
@@ -382,6 +390,7 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
         Runner::Qwen(_) => infer_qwen_kv_head_dim(&file)?,
         Runner::Granite(_) => cfg.hidden_size / cfg.num_attention_heads,
         Runner::Lfm(_) => cfg.head_dim,
+        Runner::DeepSeekV4(_) => cfg.head_dim,
     };
     let total_tokens = seq + args.gen + 8;
     let total_blocks = args.total_blocks.unwrap_or_else(|| {
@@ -473,6 +482,7 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
             }
             Runner::Granite(r) => r.step_topk(tok, i, &mut page_table, &mut kv_cache, args.top_k)?,
             Runner::Lfm(r) => r.step_topk(tok, i, &mut page_table, &mut kv_cache, args.top_k)?,
+            Runner::DeepSeekV4(r) => r.step_topk(tok, i, &mut page_table, &mut kv_cache, args.top_k)?,
         };
         all_ids.push(tok);
         next = select_next(
@@ -496,7 +506,7 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
     let mut cur = next;
     let mut output_buffer = String::with_capacity(256);
     let mut last_flush_step = 0;
-    
+
     for step in 0..args.gen {
         let pos = seq + step;
         let cand = match &mut runner {
@@ -505,6 +515,7 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
             Runner::Qwen(r) => r.step_topk(cur, pos, &mut page_table, &mut kv_cache, args.top_k)?,
             Runner::Granite(r) => r.step_topk(cur, pos, &mut page_table, &mut kv_cache, args.top_k)?,
             Runner::Lfm(r) => r.step_topk(cur, pos, &mut page_table, &mut kv_cache, args.top_k)?,
+            Runner::DeepSeekV4(r) => r.step_topk(cur, pos, &mut page_table, &mut kv_cache, args.top_k)?,
         };
         all_ids.push(cur);
         if let Some(tok) = tokenizer.as_ref() {
@@ -518,14 +529,14 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
                 }
             }
             if piece.is_empty() { piece = format!("[ID:{}]", cur); }
-            
+
             // Buffer output and flush periodically to reduce I/O overhead
             output_buffer.push_str(&piece);
-            let should_flush = piece.ends_with(' ') || piece.ends_with('\n') || 
-                              piece.ends_with('.') || piece.ends_with(',') || 
+            let should_flush = piece.ends_with(' ') || piece.ends_with('\n') ||
+                              piece.ends_with('.') || piece.ends_with(',') ||
                               piece.ends_with('?') || piece.ends_with('!') ||
                               step - last_flush_step >= 8;
-            
+
             if should_flush && !output_buffer.is_empty() {
                 print!("{}", output_buffer);
                 let _ = std::io::stdout().flush();
@@ -541,6 +552,7 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
                 Runner::Qwen(r) => r.eos_token_id(),
                 Runner::Granite(r) => r.eos_token_id(),
                 Runner::Lfm(r) => r.eos_token_id(),
+                Runner::DeepSeekV4(r) => r.eos_token_id(),
             };
             if let Some(eos) = eos {
                 if cur == eos {
@@ -568,13 +580,13 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
             &mut rng,
         )?;
     }
-    
+
     // Flush any remaining buffered output
     if !output_buffer.is_empty() {
         print!("{}", output_buffer);
         let _ = std::io::stdout().flush();
     }
-    
+
     println!(
         "\nDecode: {} tokens in {:.2}s",
         args.gen,
@@ -876,21 +888,65 @@ fn tokenizer_config_add_bos(tokenizer_json_path: &std::path::Path) -> bool {
 }
 
 fn load_tokenizer(path: &std::path::Path) -> Result<Tokenizer> {
-    match Tokenizer::from_file(path) {
+    // Strip added_tokens from the JSON before loading to suppress hundreds of
+    // WARN: "Token 'X' was expected to have ID 'Y' but was given ID 'None'"
+    // messages from the tokenizers crate. These special tokens (typically IDs
+    // >= 128000) are virtual — they aren't in the BPE vocabulary but are listed
+    // in the JSON's added_tokens array. The cellm code handles them via
+    // encode_with_explicit_added_tokens and load_added_token_ids instead.
+    let cleaned = try_strip_virtual_added_tokens(path)?;
+    let load_path: &std::path::Path = cleaned.as_deref().unwrap_or(path);
+    match Tokenizer::from_file(load_path) {
         Ok(t) => Ok(t),
         Err(e) => {
-            // Some tokenizers (notably MLX exports) store BPE merges as `[["a","b"], ...]`
-            // instead of `["a b", ...]`, which the `tokenizers` crate rejects.
-            let normalized = try_normalize_tokenizer_json(path)?;
+            // Some tokenizers (notably MLX exports) store BPE merges as `[['a','b'], ...]`
+            // instead of `['a b', ...]`, which the `tokenizers` crate rejects.
+            let normalized = try_normalize_tokenizer_json(load_path)?;
             if let Some(p) = normalized {
                 let tok = Tokenizer::from_file(&p).map_err(|e| {
-                    anyhow::anyhow!("failed to load tokenizer {:?} (normalized {:?}): {e}", path, p)
+                    anyhow::anyhow!("failed to load tokenizer {:?} (normalized {:?}): {e}", load_path, p)
                 })?;
                 return Ok(tok);
             }
             Err(anyhow::anyhow!("failed to load tokenizer {:?}: {e}", path))
         }
     }
+}
+
+/// Strip added_tokens entries whose IDs are >= 128000 from the tokenizer JSON.
+/// These are "virtual" special tokens that aren't in the BPE vocabulary;
+/// the tokenizers crate emits noisy warnings for each one during deserialization.
+/// The cellm code handles them separately via encode_with_explicit_added_tokens.
+fn try_strip_virtual_added_tokens(path: &std::path::Path) -> Result<Option<std::path::PathBuf>> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| anyhow::anyhow!("read tokenizer {:?} failed: {e}", path))?;
+    let mut v: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| anyhow::anyhow!("parse tokenizer {:?} failed: {e}", path))?;
+
+    let Some(arr) = v.get_mut("added_tokens").and_then(|x| x.as_array_mut()) else {
+        return Ok(None);
+    };
+
+    // Check if any added_tokens have IDs >= 128000 (virtual tokens not in vocab)
+    let has_virtual = arr.iter().any(|item| {
+        item.get("id").and_then(|x| x.as_u64()).map_or(false, |id| id >= 128000)
+    });
+    if !has_virtual {
+        return Ok(None);
+    }
+
+    // Keep only added_tokens with IDs < 128000 (BOS, EOS, PAD etc.)
+    arr.retain(|item| {
+        item.get("id").and_then(|x| x.as_u64()).map_or(true, |id| id < 128000)
+    });
+
+    let tmp = std::env::temp_dir().join(format!(
+        "cellm_tokenizer_cleaned_{}.json",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, serde_json::to_vec(&v)?)
+        .map_err(|e| anyhow::anyhow!("write cleaned tokenizer {:?} failed: {e}", tmp))?;
+    Ok(Some(tmp))
 }
 
 fn try_normalize_tokenizer_json(path: &std::path::Path) -> Result<Option<std::path::PathBuf>> {
@@ -1013,7 +1069,7 @@ fn load_added_token_ids(tokenizer_json_path: &std::path::Path) -> Result<std::co
         .map_err(|e| anyhow::anyhow!("parse tokenizer {:?} failed: {e}", tokenizer_json_path))?;
 
     let mut out = std::collections::HashMap::new();
-    
+
     // Load from tokenizer.json added_tokens
     if let Some(arr) = v.get("added_tokens").and_then(|x| x.as_array()) {
         for item in arr {
@@ -1026,7 +1082,7 @@ fn load_added_token_ids(tokenizer_json_path: &std::path::Path) -> Result<std::co
             out.insert(content.to_string(), id as u32);
         }
     }
-    
+
     // Also load from tokenizer_config.json special_tokens and additional_special_tokens
     // This is needed for models like Qwen3.5 that define special tokens there
     if let Some(dir) = tokenizer_json_path.parent() {
@@ -1068,7 +1124,7 @@ fn load_added_token_ids(tokenizer_json_path: &std::path::Path) -> Result<std::co
                         }
                     }
                 }
-                
+
                 // Load additional_special_tokens array
                 if let Some(additional) = cfg.get("additional_special_tokens").and_then(|x| x.as_array()) {
                     for token in additional {
@@ -1098,7 +1154,7 @@ fn load_added_token_ids(tokenizer_json_path: &std::path::Path) -> Result<std::co
             }
         }
     }
-    
+
     Ok(out)
 }
 
