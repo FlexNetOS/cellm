@@ -4,7 +4,7 @@ use cellm_core::CoreError;
 use cellm_kernels::cpu_kernels::{rms_norm_f32, softmax_f32_inplace, matmul_f32};
 use cellm_kernels::{MetalKernels, MetalOps};
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-use cellm_kernels::metal::MetalMatmul;
+use cellm_kernels::metal::{MetalMatmul, MetalBuffer};
 use std::path::Path;
 use crate::{CellmFile, ModelConfig};
 
@@ -25,6 +25,8 @@ pub struct DeepSeekV4Runner {
     metal_matmul: Option<MetalMatmul>,
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     metal_ops: Option<MetalOps>,
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    metal_weights: std::collections::HashMap<String, MetalBuffer>,
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     metal_matmul: (),
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
@@ -711,9 +713,26 @@ impl DeepSeekV4Runner {
 
     fn linear_dims(&mut self, name: &str, x: &[f32], out_dim: usize, in_dim: usize, out: &mut [f32]) -> Result<(), CoreError> {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
-        if let Some(ref mm) = self.metal_matmul {
-            if let Ok(()) = self.metal_linear_fallback(mm, name, x, out_dim, in_dim, out) {
-                return Ok(());
+        if self.metal_matmul.is_some() {
+            let w = self.tensor_f32(name)?.to_vec();
+            if let Some(ref mm) = self.metal_matmul {
+                // Get or create cached Metal weight buffer via Entry API (avoids borrow conflict)
+                use std::collections::hash_map::Entry;
+                let w_buf = match self.metal_weights.entry(name.to_string()) {
+                    Entry::Occupied(e) => e.into_mut(),
+                    Entry::Vacant(e) => {
+                        let buf = mm.upload_f32(&w).map_err(|e|
+                            CoreError::Backend(format!("metal upload {name}: {e}"))
+                        )?;
+                        e.insert(buf)
+                    }
+                };
+                let x_buf = mm.upload_f32(x).map_err(|e|
+                    CoreError::Backend(format!("metal upload x: {e}"))
+                )?;
+                if mm.matmul_row_major_f32_with_b_buffer(w_buf, out_dim, in_dim, &x_buf, 1, out).is_ok() {
+                    return Ok(());
+                }
             }
         }
         let weight = self.tensor_f32(name)?;
@@ -734,12 +753,12 @@ impl DeepSeekV4Runner {
     fn rmsnorm(&mut self, name: &str, x: &[f32], out: &mut [f32]) -> Result<(), CoreError> {
         let eps = self.cfg.rms_norm_eps;
         #[cfg(any(target_os = "macos", target_os = "ios"))]
-        if let Some(ref ops) = self.metal_ops {
-            // MetalOps::rms_norm_f16w expects f16 weight data.
-            // Our weight cache has f32; fetch original f16 bytes from the file.
+        if self.metal_ops.is_some() {
             if let Ok(w_f16) = self.tensor_f16_raw(name) {
-                if ops.rms_norm_f16w(x, w_f16, eps, false, name, out).is_ok() {
-                    return Ok(());
+                if let Some(ref ops) = self.metal_ops {
+                    if ops.rms_norm_f16w(x, &w_f16, eps, false, name, out).is_ok() {
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -753,9 +772,12 @@ impl DeepSeekV4Runner {
         let out_dim = meta.shape[0];
         let in_dim = meta.shape[1];
         #[cfg(any(target_os = "macos", target_os = "ios"))]
-        if let Some(ref mm) = self.metal_matmul {
-            if let Ok(()) = self.metal_linear_fallback(mm, name, x, out_dim, in_dim, out) {
-                return Ok(());
+        if self.metal_matmul.is_some() {
+            let w = self.tensor_f32(name)?.to_vec();
+            if let Some(ref mm) = self.metal_matmul {
+                if mm.matmul_row_major_f32(&w, out_dim, in_dim, x, 1, out).is_ok() {
+                    return Ok(());
+                }
             }
         }
         let weight = self.tensor_f32(name)?;
@@ -770,7 +792,7 @@ impl DeepSeekV4Runner {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         if let Some(ref ops) = self.metal_ops {
             if let Ok(w_f16) = self.tensor_f16_raw("lm_head.weight") {
-                if ops.logits_f16(x, w_f16, vocab, hidden, "lm_head.weight", &mut buf).is_ok() {
+                if ops.logits_f16(x, &w_f16, vocab, hidden, "lm_head.weight", &mut buf).is_ok() {
                     return Ok(buf);
                 }
             }

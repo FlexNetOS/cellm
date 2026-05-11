@@ -25,6 +25,17 @@ wasm-pack build \
 
 echo ""
 echo "==> Done! Output in crates/cellm-wasm/pkg/"
-echo "==> To test, serve crates/cellm-wasm/www/ with:"
-echo "    python3 -m http.server 8080 --directory crates/cellm-wasm/www/"
-echo "    (or any static file server)"
+
+echo "==> Deploying to docs/wasm/…"
+mkdir -p ../../docs/wasm/pkg
+cp pkg/cellm_wasm.js ../../docs/wasm/pkg/
+cp pkg/cellm_wasm_bg.wasm ../../docs/wasm/pkg/
+cp www/index.html ../../docs/wasm/index.html
+
+# Fix paths in docs/wasm/index.html for deployment (no ../pkg/ or ../../../docs/)
+# On macOS sed -i needs '' for the extension
+sed -i '' 's/\.\.\/pkg\//\.\/pkg\//g' ../../docs/wasm/index.html
+sed -i '' 's/\.\.\/\.\.\/\.\.\/docs\//\.\.\//g' ../../docs/wasm/index.html
+
+echo "==> Live at: docs/wasm/index.html"
+echo "==> To test locally, serve from project root and open docs/wasm/index.html"

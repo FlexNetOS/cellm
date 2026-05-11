@@ -1,0 +1,681 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <meta http-equiv="Cross-Origin-Opener-Policy" content="same-origin" />
+        <meta
+            http-equiv="Cross-Origin-Embedder-Policy"
+            content="require-corp"
+        />
+        <title>cellm - WASM Demo</title>
+        <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+        <style>
+            * {
+                box-sizing: border-box;
+                margin: 0;
+                padding: 0;
+            }
+            body {
+                font-family:
+                    system-ui,
+                    -apple-system,
+                    sans-serif;
+                background: #fff;
+                color: #000;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                padding: 3rem 1rem;
+            }
+            h1 {
+                font-size: 1.3rem;
+                font-weight: 600;
+                margin-bottom: 0.25rem;
+            }
+            .subtitle {
+                color: #888;
+                margin-bottom: 2rem;
+                font-size: 0.85rem;
+            }
+            .card {
+                width: 100%;
+                max-width: 640px;
+                margin-bottom: 1rem;
+            }
+            .card h2 {
+                font-size: 0.75rem;
+                font-weight: 600;
+                text-transform: uppercase;
+                letter-spacing: 0.1em;
+                color: #888;
+                margin-bottom: 0.75rem;
+            }
+            textarea,
+            input,
+            select {
+                width: 100%;
+                background: #fff;
+                color: #000;
+                border: 1px solid #ccc;
+                border-radius: 4px;
+                padding: 0.5rem;
+                font-family: inherit;
+                font-size: 0.9rem;
+            }
+            textarea {
+                resize: vertical;
+                min-height: 50px;
+            }
+            button {
+                background: #000;
+                color: #fff;
+                border: none;
+                border-radius: 4px;
+                padding: 0.5rem 1rem;
+                font-size: 0.85rem;
+                font-weight: 500;
+                cursor: pointer;
+            }
+            button:hover {
+                background: #333;
+            }
+            button:disabled {
+                opacity: 0.3;
+                cursor: default;
+            }
+            .row {
+                display: flex;
+                gap: 0.5rem;
+                align-items: center;
+                flex-wrap: wrap;
+            }
+            .stats {
+                display: flex;
+                gap: 1.5rem;
+                margin-top: 0.75rem;
+            }
+            .stat .label {
+                font-size: 0.7rem;
+                color: #888;
+                text-transform: uppercase;
+            }
+            .stat .value {
+                font-size: 1rem;
+                font-weight: 600;
+            }
+            #output {
+                white-space: pre-wrap;
+                word-break: break-word;
+                font-size: 0.9rem;
+                line-height: 1.5;
+                max-height: 360px;
+                overflow-y: auto;
+                border: 1px solid #eee;
+                border-radius: 4px;
+                padding: 0.75rem;
+                margin-top: 0.75rem;
+                min-height: 3rem;
+            }
+            #output .token {
+                display: inline;
+                color: #000;
+            }
+            .status {
+                font-size: 0.8rem;
+                color: #888;
+                margin-top: 0.5rem;
+            }
+            .error {
+                color: #e00;
+            }
+            #docsContent {
+                font-size: 0.85rem;
+                line-height: 1.5;
+                color: #333;
+            }
+            #docsContent h1,
+            #docsContent h2,
+            #docsContent h3 {
+                margin-top: 1rem;
+                margin-bottom: 0.25rem;
+            }
+            #docsContent h1 {
+                font-size: 1.1rem;
+            }
+            #docsContent h2 {
+                font-size: 0.95rem;
+            }
+            #docsContent h3 {
+                font-size: 0.85rem;
+            }
+            #docsContent p {
+                margin-bottom: 0.5rem;
+            }
+            #docsContent code {
+                background: #f5f5f5;
+                padding: 0.1rem 0.3rem;
+                border-radius: 2px;
+                font-size: 0.8rem;
+            }
+            #docsContent pre {
+                background: #f5f5f5;
+                padding: 0.75rem;
+                border-radius: 4px;
+                overflow-x: auto;
+                margin-bottom: 0.75rem;
+            }
+            #docsContent pre code {
+                background: none;
+                padding: 0;
+            }
+            #docsContent table {
+                border-collapse: collapse;
+                width: 100%;
+                margin-bottom: 0.75rem;
+                font-size: 0.8rem;
+            }
+            #docsContent th,
+            #docsContent td {
+                border: 1px solid #ddd;
+                padding: 0.3rem 0.5rem;
+                text-align: left;
+            }
+            #docsContent th {
+                background: #f5f5f5;
+            }
+            #docsContent ul,
+            #docsContent ol {
+                padding-left: 1.25rem;
+                margin-bottom: 0.5rem;
+            }
+            #docsContent li {
+                margin-bottom: 0.15rem;
+            }
+            #docsContent a {
+                color: #000;
+                text-decoration: underline;
+            }
+            #docsContent hr {
+                border: none;
+                border-top: 1px solid #ddd;
+                margin: 1rem 0;
+            }
+            #docsContent blockquote {
+                border-left: 2px solid #000;
+                padding-left: 0.75rem;
+                margin-bottom: 0.75rem;
+                color: #666;
+            }
+            .mermaid {
+                margin: 1.5rem 0;
+                display: flex;
+                justify-content: center;
+            }
+        </style>
+    </head>
+    <body>
+        <h1>cellm</h1>
+        <p class="subtitle">WASM LLM Inference Demo</p>
+
+        <div class="card">
+            <h2>Model</h2>
+            <div class="row">
+                <input
+                    type="file"
+                    id="modelFile"
+                    accept=".cellm"
+                    style="flex: 1"
+                />
+                <button id="loadBtn" disabled>Load</button>
+            </div>
+            <div class="row" style="margin-top: 0.5rem">
+                <span style="font-size: 0.8rem; color: #888">Tokenizer:</span>
+                <input
+                    type="file"
+                    id="tokenizerFile"
+                    accept=".json"
+                    style="flex: 1"
+                />
+            </div>
+            <div class="row" style="margin-top: 0.5rem">
+                <button id="devLoadBtn" type="button">Load Qwen Debug Model</button>
+            </div>
+            <div id="status" class="status">Waiting for model file...</div>
+        </div>
+
+        <div class="card" id="inferCard" style="display: none">
+            <h2>Inference</h2>
+            <textarea id="prompt" placeholder="Enter a prompt..." rows="2">
+Hello, how are you today?</textarea
+            >
+            <div class="row" style="margin-top: 0.5rem">
+                <span style="font-size: 0.8rem; color: #888">Max tokens:</span>
+                <input
+                    type="number"
+                    id="maxTokens"
+                    value="64"
+                    min="1"
+                    max="512"
+                    style="width: 70px"
+                />
+                <select id="schedulingPolicy">
+                    <option value="Fair">Fair</option>
+                    <option value="LatencyFirst">Latency First</option>
+                    <option value="ThroughputFirst">Throughput</option>
+                </select>
+                <button id="genBtn" disabled>Generate</button>
+                <button id="stopBtn" disabled>Stop</button>
+            </div>
+            <div id="output"></div>
+            <div class="stats">
+                <div class="stat">
+                    <div class="label">Tokens</div>
+                    <div class="value" id="statTokens">0</div>
+                </div>
+                <div class="stat">
+                    <div class="label">Sessions</div>
+                    <div class="value" id="statSessions">0</div>
+                </div>
+                <div class="stat">
+                    <div class="label">Free Blocks</div>
+                    <div class="value" id="statBlocks">0</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="card" id="docsCard">
+            <h2>Documentation</h2>
+            <button id="docsBtn">Load WASM Backend Docs</button>
+            <div id="docsContent" style="margin-top: 0.75rem"></div>
+        </div>
+
+        <script type="module">
+            if (window.location.protocol === "file:") {
+                document.body.innerHTML =
+                    '<div style="padding:3rem;text-align:center;max-width:600px;margin:0 auto"><h2 style="color:#e00;margin-bottom:1rem">Cannot open from file://</h2><p style="margin-bottom:1rem;color:#666;line-height:1.6">This demo requires an HTTP server.<br>Run from the project root:</p><pre style="background:#f5f5f5;padding:1rem;border-radius:4px;text-align:left;display:inline-block;font-size:0.85rem">python3 -m http.server 8080 --directory /path/to/cellm\n# then open http://localhost:8080/crates/cellm-wasm/www/</pre><p style="margin-top:1rem;color:#888;font-size:0.85rem">Or open <a href="../" style="color:#000">docs/</a> to read the documentation.</p></div>';
+                throw new Error("file:// not supported");
+            }
+            import init, { CellmEngine } from "./pkg/cellm_wasm.js";
+            let engine = null,
+                sid = null,
+                running = false;
+            let wasmReadyPromise = null;
+            const $ = (i) => document.getElementById(i);
+            const modelFile = $("modelFile"),
+                tokenizerFile = $("tokenizerFile"),
+                loadBtn = $("loadBtn"),
+                devLoadBtn = $("devLoadBtn");
+            const status = $("status"),
+                inferCard = $("inferCard"),
+                prompt = $("prompt");
+            const maxTokens = $("maxTokens"),
+                schedulingPolicy = $("schedulingPolicy");
+            const genBtn = $("genBtn"),
+                stopBtn = $("stopBtn"),
+                output = $("output");
+            const statTokens = $("statTokens"),
+                statSessions = $("statSessions"),
+                statBlocks = $("statBlocks");
+            let modelBytes = null,
+                tokenizerJson = null;
+            const devModelBase =
+                "/models/to-huggingface/qwen2.5-0.5b-int8-v1";
+            const devModelUrl =
+                `${devModelBase}/qwen2.5-0.5b-int8-v1.cellm`;
+            const devTokenizerUrl = `${devModelBase}/tokenizer.json`;
+
+            warmupWasm();
+
+            function checkReady() {
+                loadBtn.disabled = !(modelBytes && tokenizerJson);
+            }
+
+            async function fetchBytes(url) {
+                const res = await fetch(url);
+                if (!res.ok) throw new Error(`failed to fetch ${url}: ${res.status}`);
+                return new Uint8Array(await res.arrayBuffer());
+            }
+
+            async function fetchText(url) {
+                const res = await fetch(url);
+                if (!res.ok) throw new Error(`failed to fetch ${url}: ${res.status}`);
+                return await res.text();
+            }
+
+            modelFile.addEventListener("change", async () => {
+                if (!modelFile.files.length) return;
+                status.textContent = "Reading model file...";
+                modelBytes = new Uint8Array(
+                    await modelFile.files[0].arrayBuffer(),
+                );
+                status.textContent = `Model: ${modelFile.files[0].name} (${(modelBytes.length / 1e6).toFixed(1)} MB)`;
+                checkReady();
+            });
+
+            tokenizerFile.addEventListener("change", async () => {
+                if (!tokenizerFile.files.length) return;
+                tokenizerJson = await tokenizerFile.files[0].text();
+                checkReady();
+            });
+
+            async function loadLocalDebugModel() {
+                devLoadBtn.disabled = true;
+                loadBtn.disabled = true;
+                status.classList.remove("error");
+                status.textContent = `Fetching model from ${devModelUrl}...`;
+                modelBytes = await fetchBytes(devModelUrl);
+                status.textContent = `Model fetched (${(modelBytes.length / 1e6).toFixed(1)} MB). Fetching tokenizer...`;
+                tokenizerJson = await fetchText(devTokenizerUrl);
+                await loadEngine();
+            }
+
+            async function loadEngine() {
+                if (!modelBytes || !tokenizerJson) return;
+                loadBtn.disabled = true;
+                genBtn.disabled = true;
+                status.classList.remove("error");
+                const startedAt = performance.now();
+                let statusPhase = "Preparing...";
+                const setTimedStatus = (message) => {
+                    statusPhase = message;
+                    const elapsed = ((performance.now() - startedAt) / 1000).toFixed(1);
+                    status.textContent = `${message} (${elapsed}s)`;
+                };
+                const progressTimer = setInterval(() => {
+                    const elapsed = ((performance.now() - startedAt) / 1000).toFixed(1);
+                    status.textContent = `${statusPhase} (${elapsed}s)`;
+                }, 250);
+                setTimedStatus("Waiting for WASM module...");
+                try {
+                    await withTimeout(wasmReadyPromise || warmupWasm(), 120000, "WASM module init timed out");
+                    setTimedStatus("Building engine...");
+                    const config = JSON.stringify({
+                        tokens_per_block: 16,
+                        total_blocks: 128,
+                        top_k: 40,
+                        temperature: 0.8,
+                        repeat_penalty: 1.05,
+                        repeat_window: 64,
+                        seed: 1,
+                        scheduling_policy: schedulingPolicy.value,
+                    });
+                    engine = new CellmEngine(modelBytes, config);
+                    engine.set_tokenizer(tokenizerJson);
+                    inferCard.style.display = "block";
+                    genBtn.disabled = false;
+                    status.textContent =
+                        `Engine ready. EOS token: ${engine.eos_token_id()}. Enter a prompt and click Generate.`;
+                    updateStats();
+                    modelBytes = null;
+                    tokenizerJson = null;
+                } catch (err) {
+                    status.textContent = `Error: ${err}`;
+                    status.classList.add("error");
+                    loadBtn.disabled = false;
+                    devLoadBtn.disabled = false;
+                } finally {
+                    clearInterval(progressTimer);
+                }
+            }
+
+            loadBtn.addEventListener("click", loadEngine);
+            devLoadBtn.addEventListener("click", () => {
+                loadLocalDebugModel().catch((err) => {
+                    status.textContent = `Error: ${err}`;
+                    status.classList.add("error");
+                    devLoadBtn.disabled = false;
+                    checkReady();
+                });
+            });
+
+            async function loadFromQueryParams() {
+                const params = new URLSearchParams(window.location.search);
+                const useDevModel =
+                    params.get("dev") === "1" || params.get("model") === "qwen";
+                if (useDevModel) {
+                    await loadLocalDebugModel();
+                    return;
+                }
+                const modelUrl = useDevModel ? devModelUrl : params.get("model");
+                const tokenizerUrl = useDevModel
+                    ? devTokenizerUrl
+                    : params.get("tokenizer");
+                if (!modelUrl && !tokenizerUrl) return;
+                if (!modelUrl || !tokenizerUrl) {
+                    status.textContent = "Error: provide both model and tokenizer query params";
+                    status.classList.add("error");
+                    return;
+                }
+                status.textContent = `Fetching model from ${modelUrl}...`;
+                modelBytes = await fetchBytes(modelUrl);
+                status.textContent = `Model fetched (${(modelBytes.length / 1e6).toFixed(1)} MB). Fetching tokenizer...`;
+                tokenizerJson = await fetchText(tokenizerUrl);
+                await loadEngine();
+            }
+
+            loadFromQueryParams().catch((err) => {
+                status.textContent = `Error: ${err}`;
+                status.classList.add("error");
+                loadBtn.disabled = false;
+            });
+
+            genBtn.addEventListener("click", async () => {
+                if (!engine || running) return;
+                running = true;
+                genBtn.disabled = true;
+                stopBtn.disabled = false;
+                output.innerHTML = "";
+                try {
+                    status.textContent = "Tokenizing...";
+                    const inputIds = engine.tokenize(prompt.value);
+                    status.textContent = `Prefilling ${inputIds.length} tokens...`;
+                    sid = engine.create_session();
+                    const firstToken = engine.submit_tokens(sid, inputIds);
+                    const max = parseInt(maxTokens.value) || 64;
+                    let count = 1;
+                    appendToken(engine.decode([firstToken]));
+                    updateStats();
+                    if (engine.is_stop_token(firstToken)) {
+                        status.textContent = `EOS (${firstToken}).`;
+                        running = false;
+                    }
+                    while (count < max && running) {
+                        let result = engine.step_decode();
+                        if (!result) {
+                            await sleep(5);
+                            continue;
+                        }
+                        const [ds, token] = result;
+                        if (token === undefined) continue;
+                        count++;
+                        const text = engine.decode([token]);
+                        appendToken(text);
+                        updateStats();
+                        if (engine.is_stop_token(token)) {
+                            status.textContent = `EOS (${token}).`;
+                            break;
+                        }
+                        if (count % 4 === 0) await sleep(0);
+                    }
+                    if (count >= max)
+                        status.textContent = `Reached max tokens (${max}).`;
+                } catch (err) {
+                    appendToken(`\n[Error: ${err}]`);
+                    status.textContent = `Error: ${err}`;
+                    status.classList.add("error");
+                } finally {
+                    running = false;
+                    genBtn.disabled = false;
+                    stopBtn.disabled = true;
+                    updateStats();
+                }
+            });
+
+            stopBtn.addEventListener("click", () => {
+                running = false;
+                status.textContent = "Stopped.";
+                if (sid !== null && engine) {
+                    try {
+                        engine.cancel_session(sid);
+                    } catch {}
+                    sid = null;
+                }
+            });
+
+            function appendToken(t) {
+                const s = document.createElement("span");
+                s.className = "token";
+                s.textContent = t;
+                output.appendChild(s);
+                output.scrollTop = output.scrollHeight;
+            }
+            function updateStats() {
+                if (!engine) return;
+                try {
+                    statTokens.textContent = engine.total_tokens_generated();
+                    statSessions.textContent = engine.num_active_sessions();
+                    statBlocks.textContent = engine.num_free_blocks();
+                } catch {}
+            }
+            function sleep(ms) {
+                return new Promise((r) => setTimeout(r, ms));
+            }
+            function withTimeout(promise, ms, message) {
+                return Promise.race([
+                    promise,
+                    new Promise((_, reject) =>
+                        setTimeout(() => reject(new Error(message)), ms),
+                    ),
+                ]);
+            }
+            function warmupWasm() {
+                if (wasmReadyPromise) return wasmReadyPromise;
+                const startedAt = performance.now();
+                wasmReadyPromise = (async () => {
+                    status.textContent = "Fetching WASM module...";
+                    const wasmBytes = await fetchWasmBytes((loaded, total) => {
+                        const loadedMb = (loaded / 1e6).toFixed(1);
+                        const totalMb = total ? ` / ${(total / 1e6).toFixed(1)} MB` : " MB";
+                        status.textContent = `Fetching WASM module ${loadedMb}${totalMb}`;
+                    });
+                    status.textContent = "Compiling WASM module...";
+                    await init({ module_or_path: wasmBytes });
+                    const elapsed = ((performance.now() - startedAt) / 1000).toFixed(1);
+                    status.textContent = `WASM ready (${elapsed}s). Waiting for model file...`;
+                })().catch((err) => {
+                    wasmReadyPromise = null;
+                    status.textContent = `Error: ${err}`;
+                    status.classList.add("error");
+                    throw err;
+                });
+                return wasmReadyPromise;
+            }
+            async function fetchWasmBytes(onProgress) {
+                const wasmUrl = new URL("./pkg/cellm_wasm_bg.wasm", import.meta.url);
+                const resp = await fetch(wasmUrl);
+                if (!resp.ok) {
+                    throw new Error(`failed to fetch WASM (${resp.status})`);
+                }
+                const total = Number(resp.headers.get("content-length")) || 0;
+                if (!resp.body) {
+                    const bytes = new Uint8Array(await resp.arrayBuffer());
+                    onProgress(bytes.length, bytes.length);
+                    return bytes;
+                }
+                const reader = resp.body.getReader();
+                const chunks = [];
+                let loaded = 0;
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    chunks.push(value);
+                    loaded += value.length;
+                    onProgress(loaded, total);
+                }
+                const bytes = new Uint8Array(loaded);
+                let offset = 0;
+                for (const chunk of chunks) {
+                    bytes.set(chunk, offset);
+                    offset += chunk.length;
+                }
+                return bytes;
+            }
+            setInterval(() => {
+                if (running) updateStats();
+            }, 500);
+
+            mermaid.initialize({
+                startOnLoad: false,
+                theme: "base",
+                themeVariables: {
+                    primaryColor: "#ffffff",
+                    primaryTextColor: "#000000",
+                    primaryBorderColor: "#000000",
+                    lineColor: "#000000",
+                    secondaryColor: "#f9f9f9",
+                    tertiaryColor: "#ffffff",
+                    fontSize: "14px",
+                },
+            });
+
+            marked.use({
+                renderer: {
+                    code(code, lang) {
+                        const text = typeof code === "object" ? code.text : code;
+                        const info = typeof code === "object" ? code.lang : lang;
+                        const language = (info || "").toLowerCase().trim();
+                        
+                        if (language === "mermaid" || language === "language-mermaid") {
+                            return `<div class="mermaid">${text}</div>`;
+                        }
+                        return `<pre><code>${text}</code></pre>`;
+                    },
+                },
+            });
+
+            const docsBtn = $("docsBtn"),
+                docsContent = $("docsContent");
+            let docsLoaded = false;
+            docsBtn.addEventListener("click", async () => {
+                if (docsLoaded) {
+                    docsContent.style.display =
+                        docsContent.style.display === "none" ? "block" : "none";
+                    docsBtn.textContent =
+                        docsContent.style.display === "none"
+                            ? "Show WASM Backend Docs"
+                            : "Hide WASM Backend Docs";
+                    return;
+                }
+                docsBtn.textContent = "Loading...";
+                docsBtn.disabled = true;
+                try {
+                    for (const path of [
+                        "../wasm-backend.md",
+                        "docs/wasm-backend.md",
+                    ]) {
+                        const resp = await fetch(path);
+                        if (resp.ok) {
+                            docsContent.innerHTML = marked.parse(
+                                await resp.text(),
+                            );
+                            setTimeout(() => {
+                                mermaid.init(undefined, docsContent.querySelectorAll(".mermaid"));
+                            }, 50);
+                            docsLoaded = true;
+                            docsBtn.textContent = "Hide WASM Backend Docs";
+                            return;
+                        }
+                    }
+                    throw new Error("File not found");
+                } catch (err) {
+                    docsContent.innerHTML = `<p style="color:#e00">Error: ${err.message}. Serve from project root.</p>`;
+                    docsBtn.textContent = "Retry";
+                } finally {
+                    docsBtn.disabled = false;
+                }
+            });
+        </script>
+    </body>
+</html>
