@@ -9,6 +9,7 @@ cellm-core = { path = "../cellm-core" }
 anyhow = { workspace = true }
 rayon = { workspace = true }
 half = { workspace = true }
+bytemuck = { workspace = true }
 ash = { version = "0.38", optional = true }
 
 [features]

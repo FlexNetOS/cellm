@@ -83,6 +83,18 @@ nce, and how these properties enable quantum algorithms to achieve exponential s
   --chat --gen 100 --backend metal
 
 
+
+```bash
+
+./target/release/infer \
+  --model models/to-huggingface/qwen2.5-0.5b-int8-v1/qwen2.5-0.5b-int8-v1.cellm \
+  --tokenizer models/to-huggingface/qwen2.5-0.5b-int8-v1/tokenizer.json \
+  --prompt "Create a Flappy Bird game in Python" \
+  --chat --gen 3000 --backend metal
+
+
+```
+
 ```bash
 
 ./target/release/infer \

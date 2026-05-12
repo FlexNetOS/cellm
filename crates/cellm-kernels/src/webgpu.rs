@@ -1,12 +1,11 @@
 // Author: Jeffrey Asante (https://jeffasante.github.io/)
-// WebGPU compute-kernel backend for cellm.
+//! WebGPU compute-kernel backend for cellm.
 //
 // Provides GPU-accelerated matmul, RMS norm, RoPE, and softmax kernels
 // via WGSL compute shaders dispatched through the `wgpu` crate.
 // Targets `wasm32-unknown-unknown` with WebGPU and also works on native
 // platforms (Vulkan/Metal/DX12) through wgpu's cross-platform layer.
 
-use std::sync::Mutex;
 
 // ---------------------------------------------------------------------------
 // WGSL shader sources (embedded as constants)
@@ -324,7 +323,7 @@ impl WebGpuBackend {
     fn build_pipelines(device: &wgpu::Device) -> WebGpuPipelines {
         let sm = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cellm-kernels-wgsl"),
-            source: wgpu::ShaderSource::Wgsl(WGSL_SOURCE.into()),
+            source: wgpu::ShaderSource::Wgsl(wgsl_source().into()),
         });
 
         let make = |entry: &str| -> wgpu::ComputePipeline {
@@ -334,6 +333,7 @@ impl WebGpuBackend {
                 module: &sm,
                 entry_point: Some(entry),
                 compilation_options: Default::default(),
+                cache: None,
             })
         };
 
@@ -537,7 +537,7 @@ impl WebGpuBackend {
         let x_buf = self.upload_f32(x);
         let out_buf = self.create_f32_output(n as usize);
 
-        let uniforms = [n, f32::from_bits(eps.to_bits()), 0u32, 0u32];
+        let uniforms = [n, eps.to_bits(), 0u32, 0u32];
         let u_buf = self.upload_f32(bytemuck::cast_slice(&uniforms));
 
         let bind_group = self
@@ -595,7 +595,7 @@ impl WebGpuBackend {
             head_dim as u32,
             rotary_dim as u32,
             pos as u32,
-            f32::from_bits(theta.to_bits()),
+            theta.to_bits(),
             0u32,
             0u32,
             0u32,
@@ -718,15 +718,20 @@ impl WebGpuBackend {
 }
 
 // ---------------------------------------------------------------------------
-// Concatenated WGSL source
+// Combined WGSL source built at runtime
 // ---------------------------------------------------------------------------
 
-const WGSL_SOURCE: &str = concat!(
-    WGSL_MATMUL_F32, "\n",
-    WGSL_MATMUL_F16, "\n",
-    WGSL_RMS_NORM, "\n",
-    WGSL_ROPE_HALF, "\n",
-    WGSL_SOFTMAX, "\n",
-    WGSL_SILU_MUL, "\n",
-);
-
+fn wgsl_source() -> String {
+    let mut s = String::with_capacity(
+        WGSL_MATMUL_F32.len() + WGSL_MATMUL_F16.len() + WGSL_RMS_NORM.len()
+        + WGSL_ROPE_HALF.len() + WGSL_SOFTMAX.len() + WGSL_SILU_MUL.len()
+        + 32
+    );
+    s.push_str(WGSL_MATMUL_F32); s.push('\n');
+    s.push_str(WGSL_MATMUL_F16); s.push('\n');
+    s.push_str(WGSL_RMS_NORM); s.push('\n');
+    s.push_str(WGSL_ROPE_HALF); s.push('\n');
+    s.push_str(WGSL_SOFTMAX); s.push('\n');
+    s.push_str(WGSL_SILU_MUL);
+    s
+}
