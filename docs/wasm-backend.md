@@ -26,6 +26,7 @@ flowchart TB
 
         MODEL_RUNNER --> BACKEND["Backend trait"]
         BACKEND --> WASM_KERNELS["WASM SIMD Kernels"]
+        BACKEND --> WEBGPU_KERNELS["WebGPU (WGSL) Shaders"]
         BACKEND --> SCALAR_FALLBACK["Scalar Fallback"]
     end
 
@@ -229,10 +230,11 @@ models under 1B parameters (like SmolLM2-135M), the decode path is
 compute-bound within the matmul, and WASM SIMD delivers roughly equivalent
 per-cycle throughput to native ARM NEON.
 
-**No GPU fallback.** Unlike the Metal and Vulkan backends, WASM currently has
-no GPU compute path. WebGPU compute shaders (WGSL) are an option for the
-future but require tiled matmul kernels that do not exist yet in the codebase.
-For now, all operations run on the CPU via SIMD.
+**WebGPU Acceleration.** In addition to WASM SIMD, cellm supports WebGPU
+compute shaders (WGSL) for hardware acceleration. By calling
+`engine.try_init_webgpu()`, the engine can offload heavy matrix multiplications
+to the GPU, often resulting in 10-50x speedups over SIMD for larger models.
+If WebGPU is unavailable, it gracefully falls back to WASM SIMD.
 
 **Threading is by worker count.** Rayon in WASM uses a fixed worker pool
 (typically `navigator.hardwareConcurrency` workers). Each worker is a Web
@@ -333,7 +335,6 @@ node --experimental-webgpu docs/wasm/test-node.mjs --webgpu \
 
 ## Limitations and Future Work
 
-- WebGPU compute shaders for 10-50x acceleration on large matmuls
 - Speculative decoding to reduce per-token latency
 - Chunked model loading from IndexedDB for models above 1B parameters
 - Streaming model fetch (decode while still downloading weights)

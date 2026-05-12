@@ -240,7 +240,7 @@
                 />
             </div>
             <div class="row" style="margin-top: 0.5rem">
-                <button id="devLoadBtn" type="button">Load LFM Debug Model</button>
+                <button id="devLoadBtn" type="button">Load Qwen Debug Model</button>
                 <div style="margin-left: 1rem; display: flex; align-items: center; gap: 0.5rem;">
                     <span style="font-size: 0.7rem; color: #888; text-transform: uppercase; letter-spacing: 0.05em;">Backend:</span>
                     <select id="backendSelect" style="font-size: 0.8rem; padding: 2px 4px;">
@@ -414,9 +414,9 @@ What is consciousness? in one paragraph</textarea
             let modelBytes = null,
                 tokenizerJson = null;
             const devModelBase =
-                "/models/to-huggingface/lfm2.5-350m-v1";
+                "/models/to-huggingface/qwen2.5-0.5b-int8-v1";
             const devModelUrl =
-                `${devModelBase}/lfm2.5-350m-v1.cellm`;
+                `${devModelBase}/qwen2.5-0.5b-int8-v1.cellm`;
             const devTokenizerUrl = `${devModelBase}/tokenizer.json`;
 
             warmupWasm();

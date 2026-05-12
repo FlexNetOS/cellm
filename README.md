@@ -21,6 +21,8 @@ Not a wrapper around `llama.cpp`. Not a port of `vLLM`. A new runtime designed f
 | **VLM (Vision) Guide** | [`docs/vlm-smolvlm-onnx.md`](docs/vlm-smolvlm-onnx.md) |
 | **iOS Demo App** | [`bindings/ios/CellmDemo`](bindings/ios/CellmDemo) |
 | **Android Bindings** | [`bindings/kotlin`](bindings/kotlin) |
+| **WASM & WebGPU** | [`docs/wasm-backend.md`](docs/wasm-backend.md) |
+| **Live WASM Demo** | [cellm.ai/wasm](https://cellm.ai/wasm) (Research Preview) |
 
 ## Quick Start
 
@@ -133,8 +135,9 @@ cellm/
 │   ├── cellm-core/          # Memory arena, tensor layout, op dispatch
 │   ├── cellm-model/         # Model format, configuration, weight management
 │   ├── cellm-cache/         # Paged KV cache: BlockAllocator, PageTable, physical storage
-│   ├── cellm-kernels/       # CPU & Metal compute kernels (SIMD, Accelerate, Metal shaders)
+│   ├── cellm-kernels/       # CPU, Metal, WASM & WebGPU compute kernels
 │   ├── cellm-scheduler/     # Decode scheduler & batching logic
+│   ├── cellm-wasm/          # WebAssembly bindings & JavaScript API
 │   └── cellm-sdk/           # Public C FFI + high-level API for mobile consumers
 ├── bindings/
 │   ├── ios/CellmDemo/       # SwiftUI demo app (LLM + VLM stub)
@@ -222,6 +225,17 @@ Build the XCFramework:
 
 Then open `bindings/ios/CellmDemo` in Xcode.
 
+### Browser / WebAssembly
+Build and run the WASM engine with WebGPU acceleration:
+```bash
+# Build the WASM module
+./scripts/build-wasm.sh --release
+
+# Serve the demo page
+python3 -m http.server 8080 --directory crates/cellm-wasm/www/
+```
+Then open `http://localhost:8080` and use `engine.try_init_webgpu()` to enable hardware acceleration.
+
 ---
 
 ## Supported Models
@@ -252,7 +266,8 @@ Sample checkpoints bundled in this repo (via Git LFS):
 - [x] **Multi-session Scheduler** - Round-robin interleaved decoding
 - [x] **4-bit Affine Dequantization** - Native MLX/HF packed weight support
 - [x] **Multimodal Vision** - Native ViT/SigLIP encoder + linear projector
-- [x] **Accelerated Math** - Metal compute kernels + SIMD CPU fallbacks
+- [x] **Accelerated Math** - Metal + WASM SIMD + WebGPU compute kernels
+- [x] **WebAssembly Support** - Run LLMs in the browser with `wasm-bindgen`
 - [x] **High-Performance CLI** - Conversion, benchmarking, debug inference
 - [ ] **Vulkan Support** - Cross-platform compute kernels (research)
 - [ ] **Android Integration** - Kotlin/JNI bindings & tuning (coming soon)
@@ -277,6 +292,7 @@ Sample checkpoints bundled in this repo (via Git LFS):
 | Data flow diagrams | [`docs/data_flow.md`](docs/data_flow.md) |
 | Format specification | [`docs/format.md`](docs/format.md) |
 | Inference graph | [`docs/inference_graph.md`](docs/inference_graph.md) |
+| WASM & WebGPU Backend | [`docs/wasm-backend.md`](docs/wasm-backend.md) |
 
 ---
 
