@@ -98,6 +98,16 @@ struct ModelsView: View {
             tokenizerUrl: DemoAssetLinks.qwen35Tokenizer,
             tokenizerConfigName: nil,
             tokenizerConfigUrl: nil
+        ),
+        ModelAssetCard(
+            name: "NanoWhale (100M MLA+MoE)",
+            description: "Tiny DeepSeek-V4 based model with Multi-head Latent Attention and Mixture of Experts.",
+            fileName: DemoAssetLinks.nanowhaleFileName,
+            url: DemoAssetLinks.nanowhale,
+            tokenizerName: DemoAssetLinks.nanowhaleTokenizerFileName,
+            tokenizerUrl: DemoAssetLinks.nanowhaleTokenizer,
+            tokenizerConfigName: DemoAssetLinks.nanowhaleTokenizerConfigFileName,
+            tokenizerConfigUrl: DemoAssetLinks.nanowhaleTokenizerConfig
         )
     ]
     
