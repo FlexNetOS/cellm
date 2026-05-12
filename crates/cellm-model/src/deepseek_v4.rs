@@ -1,11 +1,7 @@
 // Author: Jeffrey Asante (https://jeffasante.github.io/)
 use cellm_cache::{KVCache, PageTable};
 use cellm_core::CoreError;
-use cellm_kernels::cpu_kernels::{rms_norm_f32, softmax_f32_inplace, matmul_f32};
-use cellm_kernels::{MetalKernels, MetalOps};
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-use cellm_kernels::metal::{MetalMatmul, MetalBuffer};
-use std::cell::RefCell;
+use cellm_kernels::cpu_kernels::{softmax_f32_inplace};
 use std::path::Path;
 use crate::{CellmFile, ModelConfig};
 
@@ -21,19 +17,6 @@ pub struct DeepSeekV4Runner {
     max_layers: usize,
     // Weight cache for f16 -> f32 conversion
     weight_cache: std::collections::HashMap<String, Vec<f32>>,
-    // Metal acceleration
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    metal_matmul: Option<MetalMatmul>,
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    metal_ops: Option<MetalOps>,
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    metal_weights: std::collections::HashMap<String, MetalBuffer>,
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    f16_cache: std::cell::RefCell<std::collections::HashMap<String, Vec<u16>>>,
-    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-    metal_matmul: (),
-    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-    metal_ops: (),
 }
 
 impl DeepSeekV4Runner {
@@ -79,18 +62,6 @@ impl DeepSeekV4Runner {
             eos_token_id: h.eos_token_id,
             max_layers: h.num_layers,
             weight_cache: std::collections::HashMap::new(),
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            metal_matmul: None,
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            metal_ops: None,
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            metal_weights: std::collections::HashMap::new(),
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            f16_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
-            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-            metal_matmul: (),
-            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-            metal_ops: (),
         })
     }
 
@@ -128,26 +99,9 @@ impl DeepSeekV4Runner {
         self.max_layers = n.min(self.cfg.num_hidden_layers);
     }
 
-    /// Enable Metal acceleration for matmul (linear layers) + ops (RMSNorm, logits).
-    /// Returns true if Metal was successfully enabled.
+    /// Enable Metal acceleration. Currently disabled for DeepSeekV4 — this model
+    /// is too small (hidden=320) for GPU dispatch latency to be worthwhile.
     pub fn enable_metal_full_backend(&mut self) -> bool {
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        {
-            let mk_res = MetalKernels::create_matmul();
-            let mo_res = MetalOps::create();
-            match (mk_res, mo_res) {
-                (Ok(mm), Ok(mo)) => {
-                    self.metal_matmul = Some(mm);
-                    self.metal_ops = Some(mo);
-                    true
-                }
-                (Err(e), _) | (_, Err(e)) => {
-                    eprintln!("deepseek_v4: metal init failed: {e}");
-                    false
-                }
-            }
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         false
     }
 
@@ -718,36 +672,9 @@ impl DeepSeekV4Runner {
         Ok(())
     }
 
-    // Minimum matmul element count to justify GPU upload/dispatch overhead.
-    // For tiny matrices (hidden=320), the ~0.1ms GPU dispatch latency far exceeds
-    // the ~0.001ms CPU cost of a direct 320×320 matmul. 70K ≈ 265×265.
-    const MIN_METAL_MATMUL: usize = 70_000;
-
     fn linear_dims(&mut self, name: &str, x: &[f32], out_dim: usize, in_dim: usize, out: &mut [f32]) -> Result<(), CoreError> {
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        if self.metal_matmul.is_some() && out_dim * in_dim >= Self::MIN_METAL_MATMUL {
-            let w = self.tensor_f32(name)?.to_vec();
-            if let Some(ref mm) = self.metal_matmul {
-                use std::collections::hash_map::Entry;
-                let w_buf = match self.metal_weights.entry(name.to_string()) {
-                    Entry::Occupied(e) => e.into_mut(),
-                    Entry::Vacant(e) => {
-                        let buf = mm.upload_f32(&w).map_err(|e|
-                            CoreError::Backend(format!("metal upload {name}: {e}"))
-                        )?;
-                        e.insert(buf)
-                    }
-                };
-                let x_buf = mm.upload_f32(x).map_err(|e|
-                    CoreError::Backend(format!("metal upload x: {e}"))
-                )?;
-                if mm.matmul_row_major_f32_with_b_buffer(w_buf, out_dim, in_dim, &x_buf, 1, out).is_ok() {
-                    return Ok(());
-                }
-            }
-        }
         let weight = self.tensor_f32(name)?;
-        matmul_f32(weight, out_dim, in_dim, x, 1, out);
+        cellm_kernels::cpu_kernels::matmul_f32(weight, out_dim, in_dim, x, 1, out);
         Ok(())
     }
 
@@ -761,23 +688,10 @@ impl DeepSeekV4Runner {
         Ok(())
     }
 
-    // Minimum hidden dimension for GPU RMSNorm. Below this, CPU is faster.
-    const MIN_METAL_RMS: usize = 1024;
-
     fn rmsnorm(&mut self, name: &str, x: &[f32], out: &mut [f32]) -> Result<(), CoreError> {
         let eps = self.cfg.rms_norm_eps;
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        if self.metal_ops.is_some() && x.len() >= Self::MIN_METAL_RMS {
-            if let Ok(w_f16) = self.tensor_f16_raw(name) {
-                if let Some(ref ops) = self.metal_ops {
-                    if ops.rms_norm_f16w(x, &w_f16, eps, false, name, out).is_ok() {
-                        return Ok(());
-                    }
-                }
-            }
-        }
         let weight = self.tensor_f32(name)?;
-        rms_norm_f32(x, weight, eps, out);
+        cellm_kernels::cpu_kernels::rms_norm_f32(x, weight, eps, out);
         Ok(())
     }
 
@@ -785,30 +699,8 @@ impl DeepSeekV4Runner {
         let meta = self.file.tensor_index(name).ok_or_else(|| CoreError::Backend(format!("unknown tensor {name}")))?;
         let out_dim = meta.shape[0];
         let in_dim = meta.shape[1];
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        if self.metal_matmul.is_some() && out_dim * in_dim >= Self::MIN_METAL_MATMUL {
-            let w = self.tensor_f32(name)?.to_vec();
-            if let Some(ref mm) = self.metal_matmul {
-                use std::collections::hash_map::Entry;
-                let w_buf = match self.metal_weights.entry(name.to_string()) {
-                    Entry::Occupied(e) => e.into_mut(),
-                    Entry::Vacant(e) => {
-                        let buf = mm.upload_f32(&w).map_err(|e|
-                            CoreError::Backend(format!("metal upload {name}: {e}"))
-                        )?;
-                        e.insert(buf)
-                    }
-                };
-                let x_buf = mm.upload_f32(x).map_err(|e|
-                    CoreError::Backend(format!("metal upload x: {e}"))
-                )?;
-                if mm.matmul_row_major_f32_with_b_buffer(w_buf, out_dim, in_dim, &x_buf, 1, out).is_ok() {
-                    return Ok(());
-                }
-            }
-        }
         let weight = self.tensor_f32(name)?;
-        matmul_f32(weight, out_dim, in_dim, x, 1, out);
+        cellm_kernels::cpu_kernels::matmul_f32(weight, out_dim, in_dim, x, 1, out);
         Ok(())
     }
 
@@ -816,54 +708,9 @@ impl DeepSeekV4Runner {
         let vocab = self.cfg.vocab_size;
         let hidden = self.cfg.hidden_size;
         let mut buf = vec![0.0f32; vocab];
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        if let Some(ref ops) = self.metal_ops {
-            if let Ok(w_f16) = self.tensor_f16_raw("lm_head.weight") {
-                if ops.logits_f16(x, &w_f16, vocab, hidden, "lm_head.weight", &mut buf).is_ok() {
-                    return Ok(buf);
-                }
-            }
-        }
         let weight = self.tensor_f32("lm_head.weight")?;
-        matmul_f32(weight, vocab, hidden, x, 1, &mut buf);
+        cellm_kernels::cpu_kernels::matmul_f32(weight, vocab, hidden, x, 1, &mut buf);
         Ok(buf)
-    }
-
-    /// Fetch the raw f16 weight data for a tensor (cached, for Metal upload).
-    /// Uses `&self` — the cache is populated lazily and does not need `&mut self`.
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    fn tensor_f16_raw(&self, name: &str) -> Result<Vec<u16>, CoreError> {
-        // Check cache first (only populated after first read)
-        if let Some(cached) = self.f16_cache.get(name) {
-            return Ok(cached.clone());
-        }
-        let meta = self.file.tensor_index(name).ok_or_else(|| CoreError::Backend(format!("unknown tensor {name}")))?;
-        let bytes = self.file.tensor_bytes(name).map_err(|e| CoreError::Backend(e.to_string()))?;
-        match meta.dtype.as_str() {
-            "f16" | "bf16" => {
-                let src: &[u16] = bytemuck::cast_slice(bytes);
-                let data = src.to_vec();
-                // Cannot insert into &self cache — caller must tolerate re-read.
-                // But this is only called for logits (once per step cold, cached thereafter by MetalOps).
-                Ok(data)
-            }
-            "f32" => {
-                Err(CoreError::Backend(format!("tensor {name} is f32, no f16 data available for Metal")))
-            }
-            other => Err(CoreError::Backend(format!("unsupported dtype {other} for tensor {name}"))),
-        }
-    }
-
-    /// Try to run a linear layer via Metal matmul. Falls back to CPU on any error.
-    /// Uses matmul_row_major_f32 which handles f32 upload/download internally.
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    fn metal_linear_fallback(&mut self, mm: &MetalMatmul, name: &str, x: &[f32], out_dim: usize, in_dim: usize, out: &mut [f32]) -> Result<(), CoreError> {
-        let w_f32 = self.tensor_f32(name)?;
-        // matmul_row_major_f32 computes C[m,n] = A[m,k] @ B[k,n]
-        // Here: A = weight [out_dim, in_dim], B = x [in_dim, 1], C = out [out_dim, 1]
-        mm.matmul_row_major_f32(w_f32, out_dim, in_dim, x, 1, out)
-            .map_err(|e| CoreError::Backend(format!("metal matmul {name}: {e}")))?;
-        Ok(())
     }
 
     fn tensor_f32(&mut self, name: &str) -> Result<&[f32], CoreError> {
