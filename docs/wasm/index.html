@@ -241,6 +241,13 @@
             </div>
             <div class="row" style="margin-top: 0.5rem">
                 <button id="devLoadBtn" type="button">Load LFM Debug Model</button>
+                <div style="margin-left: 1rem; display: flex; align-items: center; gap: 0.5rem;">
+                    <span style="font-size: 0.7rem; color: #888; text-transform: uppercase; letter-spacing: 0.05em;">Backend:</span>
+                    <select id="backendSelect" style="font-size: 0.8rem; padding: 2px 4px;">
+                        <option value="cpu">CPU (WASM)</option>
+                        <option value="webgpu">WebGPU (Metal/Vulkan)</option>
+                    </select>
+                </div>
             </div>
             <div id="status" class="status">Waiting for model file...</div>
             <details id="logDetails" style="margin-top: 0.5rem; font-size: 0.75rem; color: #666; border: 1px solid #eee; border-radius: 4px; background: #fafafa; text-align: left;">
@@ -335,11 +342,6 @@ What is consciousness? in one paragraph</textarea
                     <option value="Fair">Fair</option>
                     <option value="LatencyFirst">Latency First</option>
                     <option value="ThroughputFirst">Throughput</option>
-                </select>
-                <span style="font-size: 0.8rem; color: #888">Backend:</span>
-                <select id="backendSelect">
-                    <option value="cpu">CPU</option>
-                    <option value="webgpu">WebGPU (beta)</option>
                 </select>
                 <button id="genBtn" disabled>Generate</button>
                 <button id="stopBtn" disabled>Stop</button>
@@ -539,8 +541,8 @@ What is consciousness? in one paragraph</textarea
                     status.textContent =
                         `Engine ready. EOS token: ${engine.eos_token_id()}. Enter a prompt and click Generate.`;
                     updateStats();
-                    modelBytes = null;
-                    tokenizerJson = null;
+                    // modelBytes = null;
+                    // tokenizerJson = null;
                 } catch (err) {
                     log(`Engine initialization error: ${err}`, "red");
                     status.textContent = `Error: ${err}`;
@@ -599,6 +601,21 @@ What is consciousness? in one paragraph</textarea
                     }
                 });
             });
+
+            backendSelect.onchange = async () => {
+                if (engine) {
+                    log(`Backend changed to ${backendSelect.value}. Re-initializing engine...`);
+                    // We don't have the original modelBytes anymore because we set them to null to save memory
+                    // But for development, we can keep them or just ask to reload.
+                    // Actually, let's just trigger loadEngine if we have the data, or tell the user to reload.
+                    if (modelBytes && tokenizerJson) {
+                        await loadEngine();
+                    } else {
+                        log("Model data was cleared from memory. Please reload the model to switch backends.", "#e65100");
+                        status.textContent = "Please reload model to switch backends.";
+                    }
+                }
+            };
 
             async function loadFromQueryParams() {
                 const params = new URLSearchParams(window.location.search);
