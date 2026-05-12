@@ -99,6 +99,7 @@ struct ConcurrentChatView: View {
             .presentationDetents([.medium])
         }
         .onAppear { restore(); initEngine() }
+        .onDisappear { invalidate() }
         .onChange(of: modelURL) { _ in initEngine() }
         .onChange(of: tokURL) { _ in initEngine() }
         .onChange(of: backend) { _ in invalidate(); initEngine() }
@@ -356,9 +357,9 @@ struct ConcurrentChatView: View {
         guard let eng = self.engine else { return }
         let tok = self.tokenizer
 
-        decodeTask = Task.detached(priority: .userInitiated) { [weak self] in
+        decodeTask = Task.detached(priority: .userInitiated) {
             while !Task.isCancelled {
-                let active = await MainActor.run { self?.threads.contains(where: { $0.generating }) ?? false }
+                let active = await MainActor.run { self.threads.contains(where: { $0.generating }) }
                 guard active else { try? await Task.sleep(nanoseconds: 20_000_000); continue }
 
                 do {
@@ -367,23 +368,25 @@ struct ConcurrentChatView: View {
                     }
                     guard let piece = try? tok?.decodeOne(res.token) else { continue }
 
-                    let modelName = await MainActor.run { self?.modelURL?.lastPathComponent.lowercased() ?? "" }
-                    let tokName = await MainActor.run { self?.tokURL?.lastPathComponent.lowercased() ?? "" }
+                    let modelName = await MainActor.run { self.modelURL?.lastPathComponent.lowercased() ?? "" }
+                    let tokName = await MainActor.run { self.tokURL?.lastPathComponent.lowercased() ?? "" }
                     let stop = Self.isStopPiece(piece, modelName: modelName, tokenizerName: tokName)
 
                     await MainActor.run {
-                        guard let i = self?.threads.firstIndex(where: { $0.sessionId == res.session && $0.generating }) else { return }
-                        if let li = self?.threads[i].msgs.indices.last,
-                           self?.threads[i].msgs[li].role == "Assistant" {
-                            self?.threads[i].msgs[li].text += piece
+                        guard let i = self.threads.firstIndex(where: { $0.sessionId == res.session && $0.generating }) else { return }
+                        if let li = self.threads[i].msgs.indices.last,
+                           self.threads[i].msgs[li].role == "Assistant" {
+                            self.threads[i].msgs[li].text += piece
                         }
-                        self?.threads[i].tokCount += 1
-                        if stop || self?.threads[i].tokCount >= self?.maxTok ?? 200 {
-                            self?.threads[i].generating = false
+                        self.threads[i].tokCount += 1
+                        let currentTokCount = self.threads[i].tokCount
+                        let limit = self.maxTok
+                        if stop || currentTokCount >= limit {
+                            self.threads[i].generating = false
                         }
                     }
                 } catch {
-                    await MainActor.run { self?.err = String(describing: error) }
+                    await MainActor.run { self.err = String(describing: error) }
                 }
             }
         }
