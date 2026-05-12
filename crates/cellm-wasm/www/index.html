@@ -767,7 +767,8 @@ Hello, how are you today?</textarea
                 docsBtn.disabled = true;
                 try {
                     for (const path of [
-                        "../../../docs/wasm-backend.md",
+                        "./wasm-backend.md",
+                        "../wasm-backend.md",
                         "docs/wasm-backend.md",
                     ]) {
                         const resp = await fetch(path);

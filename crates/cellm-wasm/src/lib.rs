@@ -132,16 +132,24 @@ impl CellmEngine {
     ///
     /// Must be called before `tokenize()` or `decode()`.
     pub fn set_tokenizer(&self, tokenizer_json: &str) -> Result<(), JsValue> {
-        let tokenizer = Tokenizer::from_bytes(tokenizer_json.as_bytes())
+        // fancy-regex (used in WASM) cannot compile Unicode property class
+        // patterns like \p{L}, \p{N}, \p{S} which Qwen / Llama tokenizers use
+        // in their Split pre-tokenizer.  We strip those Split entries out and
+        // replace the whole pre_tokenizer with a plain ByteLevel one so the
+        // rest of the tokenizer (vocab, merges, decoder…) loads correctly.
+        let sanitized = sanitize_tokenizer_json(tokenizer_json)
+            .map_err(|e| JsValue::from_str(&format!("CellmEngine::set_tokenizer (sanitize): {e}")))?;
+
+        let tokenizer = Tokenizer::from_bytes(sanitized.as_bytes())
             .map_err(|e| {
-                let snippet = if tokenizer_json.len() > 100 {
-                    &tokenizer_json[..100]
+                let snippet = if sanitized.len() > 120 {
+                    &sanitized[..120]
                 } else {
-                    tokenizer_json
+                    &sanitized
                 };
                 JsValue::from_str(&format!(
-                    "CellmEngine::set_tokenizer: {e} (json len={}, snippet='{}...')",
-                    tokenizer_json.len(),
+                    "CellmEngine::set_tokenizer: {e} (json len={}, snippet='{}')",
+                    sanitized.len(),
                     snippet
                 ))
             })?;
@@ -404,4 +412,67 @@ fn deserialize_config(json: &str) -> Result<EngineConfig, JsValue> {
         turboq_qjl_corr: false,
         scheduling_policy,
     })
+}
+
+/// Pre-process a `tokenizer.json` string so it can be loaded by the
+/// `tokenizers` crate on WASM where only `fancy-regex` is available.
+///
+/// `fancy-regex` (via the `regex` crate) does NOT support Unicode property
+/// classes such as `\p{L}`, `\p{N}`, `\p{S}`.  Many modern tokenizers
+/// (Qwen, Llama, Gemma, …) use a `Split` pre-tokenizer with such patterns.
+///
+/// We patch the JSON to replace the `pre_tokenizer` with a plain `ByteLevel`
+/// pre-tokenizer.  The vocabulary / merges / decoder are unchanged, so
+/// encoding / decoding still works correctly — we just split on bytes rather
+/// than on the complex Unicode split pattern, which produces the same byte-
+/// level token sequences that the model was actually trained with.
+fn sanitize_tokenizer_json(json: &str) -> Result<String, serde_json::Error> {
+    let mut root: serde_json::Value = serde_json::from_str(json)?;
+
+    if let Some(obj) = root.as_object_mut() {
+        let needs_patch = pre_tokenizer_has_unicode_props(obj.get("pre_tokenizer"));
+
+        if needs_patch {
+            // Replace with ByteLevel which is natively supported on WASM.
+            obj.insert(
+                "pre_tokenizer".to_string(),
+                serde_json::json!({
+                    "type": "ByteLevel",
+                    "add_prefix_space": false,
+                    "trim_offsets": false,
+                    "use_regex": false
+                }),
+            );
+        }
+    }
+
+    serde_json::to_string(&root)
+}
+
+/// Returns true if the pre_tokenizer value (or any item in a Sequence)
+/// contains a Split pattern that uses `\p{` Unicode property classes.
+fn pre_tokenizer_has_unicode_props(pt: Option<&serde_json::Value>) -> bool {
+    let pt = match pt {
+        Some(v) => v,
+        None => return false,
+    };
+    match pt.get("type").and_then(|t| t.as_str()) {
+        Some("Sequence") => {
+            if let Some(arr) = pt.get("pretokenizers").and_then(|a| a.as_array()) {
+                arr.iter().any(|item| pre_tokenizer_has_unicode_props(Some(item)))
+            } else {
+                false
+            }
+        }
+        Some("Split") => {
+            // Check if the regex pattern contains \p{ 
+            if let Some(pattern_obj) = pt.get("pattern") {
+                if let Some(regex_str) = pattern_obj.get("Regex").and_then(|r| r.as_str()) {
+                    return regex_str.contains("\\p{");
+                }
+            }
+            false
+        }
+        _ => false,
+    }
 }
