@@ -20,10 +20,11 @@ half = { workspace = true }
 bytemuck = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
-tokenizers = { version = "0.19", default-features = false, features = ["unstable_wasm", "fancy-regex"] }
+tokenizers = { version = "0.21", default-features = false, features = ["unstable_wasm", "fancy-regex"] }
 wasm-bindgen = "0.2"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+esaxx-rs = { version = "0.1.10", default-features = false }
 console_error_panic_hook = "0.1"
 getrandom = { version = "0.2", features = ["js"] }
 js-sys = "0.3"

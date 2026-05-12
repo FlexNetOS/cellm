@@ -333,7 +333,7 @@ impl WebGpuBackend {
                 layout: None,
                 module: &sm,
                 entry_point: Some(entry),
-                compilation_options: Default::default(),
+             compilation_options: Default::default(),
                 cache: None,
             })
         };

@@ -240,7 +240,7 @@
                 />
             </div>
             <div class="row" style="margin-top: 0.5rem">
-                <button id="devLoadBtn" type="button">Load Qwen Debug Model</button>
+                <button id="devLoadBtn" type="button">Load LFM Debug Model</button>
             </div>
             <div id="status" class="status">Waiting for model file...</div>
             <div
@@ -392,9 +392,9 @@ Hello, how are you today?</textarea
             let modelBytes = null,
                 tokenizerJson = null;
             const devModelBase =
-                "/models/to-huggingface/qwen2.5-0.5b-int8-v1";
+                "/models/to-huggingface/lfm2.5-350m-v1";
             const devModelUrl =
-                `${devModelBase}/qwen2.5-0.5b-int8-v1.cellm`;
+                `${devModelBase}/lfm2.5-350m-v1.cellm`;
             const devTokenizerUrl = `${devModelBase}/tokenizer.json`;
 
             warmupWasm();

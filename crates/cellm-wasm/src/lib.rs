@@ -433,6 +433,7 @@ fn sanitize_tokenizer_json(json: &str) -> Result<String, serde_json::Error> {
         let needs_patch = pre_tokenizer_has_unicode_props(obj.get("pre_tokenizer"));
 
         if needs_patch {
+            web_sys::console::log_1(&"CellmEngine: Patching tokenizer.json to remove incompatible Unicode property classes in pre_tokenizer".into());
             // Replace with ByteLevel which is natively supported on WASM.
             obj.insert(
                 "pre_tokenizer".to_string(),
@@ -443,6 +444,8 @@ fn sanitize_tokenizer_json(json: &str) -> Result<String, serde_json::Error> {
                     "use_regex": false
                 }),
             );
+        } else {
+            web_sys::console::log_1(&"CellmEngine: Tokenizer.json seems compatible, no patching needed".into());
         }
     }
 
