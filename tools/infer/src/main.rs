@@ -208,12 +208,14 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
         text_model_type
     );
 
+    let mut metal_available = false;
     if args.backend == BackendKind::Metal {
         let t_stage = Instant::now();
         match &mut runner {
             Runner::Qwen(r) => {
                 if r.enable_metal_full_backend() {
                     println!("LLM backend: metal (Qwen full acceleration)");
+                    metal_available = true;
                 } else {
                     println!("LLM backend: metal requested, but Qwen full-metal init failed (using CPU layer loop with Metal matmul)");
                 }
@@ -221,6 +223,7 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
             Runner::Gemma(r) => {
                 if r.enable_metal_full_backend() {
                     println!("LLM backend: metal (Gemma full acceleration)");
+                    metal_available = true;
                 } else {
                     println!("LLM backend: metal requested, but Gemma is using the stable CPU math path");
                 }
@@ -228,6 +231,7 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
             Runner::Llama(r) => {
                 if r.enable_metal_full_backend() {
                     println!("LLM backend: metal (Llama full acceleration)");
+                    metal_available = true;
                 } else {
                     anyhow::bail!("LLM backend: metal requested, but Llama full-metal init failed");
                 }
@@ -235,6 +239,7 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
             Runner::Granite(r) => {
                 if r.enable_metal_full_backend() {
                     println!("LLM backend: metal (Granite full acceleration)");
+                    metal_available = true;
                 } else {
                     anyhow::bail!("LLM backend: metal requested, but Granite full-metal init failed");
                 }
@@ -242,6 +247,7 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
             Runner::Lfm(r) => {
                 if r.enable_metal_full_backend() {
                     println!("LLM backend: metal (LFM acceleration enabled)");
+                    metal_available = true;
                 } else {
                     println!("LLM backend: CPU (LFM Metal init failed, falling back)");
                 }
@@ -249,6 +255,7 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
             Runner::DeepSeekV4(r) => {
                 if r.enable_metal_full_backend() {
                     println!("LLM backend: metal (DeepSeekV4 matmul + ops)");
+                    metal_available = true;
                 } else {
                     println!("LLM backend: CPU (DeepSeekV4 fallback path)");
                 }
@@ -409,7 +416,7 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
         head_dim,
     };
     drop(file);
-    let kind = if args.backend == BackendKind::Metal {
+    let kind = if metal_available {
         cellm_cache::KvStorageKind::Metal
     } else {
         cellm_cache::KvStorageKind::Cpu
