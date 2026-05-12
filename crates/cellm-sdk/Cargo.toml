@@ -30,4 +30,4 @@ tokenizers = "0.19"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
-tokenizers = { version = "0.19", default-features = false, features = ["unstable_wasm"] }
+tokenizers = { version = "0.19", default-features = false, features = ["unstable_wasm", "fancy-regex"] }

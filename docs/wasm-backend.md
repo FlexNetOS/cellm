@@ -234,7 +234,7 @@ no GPU compute path. WebGPU compute shaders (WGSL) are an option for the
 future but require tiled matmul kernels that do not exist yet in the codebase.
 For now, all operations run on the CPU via SIMD.
 
-**Threading is有限 by worker count.** Rayon in WASM uses a fixed worker pool
+**Threading is by worker count.** Rayon in WASM uses a fixed worker pool
 (typically `navigator.hardwareConcurrency` workers). Each worker is a Web
 Worker with its own v128 SIMD unit, so parallelisation across matrix rows
 scales linearly up to the available core count.

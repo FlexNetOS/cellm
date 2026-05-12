@@ -19,5 +19,8 @@ vulkan = ["dep:ash"]
 metal = "0.27"
 objc = "0.2"
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wgpu = { version = "24", features = ["webgpu"] }
+
 [dev-dependencies]
 half = { workspace = true }

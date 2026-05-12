@@ -49,6 +49,9 @@ use wasm_bindgen::prelude::*;
 use cellm_sdk::{Engine, EngineConfig, BackendKind, SessionId};
 use tokenizers::Tokenizer;
 
+#[cfg(target_arch = "wasm32")]
+use cellm_kernels::WebGpuBackend;
+
 // ---------------------------------------------------------------------------
 // Panic hook
 // ---------------------------------------------------------------------------
@@ -72,6 +75,8 @@ pub fn init() {
 pub struct CellmEngine {
     engine: Mutex<Engine>,
     tokenizer: RefCell<Option<Tokenizer>>,
+    #[cfg(target_arch = "wasm32")]
+    gpu: Option<WebGpuBackend>,
 }
 
 #[wasm_bindgen]
@@ -100,7 +105,27 @@ impl CellmEngine {
         Ok(CellmEngine {
             engine: Mutex::new(engine),
             tokenizer: RefCell::new(None),
+            #[cfg(target_arch = "wasm32")]
+            gpu: None,
         })
+    }
+
+    /// Try to initialize WebGPU acceleration. Returns true if GPU is available.
+    /// Call with `await engine.try_init_webgpu()` from JavaScript.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn try_init_webgpu(&mut self) -> bool {
+        if let Some(gpu) = WebGpuBackend::create().await {
+            self.gpu = Some(gpu);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Check whether WebGPU acceleration is active.
+    pub fn has_gpu(&self) -> bool {
+        #[cfg(target_arch = "wasm32")] { self.gpu.is_some() }
+        #[cfg(not(target_arch = "wasm32"))] false
     }
 
     /// Set the tokenizer from a JSON string (contents of `tokenizer.json`).
@@ -108,7 +133,18 @@ impl CellmEngine {
     /// Must be called before `tokenize()` or `decode()`.
     pub fn set_tokenizer(&self, tokenizer_json: &str) -> Result<(), JsValue> {
         let tokenizer = Tokenizer::from_bytes(tokenizer_json.as_bytes())
-            .map_err(|e| JsValue::from_str(&format!("CellmEngine::set_tokenizer: {e}")))?;
+            .map_err(|e| {
+                let snippet = if tokenizer_json.len() > 100 {
+                    &tokenizer_json[..100]
+                } else {
+                    tokenizer_json
+                };
+                JsValue::from_str(&format!(
+                    "CellmEngine::set_tokenizer: {e} (json len={}, snippet='{}...')",
+                    tokenizer_json.len(),
+                    snippet
+                ))
+            })?;
         *self.tokenizer.borrow_mut() = Some(tokenizer);
         Ok(())
     }
