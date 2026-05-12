@@ -956,7 +956,14 @@ DeepSeek-V4 introduces a high-efficiency architecture featuring:
   --model models/to-huggingface/nanowhale-100m-v1/nanowhale-100m-v1.cellm \
   --tokenizer models/to-huggingface/nanowhale-100m-v1/tokenizer.json \
   --prompt "What are 3 benefits of exercise?" \
-  --gen 32 --backend cpu
+  --gen 100 --backend cpu
+
+
+  ./target/release/infer \
+  --model models/to-huggingface/nanowhale-100m-v1/nanowhale-100m-v1.cellm \
+  --tokenizer models/to-huggingface/nanowhale-100m-v1/tokenizer.json \
+  --prompt "What are 3 benefits of exercise?" \
+  --gen 100 --backend metal
 
 
   ./target/release/infer \

@@ -1,4 +1,5 @@
 // Author: Jeffrey Asante (https://jeffasante.github.io/)
+// Ported to cellm from https://github.com/cmpatino/nanowhale-100m/blob/main/modeling_deepseek_v4.py
 use cellm_cache::{KVCache, PageTable};
 use cellm_core::CoreError;
 use cellm_kernels::cpu_kernels::{softmax_f32_inplace};
@@ -22,6 +23,50 @@ pub struct DeepSeekV4Runner {
 impl DeepSeekV4Runner {
     pub fn load(path: &Path) -> Result<Self, CoreError> {
         let file = CellmFile::load(path).map_err(|e| CoreError::Backend(e.to_string()))?;
+        let h = file.header.clone();
+
+        // Extract V4 specifics from header
+        let hc_mult = h.hc_mult.unwrap_or(4);
+        let hc_sinkhorn_iters = h.hc_sinkhorn_iters.unwrap_or(2);
+
+        let cfg = ModelConfig {
+            vocab_size: h.vocab_size,
+            hidden_size: h.hidden_dim,
+            num_hidden_layers: h.num_layers,
+            num_attention_heads: h.num_heads,
+            num_key_value_heads: h.num_kv_heads,
+            intermediate_size: h.intermediate_size,
+            rms_norm_eps: h.rms_norm_eps,
+            rope_theta: h.rope_theta,
+            head_dim: h.head_dim.unwrap_or(0),
+            attention_softcap: 0.0,
+            hc_mult: Some(hc_mult),
+            hc_sinkhorn_iters: Some(hc_sinkhorn_iters),
+            o_groups: h.o_groups,
+            o_lora_rank: h.o_lora_rank,
+            q_lora_rank: h.q_lora_rank,
+            qk_rope_head_dim: h.qk_rope_head_dim,
+            n_routed_experts: h.n_routed_experts,
+            num_experts_per_tok: h.num_experts_per_tok,
+            moe_intermediate_size: h.moe_intermediate_size,
+            hc_eps: h.hc_eps,
+            ..ModelConfig::default()
+        };
+
+        Ok(Self {
+            file,
+            cfg,
+            hc_mult,
+            hc_sinkhorn_iters,
+            o_groups: h.o_groups.unwrap_or(2),
+            o_lora_rank: h.o_lora_rank.unwrap_or(80),
+            eos_token_id: h.eos_token_id,
+            max_layers: h.num_layers,
+            weight_cache: std::collections::HashMap::new(),
+        })
+    }
+
+    pub fn from_file(file: CellmFile) -> Result<Self, CoreError> {
         let h = file.header.clone();
 
         // Extract V4 specifics from header

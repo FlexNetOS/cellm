@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use cellm_cache::{KVCache, KvEncodingKind, KvStorageKind, PageTable};
 use cellm_core::KvCacheLayout;
-use cellm_model::{gemma::GemmaRunner, llama::LlamaRunner, qwen::QwenRunner, lfm::LfmRunner, CellmFile, ModelConfig};
+use cellm_model::{gemma::GemmaRunner, llama::LlamaRunner, qwen::QwenRunner, lfm::LfmRunner, deepseek_v4::DeepSeekV4Runner, CellmFile, ModelConfig};
 use cellm_scheduler::{BatchDetector, BatchGroup, BatchSessionInfo, PolicyExecutor, RoundRobinScheduler, SchedulingPlan, SchedulingPolicy, Session as SchedSession, SessionState, ThermalLevel, ThermalPolicy};
 use serde_json::Value;
 
@@ -100,6 +100,7 @@ enum Runner {
     Gemma(GemmaRunner),
     Qwen(QwenRunner),
     Lfm(LfmRunner),
+    DeepSeekV4(DeepSeekV4Runner),
 }
 
 impl Runner {
@@ -119,6 +120,13 @@ impl Runner {
             Runner::Lfm(r) => {
                 r.prefill(tokens, start_pos, pt, kv).map_err(|e| anyhow::anyhow!(e))
             }
+            Runner::DeepSeekV4(r) => {
+                // Fallback for DeepSeekV4
+                for (i, &tok) in tokens.iter().enumerate() {
+                    r.step_topk(tok, start_pos + i, pt, kv, 0).map_err(|e| anyhow::anyhow!(e))?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -128,6 +136,7 @@ impl Runner {
             Runner::Gemma(r) => Some(token) == r.eos_token_id,
             Runner::Qwen(r) => Some(token) == r.eos_token_id,
             Runner::Lfm(r) => Some(token) == r.eos_token_id,
+            Runner::DeepSeekV4(r) => Some(token) == r.eos_token_id,
         }
     }
 
@@ -137,6 +146,7 @@ impl Runner {
             Runner::Gemma(r) => r.eos_token_id,
             Runner::Qwen(r) => r.eos_token_id,
             Runner::Lfm(r) => r.eos_token_id,
+            Runner::DeepSeekV4(r) => r.eos_token_id,
         }
     }
 }
@@ -189,6 +199,7 @@ impl Engine {
             t if t.starts_with("gemma") => Runner::Gemma(GemmaRunner::load(model_path)?),
             t if t.starts_with("qwen") => Runner::Qwen(QwenRunner::load(model_path)?),
             t if t.starts_with("lfm") => Runner::Lfm(LfmRunner::load(model_path)?),
+            "deepseek_v4" => Runner::DeepSeekV4(DeepSeekV4Runner::load(model_path)?),
             other => anyhow::bail!(
                 "unsupported model_type for Engine: model_type={} effective_text_model_type={other}",
                 header.model_type
@@ -216,6 +227,9 @@ impl Engine {
                 Runner::Lfm(r) => {
                     r.enable_metal_full_backend();
                 }
+                Runner::DeepSeekV4(r) => {
+                    r.enable_metal_full_backend();
+                }
             }
         }
 
@@ -224,6 +238,7 @@ impl Engine {
             Runner::Gemma(r) => r.config().clone(),
             Runner::Qwen(r) => r.config().clone(),
             Runner::Lfm(r) => r.config().clone(),
+            Runner::DeepSeekV4(r) => r.config().clone(),
         };
 
         let head_dim = match &runner {
@@ -231,6 +246,7 @@ impl Engine {
             Runner::Gemma(_) => infer_gemma_kv_head_dim(&file)?,
             Runner::Qwen(_) => infer_qwen_kv_head_dim(&file)?,
             Runner::Lfm(_) => cfg.hidden_size / cfg.num_attention_heads,
+            Runner::DeepSeekV4(_) => cfg.head_dim,
         };
 
         let layout = KvCacheLayout {
@@ -315,6 +331,7 @@ impl Engine {
                 hd
             }
             t if t.starts_with("lfm") => header.hidden_dim / header.num_heads,
+            "deepseek_v4" => header.head_dim.unwrap_or(0),
             _ => header.hidden_dim / header.num_heads.max(1),
         };
 
@@ -327,6 +344,7 @@ impl Engine {
             ),
             t if t.starts_with("qwen") => Runner::Qwen(QwenRunner::from_file(file)?),
             t if t.starts_with("lfm") => Runner::Lfm(LfmRunner::from_file(file)?),
+            "deepseek_v4" => Runner::DeepSeekV4(DeepSeekV4Runner::from_file(file)?),
             other => anyhow::bail!(
                 "unsupported model_type for Engine: model_type={} effective_text_model_type={other}",
                 header.model_type
@@ -338,6 +356,7 @@ impl Engine {
             Runner::Gemma(r) => r.config().clone(),
             Runner::Qwen(r) => r.config().clone(),
             Runner::Lfm(r) => r.config().clone(),
+            Runner::DeepSeekV4(r) => r.config().clone(),
         };
 
         let layout = KvCacheLayout {
@@ -513,6 +532,9 @@ impl Engine {
                 r.step_topk(tok, pos, &mut s.page_table, &mut self.kv_cache, self.top_k)?
             }
             Runner::Lfm(r) => {
+                r.step_topk(tok, pos, &mut s.page_table, &mut self.kv_cache, self.top_k)?
+            }
+            Runner::DeepSeekV4(r) => {
                 r.step_topk(tok, pos, &mut s.page_table, &mut self.kv_cache, self.top_k)?
             }
         };
@@ -931,6 +953,7 @@ impl Engine {
                 }
                 Runner::Qwen(r) => r.step_topk(cur, pos, &mut s.page_table, &mut self.kv_cache, top_k)?,
                 Runner::Lfm(r) => r.step_topk(cur, pos, &mut s.page_table, &mut self.kv_cache, top_k)?,
+                Runner::DeepSeekV4(r) => r.step_topk(cur, pos, &mut s.page_table, &mut self.kv_cache, top_k)?,
             };
             if let Runner::Gemma(r) = &self.runner {
                 if r.is_gemma3_text() {
