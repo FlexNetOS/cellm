@@ -332,7 +332,7 @@ fn throw(_env: *const JNIEnv, _msg: &str) {
     unsafe { (*_env).throw_new(_msg); }
 }
 
-// ─── Engine JNI 
+// Engine JNI 
 
 #[no_mangle]
 pub extern "system" fn Java_com_cellm_sdk_CellmEngine_nativeCreate(

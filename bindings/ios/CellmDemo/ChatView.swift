@@ -227,6 +227,7 @@ struct ChatView: View {
                 Section("Smart Presets") {
                     Button(statusLabel("Gemma 3 (Stable)", file: DemoAssetLinks.gemma4E2BFileName)) { selectGemmaPreset() }
                     Button(statusLabel("Qwen 3.5 (Stable)", file: DemoAssetLinks.qwen35FileName)) { selectQwenPreset() }
+                    Button(statusLabel("NanoWhale (MLA+MoE)", file: DemoAssetLinks.nanowhaleFileName)) { selectNanoWhalePreset() }
                     Button(statusLabel("LFM 2.5 (Liquid)", file: DemoAssetLinks.lfm25FileName)) { selectLFMPreset() }
                     Button(statusLabel("SmolLM 2 (Fast)", file: DemoAssetLinks.smollm2FileName)) { selectSmolPreset() }
                     Button(statusLabel("Bonsai 1.7B (1-Bit)", file: DemoAssetLinks.bonsai1B1BitFileName)) { selectBonsaiPreset() }
@@ -1072,6 +1073,19 @@ struct ChatView: View {
         }
     }
 
+    private func selectNanoWhalePreset(silentOnMissing: Bool = false) {
+        let model = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.nanowhaleFileName)
+        let tok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.nanowhaleTokenizerFileName)
+        if let model, let tok {
+            llmModelURL = model
+            llmTokenizerURL = tok
+            selectedSampleLabel = "NanoWhale (MLA+MoE)"
+            errorText = nil
+        } else if !silentOnMissing {
+            errorText = "NanoWhale files not found. Download from Model Hub."
+        }
+    }
+
     private func selectBonsaiPreset(silentOnMissing: Bool = false) {
         let model = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.bonsai1B1BitFileName)
         let tok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.bonsai1B1BitTokenizerFileName)
@@ -1123,6 +1137,7 @@ struct ChatView: View {
                     tokenizer: tok,
                     backend: backend
                 )
+                if Task.isCancelled { return }
                 await MainActor.run {
                     cachedEngine = eng
                     cachedTokenizer = tok

@@ -112,6 +112,8 @@ struct ConcurrentChatView: View {
                     Section("Presets") {
                         Button("Gemma 4") { loadPreset(DemoAssetLinks.gemma4E2BFileName, DemoAssetLinks.gemma4E2BTokenizerFileName, "Gemma-4") }
                         Button("Qwen 2.5") { loadPreset(DemoAssetLinks.qwen25FileName, DemoAssetLinks.qwen25TokenizerFileName, "Qwen2.5") }
+                        Button("NanoWhale (MLA+MoE)") { loadPreset(DemoAssetLinks.nanowhaleFileName, DemoAssetLinks.nanowhaleTokenizerFileName, "NanoWhale") }
+                        Button("LFM 2.5 (Liquid)") { loadPreset(DemoAssetLinks.lfm25FileName, DemoAssetLinks.lfm25TokenizerFileName, "LFM-2.5") }
                         Button("SmolLM2") { loadPreset(DemoAssetLinks.smollm2FileName, DemoAssetLinks.smollm2TokenizerFileName, "SmolLM2") }
                     }
                     Section("Advanced") {
@@ -348,34 +350,40 @@ struct ConcurrentChatView: View {
 
     private func ensureLoop() {
         guard decodeTask == nil || decodeTask!.isCancelled else { return }
-        decodeTask = Task.detached(priority: .userInitiated) {
+        
+        // Capture a strong reference to the engine if it exists.
+        // If it doesn't exist, we can't start a loop anyway.
+        guard let eng = self.engine else { return }
+        let tok = self.tokenizer
+
+        decodeTask = Task.detached(priority: .userInitiated) { [weak self] in
             while !Task.isCancelled {
-                let active = await MainActor.run { self.threads.contains(where: { $0.generating }) }
+                let active = await MainActor.run { self?.threads.contains(where: { $0.generating }) ?? false }
                 guard active else { try? await Task.sleep(nanoseconds: 20_000_000); continue }
 
                 do {
-                    guard let res = try self.engine?.stepDecode() else {
+                    guard let res = try eng.stepDecode() else {
                         try? await Task.sleep(nanoseconds: 5_000_000); continue
                     }
-                    guard let piece = try? self.tokenizer?.decodeOne(res.token) else { continue }
+                    guard let piece = try? tok?.decodeOne(res.token) else { continue }
 
-                    let modelName = self.modelURL?.lastPathComponent.lowercased() ?? ""
-                    let tokName = self.tokURL?.lastPathComponent.lowercased() ?? ""
+                    let modelName = await MainActor.run { self?.modelURL?.lastPathComponent.lowercased() ?? "" }
+                    let tokName = await MainActor.run { self?.tokURL?.lastPathComponent.lowercased() ?? "" }
                     let stop = Self.isStopPiece(piece, modelName: modelName, tokenizerName: tokName)
 
                     await MainActor.run {
-                        guard let i = self.threads.firstIndex(where: { $0.sessionId == res.session && $0.generating }) else { return }
-                        if let li = self.threads[i].msgs.indices.last,
-                           self.threads[i].msgs[li].role == "Assistant" {
-                            self.threads[i].msgs[li].text += piece
+                        guard let i = self?.threads.firstIndex(where: { $0.sessionId == res.session && $0.generating }) else { return }
+                        if let li = self?.threads[i].msgs.indices.last,
+                           self?.threads[i].msgs[li].role == "Assistant" {
+                            self?.threads[i].msgs[li].text += piece
                         }
-                        self.threads[i].tokCount += 1
-                        if stop || self.threads[i].tokCount >= self.maxTok {
-                            self.threads[i].generating = false
+                        self?.threads[i].tokCount += 1
+                        if stop || self?.threads[i].tokCount >= self?.maxTok ?? 200 {
+                            self?.threads[i].generating = false
                         }
                     }
                 } catch {
-                    await MainActor.run { self.err = String(describing: error) }
+                    await MainActor.run { self?.err = String(describing: error) }
                 }
             }
         }
