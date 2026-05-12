@@ -243,6 +243,12 @@
                 <button id="devLoadBtn" type="button">Load LFM Debug Model</button>
             </div>
             <div id="status" class="status">Waiting for model file...</div>
+            <details id="logDetails" style="margin-top: 0.5rem; font-size: 0.75rem; color: #666; border: 1px solid #eee; border-radius: 4px; background: #fafafa; text-align: left;">
+                <summary style="padding: 0.4rem 0.6rem; cursor: pointer; user-select: none; font-weight: 500; font-size: 0.7rem; color: #888;">
+                    VIEW LOGS
+                </summary>
+                <div id="logContainer" style="max-height: 150px; overflow-y: auto; padding: 0.5rem; border-top: 1px solid #eee; font-family: 'Menlo', 'Monaco', 'Courier New', monospace; white-space: pre-wrap; line-height: 1.4;"></div>
+            </details>
             <div
                 id="presets"
                 style="
@@ -372,6 +378,20 @@ Hello, how are you today?</textarea
                 sid = null,
                 running = false;
             let wasmReadyPromise = null;
+            const logContainer = document.getElementById("logContainer");
+            const logDetails = document.getElementById("logDetails");
+
+            function log(msg, color = "#666") {
+                console.log(msg);
+                const entry = document.createElement("div");
+                entry.style.color = color;
+                entry.style.marginBottom = "2px";
+                const time = new Date().toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+                entry.textContent = `[${time}] ${msg}`;
+                logContainer.appendChild(entry);
+                logContainer.scrollTop = logContainer.scrollHeight;
+                if (color === "red") logDetails.open = true;
+            }
             const $ = (i) => document.getElementById(i);
             const modelFile = $("modelFile"),
                 tokenizerFile = $("tokenizerFile"),
@@ -435,11 +455,26 @@ Hello, how are you today?</textarea
                 devLoadBtn.disabled = true;
                 loadBtn.disabled = true;
                 status.classList.remove("error");
-                status.textContent = `Fetching model from ${devModelUrl}...`;
-                modelBytes = await fetchBytes(devModelUrl);
-                status.textContent = `Model fetched (${(modelBytes.length / 1e6).toFixed(1)} MB). Fetching tokenizer...`;
-                tokenizerJson = await fetchText(devTokenizerUrl);
-                await loadEngine();
+                log("Loading local debug model...");
+                try {
+                    status.textContent = `Fetching model...`;
+                    log(`Fetching model from ${devModelUrl}`);
+                    modelBytes = await fetchBytes(devModelUrl);
+                    log(`Model fetched (${(modelBytes.length / 1e6).toFixed(1)} MB)`);
+                    
+                    status.textContent = `Fetching tokenizer...`;
+                    log(`Fetching tokenizer from ${devTokenizerUrl}`);
+                    tokenizerJson = await fetchText(devTokenizerUrl);
+                    log("Tokenizer fetched");
+                    
+                    await loadEngine();
+                } catch (err) {
+                    log(`Debug load error: ${err}`, "red");
+                    status.textContent = `Error: ${err}`;
+                    status.classList.add("error");
+                } finally {
+                    devLoadBtn.disabled = false;
+                }
             }
 
             async function loadEngine() {
@@ -473,18 +508,32 @@ Hello, how are you today?</textarea
                         scheduling_policy: schedulingPolicy.value,
                         backend: backendSelect.value,
                     });
+                    log("Initializing CellmEngine with wasm-bindgen...");
                     engine = new CellmEngine(modelBytes, config);
+                    log("Engine core created");
                     if (backendSelect.value === "webgpu") {
                         status.textContent = "Initializing WebGPU...";
+                        log("Attempting to initialize WebGPU backend...");
                         const gpuOk = await engine.try_init_webgpu();
                         if (gpuOk) {
                             status.textContent = "WebGPU ready!";
+                            log("WebGPU backend initialized successfully.", "#2e7d32");
                         } else {
                             backendSelect.value = "cpu";
                             status.textContent = "WebGPU unavailable, falling back to CPU...";
+                            log("WebGPU initialization failed or unsupported in this browser. Falling back to CPU.", "#e65100");
                         }
+                    } else {
+                        log("Engine ready. CPU backend active.", "#2e7d32");
                     }
+                    status.textContent = "Setting up tokenizer...";
+                    log("Setting up tokenizer in Rust engine (applying WASM regex patches if needed)...");
                     engine.set_tokenizer(tokenizerJson);
+                    log("Tokenizer setup complete.");
+                    
+                    clearInterval(progressTimer);
+                    const totalTime = ((performance.now() - startedAt) / 1000).toFixed(1);
+                    log(`Initialization complete in ${totalTime}s`, "#2e7d32");
                     inferCard.style.display = "block";
                     genBtn.disabled = false;
                     status.textContent =
@@ -493,6 +542,7 @@ Hello, how are you today?</textarea
                     modelBytes = null;
                     tokenizerJson = null;
                 } catch (err) {
+                    log(`Engine initialization error: ${err}`, "red");
                     status.textContent = `Error: ${err}`;
                     status.classList.add("error");
                     loadBtn.disabled = false;
@@ -528,11 +578,16 @@ Hello, how are you today?</textarea
                     try {
                         status.classList.remove("error");
                         status.textContent = `Fetching model from Hugging Face...`;
+                        log(`Fetching model: ${modelUrl}`);
                         modelBytes = await fetchBytes(modelUrl);
-                        status.textContent = `Model fetched (${(modelBytes.length / 1e6).toFixed(1)} MB). Fetching tokenizer...`;
+                        log(`Model fetched (${(modelBytes.length / 1e6).toFixed(1)} MB)`);
+                        status.textContent = `Model fetched. Fetching tokenizer...`;
+                        log(`Fetching tokenizer: ${tokenizerUrl}`);
                         tokenizerJson = await fetchText(tokenizerUrl);
+                        log("Tokenizer fetched");
                         await loadEngine();
                     } catch (err) {
+                        log(`Preset error: ${err}`, "red");
                         status.textContent = `Error: ${err}`;
                         status.classList.add("error");
                     } finally {
