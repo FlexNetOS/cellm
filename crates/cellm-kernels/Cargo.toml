@@ -9,8 +9,8 @@ cellm-core = { path = "../cellm-core" }
 anyhow = { workspace = true }
 rayon = { workspace = true }
 half = { workspace = true }
-bytemuck = { workspace = true }
-wgpu = { version = "0.20", features = ["webgpu"], optional = true }
+bytemuck = { workspace = true, features = ["derive"] }
+wgpu = { version = "24", features = ["webgpu"], optional = true }
 ash = { version = "0.38", optional = true }
 
 [features]

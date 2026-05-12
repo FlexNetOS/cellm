@@ -1,0 +1,340 @@
+warning: cellm-kernels@0.1.0: Compiling matmul_f32.glsl
+warning: cellm-kernels@0.1.0:   ok matmul_f32.spv
+warning: cellm-kernels@0.1.0: Compiling attention_f32.glsl
+warning: cellm-kernels@0.1.0:   ok attention_f32.spv
+warning: cellm-kernels@0.1.0: Compiling rms_norm_f32.glsl
+warning: cellm-kernels@0.1.0:   ok rms_norm_f32.spv
+warning: cellm-kernels@0.1.0: Compiling rope_f32.glsl
+warning: cellm-kernels@0.1.0:   ok rope_f32.spv
+warning: cellm-kernels@0.1.0: Compiling silu_f32.glsl
+warning: cellm-kernels@0.1.0:   ok silu_f32.spv
+warning: cellm-kernels@0.1.0: Compiling add_f32.glsl
+warning: cellm-kernels@0.1.0:   ok add_f32.spv
+warning: cellm-kernels@0.1.0: Compiling mul_f32.glsl
+warning: cellm-kernels@0.1.0:   ok mul_f32.spv
+warning: cellm-kernels@0.1.0: Compiling softmax_f32.glsl
+warning: cellm-kernels@0.1.0:   ok softmax_f32.spv
+warning: variant `Q4_K` should have an upper camel case name
+  --> crates/cellm-core/src/dtype.rs:15:5
+   |
+15 |     Q4_K,
+   |     ^^^^ help: convert the identifier to upper camel case: `Q4K`
+   |
+   = note: `#[warn(non_camel_case_types)]` (part of `#[warn(nonstandard_style)]`) on by default
+
+warning: `cellm-core` (lib) generated 1 warning
+warning: unused import: `std::sync::Mutex`
+ --> crates/cellm-kernels/src/metal.rs:8:5
+  |
+8 | use std::sync::Mutex;
+  |     ^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `std::collections::HashMap`
+ --> crates/cellm-kernels/src/metal.rs:9:5
+  |
+9 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::collections::HashMap`
+  --> crates/cellm-kernels/src/vulkan.rs:20:5
+   |
+20 | use std::collections::HashMap;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::ffi::CString`
+  --> crates/cellm-kernels/src/vulkan.rs:21:5
+   |
+21 | use std::ffi::CString;
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::sync::Mutex`
+  --> crates/cellm-kernels/src/vulkan.rs:22:5
+   |
+22 | use std::sync::Mutex;
+   |     ^^^^^^^^^^^^^^^^
+
+warning: unused variable: `a`
+   --> crates/cellm-kernels/src/vulkan.rs:427:9
+    |
+427 |         a: &TensorView,
+    |         ^ help: if this is intentional, prefix it with an underscore: `_a`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `b`
+   --> crates/cellm-kernels/src/vulkan.rs:428:9
+    |
+428 |         b: &TensorView,
+    |         ^ help: if this is intentional, prefix it with an underscore: `_b`
+
+warning: unused variable: `out`
+   --> crates/cellm-kernels/src/vulkan.rs:429:9
+    |
+429 |         out: &mut TensorView,
+    |         ^^^ help: if this is intentional, prefix it with an underscore: `_out`
+
+warning: unused variable: `arena`
+   --> crates/cellm-kernels/src/vulkan.rs:430:9
+    |
+430 |         arena: &[u8],
+    |         ^^^^^ help: if this is intentional, prefix it with an underscore: `_arena`
+
+warning: unused variable: `x`
+   --> crates/cellm-kernels/src/vulkan.rs:441:9
+    |
+441 |         x: &TensorView,
+    |         ^ help: if this is intentional, prefix it with an underscore: `_x`
+
+warning: unused variable: `weight`
+   --> crates/cellm-kernels/src/vulkan.rs:442:9
+    |
+442 |         weight: &TensorView,
+    |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_weight`
+
+warning: unused variable: `out`
+   --> crates/cellm-kernels/src/vulkan.rs:443:9
+    |
+443 |         out: &mut TensorView,
+    |         ^^^ help: if this is intentional, prefix it with an underscore: `_out`
+
+warning: unused variable: `eps`
+   --> crates/cellm-kernels/src/vulkan.rs:444:9
+    |
+444 |         eps: f32,
+    |         ^^^ help: if this is intentional, prefix it with an underscore: `_eps`
+
+warning: unused variable: `arena`
+   --> crates/cellm-kernels/src/vulkan.rs:445:9
+    |
+445 |         arena: &[u8],
+    |         ^^^^^ help: if this is intentional, prefix it with an underscore: `_arena`
+
+warning: unused variable: `q`
+   --> crates/cellm-kernels/src/vulkan.rs:454:9
+    |
+454 |         q: &mut TensorView,
+    |         ^ help: if this is intentional, prefix it with an underscore: `_q`
+
+warning: unused variable: `k`
+   --> crates/cellm-kernels/src/vulkan.rs:455:9
+    |
+455 |         k: &mut TensorView,
+    |         ^ help: if this is intentional, prefix it with an underscore: `_k`
+
+warning: unused variable: `positions`
+   --> crates/cellm-kernels/src/vulkan.rs:456:9
+    |
+456 |         positions: &[usize],
+    |         ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_positions`
+
+warning: unused variable: `theta`
+   --> crates/cellm-kernels/src/vulkan.rs:457:9
+    |
+457 |         theta: f32,
+    |         ^^^^^ help: if this is intentional, prefix it with an underscore: `_theta`
+
+warning: unused variable: `arena`
+   --> crates/cellm-kernels/src/vulkan.rs:458:9
+    |
+458 |         arena: &mut [u8],
+    |         ^^^^^ help: if this is intentional, prefix it with an underscore: `_arena`
+
+warning: unused variable: `x`
+   --> crates/cellm-kernels/src/vulkan.rs:467:9
+    |
+467 |         x: &TensorView,
+    |         ^ help: if this is intentional, prefix it with an underscore: `_x`
+
+warning: unused variable: `out`
+   --> crates/cellm-kernels/src/vulkan.rs:468:9
+    |
+468 |         out: &mut TensorView,
+    |         ^^^ help: if this is intentional, prefix it with an underscore: `_out`
+
+warning: unused variable: `arena`
+   --> crates/cellm-kernels/src/vulkan.rs:469:9
+    |
+469 |         arena: &[u8],
+    |         ^^^^^ help: if this is intentional, prefix it with an underscore: `_arena`
+
+warning: unused variable: `a`
+   --> crates/cellm-kernels/src/vulkan.rs:478:9
+    |
+478 |         a: &TensorView,
+    |         ^ help: if this is intentional, prefix it with an underscore: `_a`
+
+warning: unused variable: `b`
+   --> crates/cellm-kernels/src/vulkan.rs:479:9
+    |
+479 |         b: &TensorView,
+    |         ^ help: if this is intentional, prefix it with an underscore: `_b`
+
+warning: unused variable: `out`
+   --> crates/cellm-kernels/src/vulkan.rs:480:9
+    |
+480 |         out: &mut TensorView,
+    |         ^^^ help: if this is intentional, prefix it with an underscore: `_out`
+
+warning: unused variable: `arena`
+   --> crates/cellm-kernels/src/vulkan.rs:481:9
+    |
+481 |         arena: &[u8],
+    |         ^^^^^ help: if this is intentional, prefix it with an underscore: `_arena`
+
+warning: unused variable: `a`
+   --> crates/cellm-kernels/src/vulkan.rs:490:9
+    |
+490 |         a: &TensorView,
+    |         ^ help: if this is intentional, prefix it with an underscore: `_a`
+
+warning: unused variable: `b`
+   --> crates/cellm-kernels/src/vulkan.rs:491:9
+    |
+491 |         b: &TensorView,
+    |         ^ help: if this is intentional, prefix it with an underscore: `_b`
+
+warning: unused variable: `out`
+   --> crates/cellm-kernels/src/vulkan.rs:492:9
+    |
+492 |         out: &mut TensorView,
+    |         ^^^ help: if this is intentional, prefix it with an underscore: `_out`
+
+warning: unused variable: `arena`
+   --> crates/cellm-kernels/src/vulkan.rs:493:9
+    |
+493 |         arena: &[u8],
+    |         ^^^^^ help: if this is intentional, prefix it with an underscore: `_arena`
+
+warning: unused variable: `x`
+   --> crates/cellm-kernels/src/vulkan.rs:502:9
+    |
+502 |         x: &mut TensorView,
+    |         ^ help: if this is intentional, prefix it with an underscore: `_x`
+
+warning: unused variable: `arena`
+   --> crates/cellm-kernels/src/vulkan.rs:503:9
+    |
+503 |         arena: &mut [u8],
+    |         ^^^^^ help: if this is intentional, prefix it with an underscore: `_arena`
+
+warning: unused variable: `q`
+   --> crates/cellm-kernels/src/vulkan.rs:512:9
+    |
+512 |         q: &TensorView,
+    |         ^ help: if this is intentional, prefix it with an underscore: `_q`
+
+warning: unused variable: `k`
+   --> crates/cellm-kernels/src/vulkan.rs:513:9
+    |
+513 |         k: &TensorView,
+    |         ^ help: if this is intentional, prefix it with an underscore: `_k`
+
+warning: unused variable: `v`
+   --> crates/cellm-kernels/src/vulkan.rs:514:9
+    |
+514 |         v: &TensorView,
+    |         ^ help: if this is intentional, prefix it with an underscore: `_v`
+
+warning: unused variable: `n_heads`
+   --> crates/cellm-kernels/src/vulkan.rs:515:9
+    |
+515 |         n_heads: usize,
+    |         ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_n_heads`
+
+warning: unused variable: `n_kv_heads`
+   --> crates/cellm-kernels/src/vulkan.rs:516:9
+    |
+516 |         n_kv_heads: usize,
+    |         ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_n_kv_heads`
+
+warning: unused variable: `out`
+   --> crates/cellm-kernels/src/vulkan.rs:517:9
+    |
+517 |         out: &mut TensorView,
+    |         ^^^ help: if this is intentional, prefix it with an underscore: `_out`
+
+warning: unused variable: `arena`
+   --> crates/cellm-kernels/src/vulkan.rs:518:9
+    |
+518 |         arena: &[u8],
+    |         ^^^^^ help: if this is intentional, prefix it with an underscore: `_arena`
+
+warning: unused variable: `scratch`
+   --> crates/cellm-kernels/src/vulkan.rs:519:9
+    |
+519 |         scratch: &mut Vec<f32>,
+    |         ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_scratch`
+
+warning: value assigned to `dot` is never read
+   --> crates/cellm-kernels/src/wasm.rs:137:27
+    |
+137 |             let mut dot = 0.0f32;
+    |                           ^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `dot` is never read
+   --> crates/cellm-kernels/src/wasm.rs:236:27
+    |
+236 |             let mut dot = 0.0f32;
+    |                           ^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: value assigned to `dot` is never read
+   --> crates/cellm-kernels/src/wasm.rs:442:27
+    |
+442 |             let mut dot = 0.0f32;
+    |                           ^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: function `unpack_i4` is never used
+ --> crates/cellm-kernels/src/cpu_kernels.rs:7:4
+  |
+7 | fn unpack_i4(packed_row: &[u8], idx: usize) -> f32 {
+  |    ^^^^^^^^^
+  |
+  = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `ELEM_OPS_SHADER` is never used
+   --> crates/cellm-kernels/src/metal.rs:500:7
+    |
+500 | const ELEM_OPS_SHADER: &str = r#"
+    |       ^^^^^^^^^^^^^^^
+
+warning: constant `COPY_SHADER` is never used
+    --> crates/cellm-kernels/src/metal.rs:1410:7
+     |
+1410 | const COPY_SHADER: &str = r#"
+     |       ^^^^^^^^^^^
+
+warning: fields `workgroup_count` and `shared_mem_size` are never read
+  --> crates/cellm-kernels/src/vulkan.rs:81:5
+   |
+62 | pub struct VulkanBackend {
+   |            ------------- fields in this struct
+...
+81 |     workgroup_count: u32,
+   |     ^^^^^^^^^^^^^^^
+82 |     /// Maximum shared memory size in bytes.
+83 |     shared_mem_size: usize,
+   |     ^^^^^^^^^^^^^^^
+
+warning: struct `KernelParams` is never constructed
+   --> crates/cellm-kernels/src/vulkan.rs:532:8
+    |
+532 | struct KernelParams {
+    |        ^^^^^^^^^^^^
+
+warning: function `unpack_i4` is never used
+  --> crates/cellm-kernels/src/wasm.rs:13:4
+   |
+13 | fn unpack_i4(packed_row: &[u8], idx: usize) -> f32 {
+   |    ^^^^^^^^^
+
+warning: `cellm-kernels` (lib) generated 49 warnings (run `cargo fix --lib -p cellm-kernels` to apply 40 suggestions)
+    Finished `release` profile [optimized] target(s) in 0.20s

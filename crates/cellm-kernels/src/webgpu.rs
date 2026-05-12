@@ -279,7 +279,7 @@ impl WebGpuBackend {
     /// Create a WebGPU backend with pre-compiled shaders.
     /// Returns `None` if WebGPU is unavailable (falls back to CPU).
     pub async fn create() -> Option<Self> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
             ..Default::default()
         });
@@ -332,8 +332,9 @@ impl WebGpuBackend {
                 label: Some(entry),
                 layout: None,
                 module: &sm,
-                entry_point: entry,
+                entry_point: Some(entry),
                 compilation_options: Default::default(),
+                cache: None,
             })
         };
 
