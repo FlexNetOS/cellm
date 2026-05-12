@@ -365,6 +365,7 @@ fn deserialize_config(json: &str) -> Result<EngineConfig, JsValue> {
         seed: u64,
         #[serde(default)]
         scheduling_policy: String,
+
     }
 
     fn default_tokens_per_block() -> usize { 16 }
