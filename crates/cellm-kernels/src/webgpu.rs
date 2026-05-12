@@ -1,3 +1,4 @@
+#![cfg(feature = "webgpu")]
 // Author: Jeffrey Asante (https://jeffasante.github.io/)
 //! WebGPU compute-kernel backend for cellm.
 //
@@ -278,8 +279,8 @@ impl WebGpuBackend {
     /// Create a WebGPU backend with pre-compiled shaders.
     /// Returns `None` if WebGPU is unavailable (falls back to CPU).
     pub async fn create() -> Option<Self> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::BROWSER_WEBGPU,
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY,
             ..Default::default()
         });
 
@@ -331,9 +332,8 @@ impl WebGpuBackend {
                 label: Some(entry),
                 layout: None,
                 module: &sm,
-                entry_point: Some(entry),
+                entry_point: entry,
                 compilation_options: Default::default(),
-                cache: None,
             })
         };
 

@@ -330,6 +330,11 @@ Hello, how are you today?</textarea
                     <option value="LatencyFirst">Latency First</option>
                     <option value="ThroughputFirst">Throughput</option>
                 </select>
+                <span style="font-size: 0.8rem; color: #888">Backend:</span>
+                <select id="backendSelect">
+                    <option value="cpu">CPU</option>
+                    <option value="webgpu" disabled>WebGPU (beta)</option>
+                </select>
                 <button id="genBtn" disabled>Generate</button>
                 <button id="stopBtn" disabled>Stop</button>
             </div>
@@ -377,6 +382,7 @@ Hello, how are you today?</textarea
                 prompt = $("prompt");
             const maxTokens = $("maxTokens"),
                 schedulingPolicy = $("schedulingPolicy");
+            const backendSelect = $("backendSelect");
             const genBtn = $("genBtn"),
                 stopBtn = $("stopBtn"),
                 output = $("output");
@@ -467,6 +473,16 @@ Hello, how are you today?</textarea
                         scheduling_policy: schedulingPolicy.value,
                     });
                     engine = new CellmEngine(modelBytes, config);
+                    if (backendSelect.value === "webgpu") {
+                        status.textContent = "Initializing WebGPU...";
+                        const gpuOk = await engine.try_init_webgpu();
+                        if (gpuOk) {
+                            status.textContent = "WebGPU ready!";
+                        } else {
+                            backendSelect.value = "cpu";
+                            status.textContent = "WebGPU unavailable, falling back to CPU...";
+                        }
+                    }
                     engine.set_tokenizer(tokenizerJson);
                     inferCard.style.display = "block";
                     genBtn.disabled = false;
