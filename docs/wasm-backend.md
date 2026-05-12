@@ -270,6 +270,66 @@ server that adds these headers, or use the `wasm-pack` test server:
 ```bash
 wasm-pack test --firefox --headless
 ```
+### Testing with Node.js
+
+The WASM module can also be tested directly from Node.js without a browser.
+This is useful for benchmarking, CI pipelines, and debugging.
+
+```bash
+# Requirements: Node >= 18 (WASM SIMD enabled by default)
+# WebGPU: Node >= 22 with --experimental-webgpu
+
+node docs/wasm/test-node.mjs <model.cellm> <tokenizer.json>
+```
+
+The test script (`docs/wasm/test-node.mjs`) loads the WASM module, creates an
+engine, tokenizes a prompt, and runs a decode loop using `step_decode()`.
+
+Example runs:
+
+```
+# NanoWhale-100M (~18 tok/s on Apple M-series)
+$ node docs/wasm/test-node.mjs models/nanowhale-100m.cellm models/nanowhale-100m/tokenizer.json
+Model: 220.8MB, Tokens: 9.2MB
+ Your response should contain at least 3...
+50 tokens in 2738.1ms (18.3 tok/s)
+
+# Qwen2.5-0.5B int8 (~1.7 tok/s)
+$ node docs/wasm/test-node.mjs models/to-huggingface/qwen2.5-0.5b-int8-v1/qwen2.5-0.5b-int8-v1.cellm models/to-huggingface/qwen2.5-0.5b-int8-v1/tokenizer.json
+Model: 495.1MB, Tokens: 6.2MB
+50 tokens in 29845.0ms (1.7 tok/s)
+```
+
+**Note:** `engine.generate()` currently returns empty on WASM.
+Use the manual `step_decode()` loop instead:
+
+```js
+const sid = engine.create_session();
+let tok = engine.submit_tokens(sid, inputIds);
+let count = 0;
+while (count < maxTokens) {
+  count++;
+  process.stdout.write(engine.decode(new Uint32Array([tok])));
+  if (engine.is_stop_token(tok)) break;
+  const r = engine.step_decode();
+  if (!r) break;
+  tok = r[1]; // r = [session_id, token_id]
+}
+```
+
+For WebGPU testing (Node >= 22):
+
+```bash
+node --experimental-webgpu docs/wasm/test-node.mjs --webgpu \
+  models/nanowhale-100m.cellm models/nanowhale-100m/tokenizer.json
+```
+
+| Model | Size | WASM SIMD | Notes |
+|---|---|---|---|
+| NanoWhale-100M (f16) | 220 MB | ~18 tok/s | Compute-bound, good WASM fit |
+| Qwen2.5-0.5B (int8) | 495 MB | ~1.7 tok/s | Memory-bound, int8 dequant overhead |
+
+
 
 ## Limitations and Future Work
 
