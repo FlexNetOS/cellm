@@ -83,6 +83,10 @@ struct GemmaPerLayerInputSpec {
 impl GemmaRunner {
     pub fn load(path: &Path) -> Result<Self, CoreError> {
         let file = CellmFile::load(path)?;
+        Self::from_file(file)
+    }
+
+    pub fn from_file(file: CellmFile) -> Result<Self, CoreError> {
         let h = file.header.clone();
 
         let cfg = ModelConfig {

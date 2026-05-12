@@ -336,12 +336,8 @@ impl Engine {
         };
 
         let mut runner = match text_model_type.as_str() {
-            "llama" | "smollm3" => anyhow::bail!(
-                "in-memory Engine loading is not implemented for {text_model_type}"
-            ),
-            t if t.starts_with("gemma") => anyhow::bail!(
-                "in-memory Engine loading is not implemented for {t}"
-            ),
+            "llama" | "smollm3" => Runner::Llama(LlamaRunner::from_file(file)?),
+            t if t.starts_with("gemma") => Runner::Gemma(GemmaRunner::from_file(file)?),
             t if t.starts_with("qwen") => Runner::Qwen(QwenRunner::from_file(file)?),
             t if t.starts_with("lfm") => Runner::Lfm(LfmRunner::from_file(file)?),
             "deepseek_v4" => Runner::DeepSeekV4(DeepSeekV4Runner::from_file(file)?),

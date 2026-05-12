@@ -267,17 +267,17 @@ impl CellmEngine {
 
     /// Total tokens generated so far across all sessions.
     pub fn total_tokens_generated(&self) -> f64 {
-        self.engine.lock().unwrap().total_tokens_generated() as f64
+        self.engine.try_lock().map(|e| e.total_tokens_generated() as f64).unwrap_or(0.0)
     }
 
     /// Number of active (non-terminated) sessions.
     pub fn num_active_sessions(&self) -> u32 {
-        self.engine.lock().unwrap().num_active_sessions() as u32
+        self.engine.try_lock().map(|e| e.num_active_sessions() as u32).unwrap_or(0)
     }
 
     /// Number of free KV cache blocks remaining.
     pub fn num_free_blocks(&self) -> u32 {
-        self.engine.lock().unwrap().num_free_blocks() as u32
+        self.engine.try_lock().map(|e| e.num_free_blocks() as u32).unwrap_or(0)
     }
 
     /// Model EOS token id, or -1 when the model metadata does not provide one.

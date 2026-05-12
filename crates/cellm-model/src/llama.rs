@@ -54,6 +54,10 @@ enum LlamaLinearBackend {
 impl LlamaRunner {
     pub fn load(path: &Path) -> Result<Self, CoreError> {
         let file = CellmFile::load(path)?;
+        Self::from_file(file)
+    }
+
+    pub fn from_file(file: CellmFile) -> Result<Self, CoreError> {
         let h = file.header.clone();
 
         let cfg = ModelConfig {
@@ -487,6 +491,7 @@ impl LlamaRunner {
         let mut t_norm_ns = 0u64;
         let mut t_rope_ns = 0u64;
         let mut t_other_ns = 0u64;
+        #[cfg(not(target_arch = "wasm32"))]
         let t_step_start = std::time::Instant::now();
         let mut attn_norm_w = vec![0.0f32; hidden];
         let mut x_norm = vec![0.0f32; hidden];
@@ -535,6 +540,7 @@ impl LlamaRunner {
             let use_metal_rope = self.metal_ops.is_some() && self.use_metal_rope && self.rope_interleaved;
 
             // Attention input norm.
+            #[cfg(not(target_arch = "wasm32"))]
             let t0 = std::time::Instant::now();
             let ln = &layer_names[layer];
             if use_metal_norm {
@@ -553,9 +559,13 @@ impl LlamaRunner {
                 )?;
                 rms_norm_f32(&x, &attn_norm_w, cfg.rms_norm_eps, &mut x_norm);
             }
-            t_norm_ns += t0.elapsed().as_nanos() as u64;
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                t_norm_ns += t0.elapsed().as_nanos() as u64;
+            }
 
             // QKV projections (HF weights are [out, in]).
+            #[cfg(not(target_arch = "wasm32"))]
             let t0 = std::time::Instant::now();
             let fused_qkv = self.linear_qkv_f16_out_in(
                 &x_norm,
@@ -575,8 +585,12 @@ impl LlamaRunner {
                 self.linear_f16_out_in(&x_norm, &ln.k_proj, kv_dim, hidden, &mut k)?;
                 self.linear_f16_out_in(&x_norm, &ln.v_proj, kv_dim, hidden, &mut v)?;
             }
-            t_linear_ns += t0.elapsed().as_nanos() as u64;
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                t_linear_ns += t0.elapsed().as_nanos() as u64;
+            }
 
+            #[cfg(not(target_arch = "wasm32"))]
             let t0 = std::time::Instant::now();
             if use_metal_rope {
                 let ops = self.metal_ops.as_ref().unwrap();
@@ -591,7 +605,10 @@ impl LlamaRunner {
                 rope_non_interleaved_inplace_f32(&mut q, n_heads, head_dim, head_dim, pos, cfg.rope_theta);
                 rope_non_interleaved_inplace_f32(&mut k, n_kv_heads, head_dim, head_dim, pos, cfg.rope_theta);
             }
-            t_rope_ns += t0.elapsed().as_nanos() as u64;
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                t_rope_ns += t0.elapsed().as_nanos() as u64;
+            }
 
             // Write new token K/V into paged cache.
             {
@@ -600,6 +617,7 @@ impl LlamaRunner {
             }
 
             // Gather historical K/V and run attention for this token.
+            #[cfg(not(target_arch = "wasm32"))]
             let t0 = std::time::Instant::now();
             let seq = page_table.token_count();
             let cr = kv_cache.view();
@@ -624,9 +642,13 @@ impl LlamaRunner {
                 None, // soft_cap
                 &mut attn_out,
             )?;
-            t_attn_ns += t0.elapsed().as_nanos() as u64;
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                t_attn_ns += t0.elapsed().as_nanos() as u64;
+            }
 
             // o_proj: hidden <- hidden
+            #[cfg(not(target_arch = "wasm32"))]
             let t0 = std::time::Instant::now();
             self.linear_f16_out_in(
                 &attn_out,
@@ -635,7 +657,10 @@ impl LlamaRunner {
                 hidden,
                 &mut attn_proj,
             )?;
-            t_linear_ns += t0.elapsed().as_nanos() as u64;
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                t_linear_ns += t0.elapsed().as_nanos() as u64;
+            }
 
             for i in 0..hidden {
                 x[i] += attn_proj[i];
@@ -731,6 +756,7 @@ impl LlamaRunner {
             if !ffn_done {
                 // CPU fallback or non-f16 path
                 // Post-attn norm.
+                #[cfg(not(target_arch = "wasm32"))]
                 let t0 = std::time::Instant::now();
                 if use_metal_norm {
                     let w = self.tensor_f16(&ffn_norm_name)?;
@@ -745,9 +771,13 @@ impl LlamaRunner {
                     self.rmsnorm_weight(&ffn_norm_name, &mut post_norm_w)?;
                     rms_norm_f32(&x, &post_norm_w, cfg.rms_norm_eps, &mut mlp_in);
                 }
-                t_norm_ns += t0.elapsed().as_nanos() as u64;
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    t_norm_ns += t0.elapsed().as_nanos() as u64;
+                }
 
                 // MLP: gate_proj + up_proj -> silu(gate)*up -> down_proj
+                #[cfg(not(target_arch = "wasm32"))]
                 let t0 = std::time::Instant::now();
                 self.linear_f16_out_in(&mlp_in, &gate_name, cfg.intermediate_size, hidden, &mut gate)?;
                 self.linear_f16_out_in(&mlp_in, &up_name, cfg.intermediate_size, hidden, &mut up)?;
@@ -762,13 +792,17 @@ impl LlamaRunner {
                 }
 
                 self.linear_f16_out_in(&gate, &down_name, hidden, cfg.intermediate_size, &mut down)?;
-                t_linear_ns += t0.elapsed().as_nanos() as u64;
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    t_linear_ns += t0.elapsed().as_nanos() as u64;
+                }
                 for i in 0..hidden {
                     x[i] += down[i];
                 }
             }
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
         if debug_timing {
             let total = t_step_start.elapsed().as_nanos() as u64;
             eprintln!(

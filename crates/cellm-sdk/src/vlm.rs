@@ -2,6 +2,7 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 use rayon::prelude::*;
 
@@ -20,6 +21,27 @@ use rand::prelude::*;
 use serde_json::Value;
 use tokenizers::{AddedToken, Tokenizer};
 use crate::BackendKind;
+
+#[cfg(not(target_arch = "wasm32"))]
+type StatsInstant = std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+type StatsInstant = ();
+
+#[cfg(not(target_arch = "wasm32"))]
+fn stats_instant_now() -> StatsInstant {
+    std::time::Instant::now()
+}
+#[cfg(target_arch = "wasm32")]
+fn stats_instant_now() -> StatsInstant {}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn stats_elapsed_ms(snapshot: &StatsInstant) -> f64 {
+    snapshot.elapsed().as_secs_f64() * 1000.0
+}
+#[cfg(target_arch = "wasm32")]
+fn stats_elapsed_ms(_: &StatsInstant) -> f64 {
+    0.0
+}
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 #[link(name = "Accelerate", kind = "framework")]
@@ -159,7 +181,7 @@ pub fn describe_image_with_cellm_timed(
     user_prompt: &str,
     cfg: VlmRunConfig,
 ) -> Result<(String, VlmTimingBreakdown)> {
-    let total_start = Instant::now();
+    let total_start = stats_instant_now();
     let tokenizer_path = resolve_tokenizer_path(model_path)?;
     let tok = load_tokenizer(&tokenizer_path)?;
     let processor_hints = load_vlm_processor_hints(model_path, &tokenizer_path, &tok);
@@ -324,7 +346,7 @@ pub fn describe_image_with_cellm_timed(
         patch_ms,
         encoder_ms,
         decode_ms,
-        total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
+        total_ms: stats_elapsed_ms(&total_start),
         encoder_layer_ms,
     };
     Ok((text.trim().to_string(), timing))
@@ -337,7 +359,7 @@ pub fn describe_audio_with_cellm_timed(
     user_prompt: &str,
     cfg: VlmRunConfig,
 ) -> Result<(String, VlmTimingBreakdown)> {
-    let total_start = Instant::now();
+    let total_start = stats_instant_now();
     let tokenizer_path = resolve_tokenizer_path(model_path)?;
     let tok = load_tokenizer(&tokenizer_path)?;
     let file = CellmFile::load(model_path).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -355,7 +377,7 @@ pub fn describe_audio_with_cellm_timed(
     let eoa_str = if tok.token_to_id("<audio|>").is_some() { "<audio|>" } else { "" };
 
     // Parse WAV → PCM i16 samples
-    let t_mel = Instant::now();
+    let t_mel = stats_instant_now();
     let (pcm_i16, sample_rate) = parse_wav_pcm16(audio_bytes)?;
     if sample_rate != 16000 {
         anyhow::bail!("Audio must be 16 kHz, got {} Hz. Resample before calling.", sample_rate);
@@ -372,12 +394,12 @@ pub fn describe_audio_with_cellm_timed(
         8000.0f64, // max_frequency
         0.001f32,  // mel_floor
     );
-    let mel_ms = t_mel.elapsed().as_secs_f64() * 1000.0;
+    let mel_ms = stats_elapsed_ms(&t_mel);
 
     // Run the audio conformer encoder
-    let t_enc = Instant::now();
+    let t_enc = stats_instant_now();
     let audio_features = run_audio_cellm_gemma4(&file, &mel_features, t_frames, 128)?;
-    let encoder_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
+    let encoder_ms = stats_elapsed_ms(&t_enc);
     let n_audio_tokens = audio_features.shape()[0];
 
     if std::env::var("CELLM_VLM_DEBUG_FEATURE_STATS").is_ok() {
@@ -470,7 +492,7 @@ pub fn describe_audio_with_cellm_timed(
         patch_ms: mel_ms,
         encoder_ms,
         decode_ms,
-        total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
+        total_ms: stats_elapsed_ms(&total_start),
         encoder_layer_ms: vec![],
     };
     Ok((text.trim().to_string(), timing))
@@ -487,7 +509,7 @@ fn run_decode_cellm(
     prefix_image_features: bool,
     banned_token_ids: &[i64],
 ) -> Result<(Vec<i64>, f64)> {
-    let decode_start = Instant::now();
+    let decode_start = stats_instant_now();
     enum DecodeRunner {
         Llama(LlamaRunner),
         Gemma(GemmaRunner),
@@ -1022,7 +1044,7 @@ fn run_decode_cellm(
         }
     }
 
-    Ok((generated, decode_start.elapsed().as_secs_f64() * 1000.0))
+    Ok((generated, stats_elapsed_ms(&decode_start)))
 }
 
 fn effective_text_model_type(header: &cellm_model::CellmHeader) -> String {
@@ -1361,7 +1383,7 @@ fn run_vision_cellm(
     let mut encoder_ms = 0.0f64;
     let mut encoder_layer_ms = vec![0.0f64; num_layers];
 
-    let patch_start = Instant::now();
+    let patch_start = stats_instant_now();
     for img in 0..nimg {
         let offset = img * num_tokens * hidden;
         let mut img_tokens = vec![0.0f32; num_tokens * hidden];
@@ -1379,11 +1401,11 @@ fn run_vision_cellm(
         );
         tokens[offset..offset + num_tokens * hidden].copy_from_slice(&img_tokens);
     }
-    patch_ms += patch_start.elapsed().as_secs_f64() * 1000.0;
+    patch_ms += stats_elapsed_ms(&patch_start);
 
-    let encoder_start = Instant::now();
+    let encoder_start = stats_instant_now();
     for (layer_idx, layer) in layers.iter().enumerate() {
-        let layer_start = Instant::now();
+        let layer_start = stats_instant_now();
         layer_norm_rows(
             &tokens, batched_tokens, hidden, &layer.ln1_w, &layer.ln1_b, eps, &mut norm1,
         );
@@ -1452,7 +1474,7 @@ fn run_vision_cellm(
             &mut linear_backend,
         );
         add_inplace(&mut tokens, &mlp_out);
-        encoder_layer_ms[layer_idx] += layer_start.elapsed().as_secs_f64() * 1000.0;
+        encoder_layer_ms[layer_idx] += stats_elapsed_ms(&layer_start);
     }
 
     layer_norm_rows(
@@ -1508,7 +1530,7 @@ fn run_vision_cellm(
             out[[r, c]] = flat_out[r * text_hidden + c];
         }
     }
-    encoder_ms += encoder_start.elapsed().as_secs_f64() * 1000.0;
+    encoder_ms += stats_elapsed_ms(&encoder_start);
 
     if std::env::var("CELLM_STEP_TIMING").is_ok() {
         eprintln!("VISION_ENCODER patch={:.1}ms total_encoder={:.1}ms", patch_ms, encoder_ms);
@@ -1714,7 +1736,7 @@ fn run_vision_cellm_gemma4(
     let mut out = Array2::<f32>::zeros((nimg * out_tokens_per_image, text_hidden));
 
     for img in 0..nimg {
-        let t_patch = Instant::now();
+        let t_patch = stats_instant_now();
         let mut patch_rows = vec![0.0f32; num_tokens * patch_in];
         for t in 0..num_tokens {
             for i in 0..patch_in {
@@ -1763,11 +1785,11 @@ fn run_vision_cellm_gemma4(
                 rope_sin[base + rope_half + i] = ay.sin();
             }
         }
-        patch_ms += t_patch.elapsed().as_secs_f64() * 1000.0;
+        patch_ms += stats_elapsed_ms(&t_patch);
 
-        let t_enc = Instant::now();
+        let t_enc = stats_instant_now();
         for (layer_idx, layer) in layers.iter().enumerate() {
-            let layer_start = Instant::now();
+            let layer_start = stats_instant_now();
             rms_norm_rows(&tokens, num_tokens, hidden, &layer.input_ln_w, eps, &mut norm0);
 
             linear_rows_clipped(
@@ -1916,7 +1938,7 @@ fn run_vision_cellm_gemma4(
                 &mut norm0,
             );
             add_inplace(&mut tokens, &norm0);
-            encoder_layer_ms[layer_idx] += layer_start.elapsed().as_secs_f64() * 1000.0;
+            encoder_layer_ms[layer_idx] += stats_elapsed_ms(&layer_start);
         }
 
         let mut max_x = 0usize;
@@ -1960,7 +1982,7 @@ fn run_vision_cellm_gemma4(
                 out[[img * out_tokens_per_image + out_tok, o]] = acc;
             }
         }
-        encoder_ms += t_enc.elapsed().as_secs_f64() * 1000.0;
+        encoder_ms += stats_elapsed_ms(&t_enc);
     }
 
     Ok((out, out_tokens_per_image, patch_ms, encoder_ms, encoder_layer_ms))
@@ -2441,7 +2463,7 @@ fn run_audio_cellm_gemma4(
     let mut hidden_states = vec![0.0f32; t_sub * hidden];
     linear_rows(&sub_out, t_sub, proj_in_dim, &proj_w, hidden, None, &mut hidden_states, &mut backend);
     audio_stats("hidden_states_init", &hidden_states);
-    let t_subsample_done = std::time::Instant::now();
+    let t_subsample_done = stats_instant_now();
     eprintln!("[audio_timing] t_sub={t_sub} subsample_done");
 
     //  B. Relative positional embeddings
@@ -2450,7 +2472,7 @@ fn run_audio_cellm_gemma4(
     let rel_pos_embed = compute_audio_rel_pos_embed(n_rel_pos, hidden);
 
     //  C. 12 Conformer Layers
-    let t_conformer_start = std::time::Instant::now();
+    let t_conformer_start = stats_instant_now();
     let mut norm_buf = vec![0.0f32; t_sub * hidden];
     let mut norm2_buf = vec![0.0f32; t_sub * hidden];
     let mut ffw1_buf = vec![0.0f32; t_sub * ffw_intermediate];
@@ -2467,17 +2489,17 @@ fn run_audio_cellm_gemma4(
     let mut conv_state = vec![0.0f32; (conv_kernel - 1) * hidden]; // causal conv padding
 
     for layer in 0..num_audio_layers {
-        let t_layer_start = std::time::Instant::now();
+        let t_layer_start = stats_instant_now();
         let p = format!("model.audio_tower.layers.{layer}.");
 
         //  feed_forward1
         {
-            let t0 = std::time::Instant::now();
+            let t0 = stats_instant_now();
             let pre_w = load_audio_weight_f32(file, &format!("{p}feed_forward1.pre_layer_norm.weight"))?;
             let ff1_w = load_audio_weight_f32(file, &format!("{p}feed_forward1.ffw_layer_1.linear.weight"))?;
             let ff2_w = load_audio_weight_f32(file, &format!("{p}feed_forward1.ffw_layer_2.linear.weight"))?;
             let post_w = load_audio_weight_f32(file, &format!("{p}feed_forward1.post_layer_norm.weight"))?;
-            if layer == 0 { eprintln!("[audio_timing] L0 ff1 weight_load={:.1}ms", t0.elapsed().as_secs_f64()*1000.0); }
+            if layer == 0 { eprintln!("[audio_timing] L0 ff1 weight_load={:.1}ms", stats_elapsed_ms(&t0)); }
             let (ff1_in_clip, ff1_out_clip) = load_linear_clip_ranges(file, &format!("{p}feed_forward1.ffw_layer_1"))?;
             let (ff2_in_clip, ff2_out_clip) = load_linear_clip_ranges(file, &format!("{p}feed_forward1.ffw_layer_2"))?;
 
@@ -2495,13 +2517,13 @@ fn run_audio_cellm_gemma4(
                 hidden_states[i] = residual[i] + norm_buf[i] * residual_weight;
             }
             if layer == 0 { audio_stats("L0_after_ffn1", &hidden_states[..t_sub*hidden]); }
-            if layer == 0 { eprintln!("[audio_timing] L0 ff1 total={:.1}ms", t0.elapsed().as_secs_f64()*1000.0); }
+            if layer == 0 { eprintln!("[audio_timing] L0 ff1 total={:.1}ms", stats_elapsed_ms(&t0)); }
         }
 
         //  self_attn (chunked local with relative pos bias)
         {
-            let t0 = std::time::Instant::now();
-            let t_wload = std::time::Instant::now();
+            let t0 = stats_instant_now();
+            let t_wload = stats_instant_now();
             let norm_pre_w = load_audio_weight_f32(file, &format!("{p}norm_pre_attn.weight"))?;
             let norm_post_w = load_audio_weight_f32(file, &format!("{p}norm_post_attn.weight"))?;
             let q_w = load_audio_weight_f32(file, &format!("{p}self_attn.q_proj.linear.weight"))?;
@@ -2512,8 +2534,8 @@ fn run_audio_cellm_gemma4(
             let per_dim_scale = load_audio_weight_f32(file, &format!("{p}self_attn.per_dim_scale"))?;
             let (qkv_in_clip, qkv_out_clip) = load_linear_clip_ranges(file, &format!("{p}self_attn.q_proj"))?;
             let (post_in_clip, post_out_clip) = load_linear_clip_ranges(file, &format!("{p}self_attn.post"))?;
-            if layer == 0 { eprintln!("[audio_timing] L0 attn weight_load={:.1}ms", t_wload.elapsed().as_secs_f64()*1000.0); }
-            let t_qkv = std::time::Instant::now();
+            if layer == 0 { eprintln!("[audio_timing] L0 attn weight_load={:.1}ms", stats_elapsed_ms(&t_wload)); }
+            let t_qkv = stats_instant_now();
 
             // softplus(per_dim_scale) element-wise
             let pds: Vec<f32> = per_dim_scale.iter().map(|&v| (1.0 + v.exp()).ln()).collect();
@@ -2665,12 +2687,12 @@ fn run_audio_cellm_gemma4(
                 hidden_states[i] = residual[i] + norm2_buf[i];
             }
             if layer == 0 { audio_stats("L0_after_attn", &hidden_states[..t_sub*hidden]); }
-            if layer == 0 { eprintln!("[audio_timing] L0 attn qkv+rest={:.1}ms total={:.1}ms", t_qkv.elapsed().as_secs_f64()*1000.0, t0.elapsed().as_secs_f64()*1000.0); }
+            if layer == 0 { eprintln!("[audio_timing] L0 attn qkv+rest={:.1}ms total={:.1}ms", stats_elapsed_ms(&t_qkv), stats_elapsed_ms(&t0)); }
         }
 
         //  lconv1d
         {
-            let t0 = std::time::Instant::now();
+            let t0 = stats_instant_now();
             let pre_w = load_audio_weight_f32(file, &format!("{p}lconv1d.pre_layer_norm.weight"))?;
             let lin_start_w = load_audio_weight_f32(file, &format!("{p}lconv1d.linear_start.linear.weight"))?;
             let dw_w = load_audio_weight_f32(file, &format!("{p}lconv1d.depthwise_conv1d.weight"))?;
@@ -2730,12 +2752,12 @@ fn run_audio_cellm_gemma4(
                 hidden_states[i] = residual[i] + lconv_out[i];
             }
             if layer == 0 { audio_stats("L0_after_lconv", &hidden_states[..t_sub*hidden]); }
-            if layer == 0 { eprintln!("[audio_timing] L0 lconv total={:.1}ms", t0.elapsed().as_secs_f64()*1000.0); }
+            if layer == 0 { eprintln!("[audio_timing] L0 lconv total={:.1}ms", stats_elapsed_ms(&t0)); }
         }
 
         //  feed_forward2
         {
-            let t0 = std::time::Instant::now();
+            let t0 = stats_instant_now();
             let pre_w = load_audio_weight_f32(file, &format!("{p}feed_forward2.pre_layer_norm.weight"))?;
             let ff1_w = load_audio_weight_f32(file, &format!("{p}feed_forward2.ffw_layer_1.linear.weight"))?;
             let ff2_w = load_audio_weight_f32(file, &format!("{p}feed_forward2.ffw_layer_2.linear.weight"))?;
@@ -2756,7 +2778,7 @@ fn run_audio_cellm_gemma4(
             for i in 0..t_sub * hidden {
                 hidden_states[i] = residual[i] + norm_buf[i] * residual_weight;
             }
-            if layer == 0 { eprintln!("[audio_timing] L0 ff2 total={:.1}ms", t0.elapsed().as_secs_f64()*1000.0); }
+            if layer == 0 { eprintln!("[audio_timing] L0 ff2 total={:.1}ms", stats_elapsed_ms(&t0)); }
         }
 
         //  norm_out
@@ -2768,19 +2790,19 @@ fn run_audio_cellm_gemma4(
         if layer < 2 || layer == 11 {
             audio_stats(&format!("after_layer_{layer}"), &hidden_states[..t_sub * hidden]);
         }
-        eprintln!("[audio_timing] layer {layer} done in {:.1}ms", t_layer_start.elapsed().as_secs_f64() * 1000.0);
+        eprintln!("[audio_timing] layer {layer} done in {:.1}ms", stats_elapsed_ms(&t_layer_start));
     }
-    eprintln!("[audio_timing] all conformer layers done in {:.1}ms", t_conformer_start.elapsed().as_secs_f64() * 1000.0);
+    eprintln!("[audio_timing] all conformer layers done in {:.1}ms", stats_elapsed_ms(&t_conformer_start));
 
     //  D. Output projection [1024 → 1536]
-    let t_outproj_start = std::time::Instant::now();
+    let t_outproj_start = stats_instant_now();
     let out_proj_w = load_audio_weight_f32(file, "model.audio_tower.output_proj.weight")?;
     let out_proj_b = load_audio_weight_f32(file, "model.audio_tower.output_proj.bias")?;
     let mut proj_out = vec![0.0f32; t_sub * text_hidden];
     linear_rows(&hidden_states, t_sub, hidden, &out_proj_w, text_hidden, Some(&out_proj_b), &mut proj_out, &mut backend);
     audio_stats("D_out_proj", &proj_out[..t_sub * text_hidden]);
 
-    eprintln!("[audio_timing] output_proj done in {:.1}ms", t_outproj_start.elapsed().as_secs_f64() * 1000.0);
+    eprintln!("[audio_timing] output_proj done in {:.1}ms", stats_elapsed_ms(&t_outproj_start));
     //  E. Embedder (RMSNorm no-scale + Linear 1536→1536)
     let embed_proj_w = load_audio_weight_f32(file, "model.embed_audio.embedding_projection.weight")?;
     let mut embed_norm = vec![0.0f32; t_sub * text_hidden];
