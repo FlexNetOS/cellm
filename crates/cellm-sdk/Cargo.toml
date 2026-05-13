@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "Public API, C FFI, and Swift/Kotlin glue for cellm."
 
+[features]
+default = []
+webgpu = ["cellm-kernels/webgpu"]
+
 [dependencies]
 cellm-core = { path = "../cellm-core" }
 cellm-cache = { path = "../cellm-cache" }

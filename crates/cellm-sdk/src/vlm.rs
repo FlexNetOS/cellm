@@ -13,6 +13,8 @@ use cellm_core::KvCacheLayout;
 use cellm_kernels::metal::MetalBuffer;
 use cellm_kernels::metal::MetalMatmul;
 use cellm_kernels::MetalKernels;
+#[cfg(feature = "webgpu")]
+use cellm_kernels::VisionWebGpu;
 use cellm_model::{gemma::GemmaRunner, llama::LlamaRunner, CellmFile};
 use half::f16;
 use image::RgbImage;
@@ -225,11 +227,22 @@ pub fn describe_image_with_cellm_timed(
         processor_hints.image_seq_len.unwrap_or(280),
     )?;
     let num_images = image_input.pixel_values.shape()[1];
+    let mut vision_backend = match cfg.backend {
+        BackendKind::Metal => {
+            let ctx = MetalKernels::create_matmul()
+                .map_err(|e| anyhow::anyhow!("VLM Metal backend requested but unavailable: {e}"))?;
+            LinearBackend::Metal {
+                ctx,
+                weight_t_cache: HashMap::new(),
+            }
+        }
+        BackendKind::Cpu => LinearBackend::Cpu,
+    };
     let (mut image_features, image_seq_len, patch_ms, encoder_ms, encoder_layer_ms) =
         run_vision_cellm(
             &file,
             &image_input,
-            cfg.backend,
+            &mut vision_backend,
             processor_hints.image_seq_len,
         )?;
     if std::env::var("CELLM_VLM_DEBUG_FEATURE_STATS").is_ok() {
@@ -350,6 +363,274 @@ pub fn describe_image_with_cellm_timed(
         encoder_layer_ms,
     };
     Ok((text.trim().to_string(), timing))
+}
+
+/// Variant of `describe_image_with_cellm_timed` that accepts a `VisionWebGpu`
+/// for WebGPU-accelerated vision encoding. Returns the `VisionWebGpu` back
+/// so the caller can use it for text inference after vision processing.
+#[cfg(feature = "webgpu")]
+pub fn describe_image_with_cellm_webgpu(
+    model_path: &Path,
+    image_bytes: &[u8],
+    user_prompt: &str,
+    cfg: VlmRunConfig,
+    mut vision: VisionWebGpu,
+) -> Result<(String, VlmTimingBreakdown, VisionWebGpu)> {
+    let total_start = stats_instant_now();
+    let tokenizer_path = resolve_tokenizer_path(model_path)?;
+    let tok = load_tokenizer(&tokenizer_path)?;
+    let processor_hints = load_vlm_processor_hints(model_path, &tokenizer_path, &tok);
+    let file = CellmFile::load(model_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let is_gemma4_vision = file
+        .tensor_index("model.vision_tower.patch_embedder.input_proj.weight")
+        .is_some()
+        && file
+            .tensor_index("model.embed_vision.embedding_projection.weight")
+            .is_some();
+    let is_idefics3_vision = file
+        .tensor_index("model.vision_model.embeddings.patch_embedding.weight")
+        .is_some()
+        && file
+            .tensor_index("model.connector.modality_projection.proj.weight")
+            .is_some();
+    if !is_gemma4_vision && !is_idefics3_vision {
+        anyhow::bail!(
+            "This model does not support image input (gemma4_vision={}, idefics3_vision={})",
+            is_gemma4_vision, is_idefics3_vision
+        );
+    }
+    let model_type = effective_text_model_type(&file.header);
+    let gemma4_mode = std::env::var("CELLM_VLM_GEMMA4_MODE").unwrap_or_else(|_| "placeholder".to_string());
+    let gemma4_prefix_image = is_gemma4_vision && model_type.starts_with("gemma4")
+        && gemma4_mode.eq_ignore_ascii_case("prefix");
+    let image_input = preprocess_image_for_model(
+        image_bytes,
+        processor_hints.do_image_splitting,
+        is_gemma4_vision,
+        processor_hints.image_seq_len.unwrap_or(280),
+    )?;
+    let num_images = image_input.pixel_values.shape()[1];
+
+    // Use WebGPU for the vision encoder
+    let mut linear_backend = LinearBackend::WebGpu(vision);
+    let (mut image_features, image_seq_len, patch_ms, encoder_ms, encoder_layer_ms) =
+        run_vision_cellm(
+            &file,
+            &image_input,
+            &mut linear_backend,
+            processor_hints.image_seq_len,
+        )?;
+
+    // Recover the VisionWebGpu
+    let vision = match linear_backend {
+        LinearBackend::WebGpu(v) => v,
+        _ => unreachable!(),
+    };
+
+    let (image_token_id, image_token_text, use_idefics_wrappers, boi_token_text, eoi_token_text) =
+        resolve_image_token(&tok)?;
+    let eos_token_id = file
+        .header
+        .eos_token_id
+        .map(|v| v as i64)
+        .or_else(|| {
+            file.header
+                .source_text_config
+                .as_ref()
+                .and_then(|v| v.get("eos_token_id"))
+                .and_then(|v| v.as_i64())
+        })
+        .unwrap_or(2);
+    let end_of_utt = tok.token_to_id("<turn|>")
+        .map(|v| v as i64)
+        .or_else(|| tok.token_to_id("<end_of_utterance>").map(|v| v as i64));
+    let banned_token_ids = banned_token_ids(&tok);
+
+    if let Some(expected) = processor_hints.image_seq_len {
+        if expected != image_seq_len {
+            anyhow::bail!(
+                "processor/image_seq_len mismatch: processor_config={} vision_projector={}",
+                expected,
+                image_seq_len
+            );
+        }
+    }
+    let image_block = if gemma4_prefix_image {
+        String::new()
+    } else {
+        format_image_block(
+            num_images,
+            image_seq_len,
+            image_token_text.as_str(),
+            use_idefics_wrappers,
+            boi_token_text.as_deref(),
+            eoi_token_text.as_deref(),
+        )
+    };
+    let prompt = if gemma4_prefix_image {
+        if image_block.is_empty() {
+            user_prompt.to_string()
+        } else {
+            format!("{image_block}
+{user_prompt}")
+        }
+    } else {
+        build_single_turn_prompt(
+            user_prompt,
+            &image_block,
+            tok.token_to_id("<|turn>").is_some() && tok.token_to_id("<turn|>").is_some(),
+        )
+    };
+    let enc_ids = encode_with_explicit_added_tokens(&tok, &tokenizer_path, &prompt)?;
+    let mut input_ids: Vec<i64> = enc_ids.into_iter().map(|x| x as i64).collect();
+    if gemma4_prefix_image {
+        if let Some(bos) = file.header.bos_token_id.map(|v| v as i64) {
+            if input_ids.first().copied() != Some(bos) {
+                input_ids.insert(0, bos);
+            }
+        }
+    }
+
+    let (generated, decode_ms) = run_decode_cellm(
+        model_path,
+        image_token_id,
+        eos_token_id,
+        end_of_utt,
+        cfg,
+        input_ids,
+        &image_features,
+        gemma4_prefix_image,
+        &banned_token_ids,
+    )?;
+    let text = tok
+        .decode(
+            &generated.into_iter().map(|t| t as u32).collect::<Vec<u32>>(),
+            true,
+        )
+        .map_err(|e| anyhow::anyhow!("decode failed: {e}"))?;
+    let timing = VlmTimingBreakdown {
+        patch_ms,
+        encoder_ms,
+        decode_ms,
+        total_ms: stats_elapsed_ms(&total_start),
+        encoder_layer_ms,
+    };
+    Ok((text.trim().to_string(), timing, vision))
+}
+
+/// WASM-friendly variant: takes model bytes + tokenizer bytes instead of paths.
+/// Model bytes are the complete `.cellm` file. Tokenizer bytes are the JSON content.
+#[cfg(feature = "webgpu")]
+pub fn describe_image_with_cellm_webgpu_from_bytes(
+    model_bytes: &[u8],
+    tokenizer_bytes: &[u8],
+    image_bytes: &[u8],
+    user_prompt: &str,
+    cfg: VlmRunConfig,
+    mut vision: VisionWebGpu,
+) -> Result<(String, VlmTimingBreakdown, VisionWebGpu)> {
+    let total_start = stats_instant_now();
+    // Load tokenizer from bytes (skip sanitization — WASM path uses pre-sanitized JSON)
+    let tok = Tokenizer::from_bytes(tokenizer_bytes)
+        .map_err(|e| anyhow::anyhow!("tokenizer from bytes: {e}"))?;
+    let processor_hints = VlmProcessorHints {
+        image_seq_len: None,
+        do_image_splitting: false,
+    };
+    let file = CellmFile::load_from_bytes(model_bytes)
+        .map_err(|e| anyhow::anyhow!("CellmFile::load_from_bytes: {e}"))?;
+    let is_gemma4_vision = file
+        .tensor_index("model.vision_tower.patch_embedder.input_proj.weight")
+        .is_some()
+        && file
+            .tensor_index("model.embed_vision.embedding_projection.weight")
+            .is_some();
+    let is_idefics3_vision = file
+        .tensor_index("model.vision_model.embeddings.patch_embedding.weight")
+        .is_some()
+        && file
+            .tensor_index("model.connector.modality_projection.proj.weight")
+            .is_some();
+    if !is_gemma4_vision && !is_idefics3_vision {
+        anyhow::bail!(
+            "This model does not support image input (gemma4_vision={}, idefics3_vision={})",
+            is_gemma4_vision, is_idefics3_vision
+        );
+    }
+    let image_input = preprocess_image_for_model(
+        image_bytes,
+        false,
+        is_gemma4_vision,
+        280,
+    )?;
+    let num_images = image_input.pixel_values.shape()[1];
+
+    // Use WebGPU for the vision encoder
+    let mut linear_backend = LinearBackend::WebGpu(vision);
+    let (mut image_features, image_seq_len, patch_ms, encoder_ms, encoder_layer_ms) =
+        run_vision_cellm(
+            &file,
+            &image_input,
+            &mut linear_backend,
+            None,
+        )?;
+
+    let vision = match linear_backend {
+        LinearBackend::WebGpu(v) => v,
+        _ => unreachable!(),
+    };
+
+    let (image_token_id, image_token_text, use_idefics_wrappers, boi_token_text, eoi_token_text) =
+        resolve_image_token(&tok)?;
+    let eos_token_id = file.header.eos_token_id.map(|v| v as i64).unwrap_or(2);
+    let end_of_utt = tok.token_to_id("<turn|>")
+        .map(|v| v as i64)
+        .or_else(|| tok.token_to_id("<end_of_utterance>").map(|v| v as i64));
+    let banned_token_ids = banned_token_ids(&tok);
+
+    let image_block = format_image_block(
+        num_images,
+        image_seq_len,
+        image_token_text.as_str(),
+        use_idefics_wrappers,
+        boi_token_text.as_deref(),
+        eoi_token_text.as_deref(),
+    );
+    let prompt = build_single_turn_prompt(
+        user_prompt,
+        &image_block,
+        tok.token_to_id("<|turn>").is_some() && tok.token_to_id("<turn|>").is_some(),
+    );
+    let enc_ids = encode_with_explicit_added_tokens(&tok, &PathBuf::from("."), &prompt)?;
+    let mut input_ids: Vec<i64> = enc_ids.into_iter().map(|x| x as i64).collect();
+    if let Some(bos) = file.header.bos_token_id.map(|v| v as i64) {
+        if input_ids.first().copied() != Some(bos) {
+            input_ids.insert(0, bos);
+        }
+    }
+
+    let (generated, decode_ms) = run_decode_cellm_from_bytes(
+        model_bytes,
+        image_token_id,
+        eos_token_id,
+        end_of_utt,
+        cfg,
+        input_ids,
+        &image_features,
+        false,
+        &banned_token_ids,
+    )?;
+    let text = tok
+        .decode(&generated.into_iter().map(|t| t as u32).collect::<Vec<u32>>(), true)
+        .map_err(|e| anyhow::anyhow!("decode failed: {e}"))?;
+    let timing = VlmTimingBreakdown {
+        patch_ms,
+        encoder_ms,
+        decode_ms,
+        total_ms: stats_elapsed_ms(&total_start),
+        encoder_layer_ms,
+    };
+    Ok((text.trim().to_string(), timing, vision))
 }
 
 /// Transcribe / describe audio using the Gemma 4 audio tower.
@@ -498,8 +779,8 @@ pub fn describe_audio_with_cellm_timed(
     Ok((text.trim().to_string(), timing))
 }
 
-fn run_decode_cellm(
-    model_path: &Path,
+fn run_decode_cellm_inner(
+    file: CellmFile,
     image_token_id: i64,
     eos_token_id: i64,
     end_of_utterance_id: Option<i64>,
@@ -515,14 +796,20 @@ fn run_decode_cellm(
         Gemma(GemmaRunner),
     }
 
-    let file = CellmFile::load(model_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Extract info before moving file into runner
     let model_type = effective_text_model_type(&file.header);
+    let is_gemma4_text = model_type.starts_with("gemma4");
+    let head_dim_from_config = if model_type.starts_with("gemma") {
+        infer_gemma_kv_head_dim(&file)?
+    } else {
+        0 // will be computed from hidden/num_heads later
+    };
     let mut runner = match model_type.as_str() {
         "llama" | "smollm3" => {
-            DecodeRunner::Llama(LlamaRunner::load(model_path).map_err(|e| anyhow::anyhow!("{e}"))?)
+            DecodeRunner::Llama(LlamaRunner::from_file(file).map_err(|e| anyhow::anyhow!("{e}"))?)
         }
         t if t.starts_with("gemma") => {
-            DecodeRunner::Gemma(GemmaRunner::load(model_path).map_err(|e| anyhow::anyhow!("{e}"))?)
+            DecodeRunner::Gemma(GemmaRunner::from_file(file).map_err(|e| anyhow::anyhow!("{e}"))?)
         }
         other => anyhow::bail!("unsupported text model for VLM decode: {other}"),
     };
@@ -556,7 +843,7 @@ fn run_decode_cellm(
     }
 
     let head_dim = if model_type.starts_with("gemma") {
-        infer_gemma_kv_head_dim(&file)?
+        head_dim_from_config
     } else {
         hidden / num_heads.max(1)
     };
@@ -1047,6 +1334,45 @@ fn run_decode_cellm(
     Ok((generated, stats_elapsed_ms(&decode_start)))
 }
 
+/// Load from a filesystem path (wraps run_decode_cellm_inner).
+fn run_decode_cellm(
+    model_path: &Path,
+    image_token_id: i64,
+    eos_token_id: i64,
+    end_of_utterance_id: Option<i64>,
+    cfg: VlmRunConfig,
+    input_ids: Vec<i64>,
+    image_features: &Array2<f32>,
+    prefix_image_features: bool,
+    banned_token_ids: &[i64],
+) -> Result<(Vec<i64>, f64)> {
+    let file = CellmFile::load(model_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    run_decode_cellm_inner(
+        file, image_token_id, eos_token_id, end_of_utterance_id,
+        cfg, input_ids, image_features, prefix_image_features, banned_token_ids,
+    )
+}
+
+/// Load from model bytes (WASM-friendly, wraps run_decode_cellm_inner).
+fn run_decode_cellm_from_bytes(
+    model_bytes: &[u8],
+    image_token_id: i64,
+    eos_token_id: i64,
+    end_of_utterance_id: Option<i64>,
+    cfg: VlmRunConfig,
+    input_ids: Vec<i64>,
+    image_features: &Array2<f32>,
+    prefix_image_features: bool,
+    banned_token_ids: &[i64],
+) -> Result<(Vec<i64>, f64)> {
+    let file = CellmFile::load_from_bytes(model_bytes)
+        .map_err(|e| anyhow::anyhow!("CellmFile::load_from_bytes: {e}"))?;
+    run_decode_cellm_inner(
+        file, image_token_id, eos_token_id, end_of_utterance_id,
+        cfg, input_ids, image_features, prefix_image_features, banned_token_ids,
+    )
+}
+
 fn effective_text_model_type(header: &cellm_model::CellmHeader) -> String {
     let mut mt = header.model_type.clone();
     if mt == "llava" || mt == "llava_qwen" || mt == "llava_idefics3" || mt == "llava_smolvlm" || mt == "vlm" {
@@ -1169,7 +1495,7 @@ fn sample_from_candidates(
 fn run_vision_cellm(
     file: &CellmFile,
     image_input: &PreparedImage,
-    backend: BackendKind,
+    backend: &mut LinearBackend,
     target_image_seq_len: Option<usize>,
 ) -> Result<(Array2<f32>, usize, f64, f64, Vec<f64>)> {
     if file
@@ -1183,17 +1509,7 @@ fn run_vision_cellm(
     }
     let pixel_values = image_input.pixel_values.clone();
 
-    let mut linear_backend = match backend {
-        BackendKind::Metal => {
-            let ctx = MetalKernels::create_matmul()
-                .map_err(|e| anyhow::anyhow!("VLM Metal backend requested but unavailable: {e}"))?;
-            LinearBackend::Metal {
-                ctx,
-                weight_t_cache: HashMap::new(),
-            }
-        }
-        BackendKind::Cpu => LinearBackend::Cpu,
-    };
+
     let vision_prefix = file
         .header
         .vision_tensor_prefix
@@ -1397,7 +1713,7 @@ fn run_vision_cellm(
             &patch_b,
             &pos,
             &mut img_tokens,
-            &mut linear_backend,
+            backend,
         );
         tokens[offset..offset + num_tokens * hidden].copy_from_slice(&img_tokens);
     }
@@ -1410,13 +1726,13 @@ fn run_vision_cellm(
             &tokens, batched_tokens, hidden, &layer.ln1_w, &layer.ln1_b, eps, &mut norm1,
         );
         linear_rows(
-            &norm1, batched_tokens, hidden, &layer.q_w, hidden, Some(&layer.q_b), &mut q, &mut linear_backend,
+            &norm1, batched_tokens, hidden, &layer.q_w, hidden, Some(&layer.q_b), &mut q, backend,
         );
         linear_rows(
-            &norm1, batched_tokens, hidden, &layer.k_w, hidden, Some(&layer.k_b), &mut k, &mut linear_backend,
+            &norm1, batched_tokens, hidden, &layer.k_w, hidden, Some(&layer.k_b), &mut k, backend,
         );
         linear_rows(
-            &norm1, batched_tokens, hidden, &layer.v_w, hidden, Some(&layer.v_b), &mut v, &mut linear_backend,
+            &norm1, batched_tokens, hidden, &layer.v_w, hidden, Some(&layer.v_b), &mut v, backend,
         );
 
         for img in 0..nimg {
@@ -1433,7 +1749,7 @@ fn run_vision_cellm(
                 &mut prob_buf,
                 &mut attn[offset..offset + num_tokens * hidden],
                 None,
-                &mut linear_backend,
+                backend,
             );
         }
 
@@ -1445,7 +1761,7 @@ fn run_vision_cellm(
             hidden,
             Some(&layer.o_b),
             &mut proj_out,
-            &mut linear_backend,
+            backend,
         );
         add_inplace(&mut tokens, &proj_out);
 
@@ -1460,7 +1776,7 @@ fn run_vision_cellm(
             intermediate,
             Some(&layer.fc1_b),
             &mut mlp_up,
-            &mut linear_backend,
+            backend,
         );
         gelu_pytorch_tanh_inplace(&mut mlp_up);
         linear_rows(
@@ -1471,7 +1787,7 @@ fn run_vision_cellm(
             hidden,
             Some(&layer.fc2_b),
             &mut mlp_out,
-            &mut linear_backend,
+            backend,
         );
         add_inplace(&mut tokens, &mlp_out);
         encoder_layer_ms[layer_idx] += stats_elapsed_ms(&layer_start);
@@ -1522,7 +1838,7 @@ fn run_vision_cellm(
         text_hidden,
         None,
         &mut flat_out,
-        &mut linear_backend,
+        backend,
     );
 
     for r in 0..total_out_rows {
@@ -1546,19 +1862,9 @@ fn run_vision_cellm_gemma4(
     file: &CellmFile,
     image_input: &PreparedImage,
     target_image_seq_len: Option<usize>,
-    backend: BackendKind,
+    backend: &mut LinearBackend,
 ) -> Result<(Array2<f32>, usize, f64, f64, Vec<f64>)> {
-    let mut linear_backend = match backend {
-        BackendKind::Metal => {
-            let ctx = MetalKernels::create_matmul()
-                .map_err(|e| anyhow::anyhow!("Gemma4 VLM Metal backend unavailable: {e}"))?;
-            LinearBackend::Metal {
-                ctx,
-                weight_t_cache: HashMap::new(),
-            }
-        }
-        BackendKind::Cpu => LinearBackend::Cpu,
-    };
+    // backend is passed as parameter, use it directly
 
     let patch_w_name = "model.vision_tower.patch_embedder.input_proj.weight";
     let pos_name = "model.vision_tower.patch_embedder.position_embedding_table";
@@ -1751,7 +2057,7 @@ fn run_vision_cellm_gemma4(
             hidden,
             None,
             &mut tokens,
-            &mut linear_backend,
+            backend,
         );
         let pos_axis = &pos_table[..pos_rows * hidden];
         valid_mask.fill(false);
@@ -1802,7 +2108,7 @@ fn run_vision_cellm_gemma4(
                 &mut q,
                 layer.q_clip_in,
                 layer.q_clip_out,
-                &mut linear_backend,
+                backend,
             );
             linear_rows_clipped(
                 &norm0,
@@ -1814,7 +2120,7 @@ fn run_vision_cellm_gemma4(
                 &mut k,
                 layer.k_clip_in,
                 layer.k_clip_out,
-                &mut linear_backend,
+                backend,
             );
             linear_rows_clipped(
                 &norm0,
@@ -1826,7 +2132,7 @@ fn run_vision_cellm_gemma4(
                 &mut v,
                 layer.v_clip_in,
                 layer.v_clip_out,
-                &mut linear_backend,
+                backend,
             );
 
             for t in 0..num_tokens {
@@ -1859,7 +2165,7 @@ fn run_vision_cellm_gemma4(
                 &mut prob_buf,
                 &mut attn,
                 Some(&valid_mask),
-                &mut linear_backend,
+                backend,
             );
             linear_rows_clipped(
                 &attn,
@@ -1871,7 +2177,7 @@ fn run_vision_cellm_gemma4(
                 &mut proj_out,
                 layer.o_clip_in,
                 layer.o_clip_out,
-                &mut linear_backend,
+                backend,
             );
             rms_norm_rows(
                 &proj_out,
@@ -1901,7 +2207,7 @@ fn run_vision_cellm_gemma4(
                 &mut gate,
                 layer.gate_clip_in,
                 layer.gate_clip_out,
-                &mut linear_backend,
+                backend,
             );
             linear_rows_clipped(
                 &norm1,
@@ -1913,7 +2219,7 @@ fn run_vision_cellm_gemma4(
                 &mut up,
                 layer.up_clip_in,
                 layer.up_clip_out,
-                &mut linear_backend,
+                backend,
             );
             gelu_pytorch_tanh_inplace(&mut gate);
             mul_inplace(&mut gate, &up);
@@ -1927,7 +2233,7 @@ fn run_vision_cellm_gemma4(
                 &mut mlp_out,
                 layer.down_clip_in,
                 layer.down_clip_out,
-                &mut linear_backend,
+                backend,
             );
             rms_norm_rows(
                 &mlp_out,
@@ -3239,6 +3545,17 @@ fn linear_rows(
     out: &mut [f32],
     backend: &mut LinearBackend,
 ) {
+    // WebGPU fast path: delegate batch matmul to GPU when the op is large enough.
+    #[cfg(feature = "webgpu")]
+    if let LinearBackend::WebGpu(ref mut vision) = backend {
+        let total_ops = rows * in_dim * out_dim;
+        if total_ops >= 1 << 16 {
+            vision.linear_batch(input, rows, in_dim, weight, out_dim, bias, out);
+            return;
+        }
+        // Small ops: fall through to CPU scalar loop below.
+    }
+
     if let LinearBackend::Metal {
         ctx,
         weight_t_cache,
@@ -3391,6 +3708,8 @@ enum LinearBackend {
         ctx: MetalMatmul,
         weight_t_cache: HashMap<(usize, usize, usize), MetalBuffer>,
     },
+    #[cfg(feature = "webgpu")]
+    WebGpu(VisionWebGpu),
 }
 
 fn add_bias_rows(out: &mut [f32], rows: usize, cols: usize, bias: &[f32]) {

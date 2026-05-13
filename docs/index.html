@@ -4,12 +4,7 @@
         <meta charset="UTF-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
         <title>cellm | Inference Projects</title>
-        <link rel="preconnect" href="https://fonts.googleapis.com" />
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-        <link
-            href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:ital,wght@0,100..900;1,100..900&display=swap"
-            rel="stylesheet"
-        />
+
         <style>
             :root {
                 --bg: #ffffff;
@@ -29,46 +24,46 @@
                 background-color: var(--bg);
                 color: var(--text);
                 font-family:
-                    "Hanken Grotesk",
+                    system-ui,
                     -apple-system,
-                    BlinkMacSystemFont,
                     sans-serif;
-                line-height: 1.6;
+                line-height: 1.5;
                 -webkit-font-smoothing: antialiased;
                 -moz-osx-font-smoothing: grayscale;
-                padding: 80px 40px;
+                padding: 3rem 1rem;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
             }
 
             .container {
-                max-width: 800px;
-                margin: 0 auto;
+                width: 100%;
+                max-width: 640px;
             }
 
             header {
-                margin-bottom: 80px;
+                margin-bottom: 2rem;
+                width: 100%;
             }
 
             h1 {
-                font-size: 1.5rem;
+                font-size: 1.3rem;
                 font-weight: 600;
-                letter-spacing: -0.04em;
-                margin-bottom: 12px;
-                text-transform: lowercase;
+                margin-bottom: 0.25rem;
             }
 
             .description {
                 color: var(--text-secondary);
-                font-size: 0.95rem;
+                font-size: 0.85rem;
                 font-weight: 400;
-                max-width: 500px;
             }
 
             .search-container {
-                margin-bottom: 60px;
+                margin-bottom: 2rem;
                 position: sticky;
                 top: 0;
                 background: var(--bg);
-                padding: 20px 0;
+                padding: 1rem 0;
                 z-index: 10;
             }
 
@@ -89,7 +84,7 @@
             }
 
             section {
-                margin-bottom: 80px;
+                margin-bottom: 2rem;
             }
 
             h2 {
@@ -97,8 +92,8 @@
                 font-weight: 600;
                 color: var(--text-secondary);
                 text-transform: uppercase;
-                letter-spacing: 0.15em;
-                margin-bottom: 32px;
+                letter-spacing: 0.1em;
+                margin-bottom: 0.75rem;
                 display: flex;
                 align-items: center;
             }
@@ -114,7 +109,7 @@
             .project-list {
                 display: flex;
                 flex-direction: column;
-                gap: 24px;
+                gap: 1rem;
             }
 
             .project-item {
@@ -129,9 +124,9 @@
             }
 
             .project-title {
-                font-size: 1.15rem;
+                font-size: 0.95rem;
                 font-weight: 500;
-                margin-bottom: 6px;
+                margin-bottom: 4px;
                 color: var(--text);
                 display: inline-block;
                 border-bottom: 1px solid transparent;
@@ -143,18 +138,19 @@
             }
 
             .project-meta {
-                font-size: 0.9rem;
+                font-size: 0.8rem;
                 color: var(--text-secondary);
                 font-weight: 400;
             }
 
             footer {
-                margin-top: 160px;
-                font-size: 0.85rem;
+                margin-top: 4rem;
+                font-size: 0.8rem;
                 color: var(--text-secondary);
                 border-top: 1px solid var(--border);
-                padding-top: 40px;
-                padding-bottom: 80px;
+                padding-top: 2rem;
+                padding-bottom: 4rem;
+                width: 100%;
             }
 
             /* Micro-animations */
@@ -175,23 +171,24 @@
 
             /* Markdown Content Styling */
             .markdown-body {
-                font-size: 1rem;
+                font-size: 0.85rem;
+                line-height: 1.5;
                 color: var(--text);
             }
 
             .markdown-body h1 {
-                font-size: 1.8rem;
-                margin-top: 40px;
-                margin-bottom: 24px;
-                letter-spacing: -0.04em;
+                font-size: 1.1rem;
+                margin-top: 1.5rem;
+                margin-bottom: 0.5rem;
+                letter-spacing: -0.02em;
             }
 
             .markdown-body h2 {
-                font-size: 1.3rem;
-                margin-top: 48px;
-                margin-bottom: 16px;
+                font-size: 0.95rem;
+                margin-top: 1.25rem;
+                margin-bottom: 0.5rem;
                 text-transform: none;
-                letter-spacing: -0.02em;
+                letter-spacing: -0.01em;
                 border-bottom: none;
                 color: var(--text);
             }
@@ -201,41 +198,41 @@
             }
 
             .markdown-body h3 {
-                font-size: 1.1rem;
-                margin-top: 32px;
-                margin-bottom: 12px;
+                font-size: 0.85rem;
+                margin-top: 1rem;
+                margin-bottom: 0.5rem;
             }
 
             .markdown-body p {
-                margin-bottom: 20px;
+                margin-bottom: 0.75rem;
             }
 
             .markdown-body ul,
             .markdown-body ol {
-                margin-bottom: 20px;
-                padding-left: 24px;
+                margin-bottom: 0.75rem;
+                padding-left: 1.25rem;
             }
 
             .markdown-body li {
-                margin-bottom: 8px;
+                margin-bottom: 0.25rem;
             }
 
             .markdown-body code {
                 font-family:
                     ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
                     monospace;
-                background: #f4f4f4;
-                padding: 2px 4px;
-                border-radius: 4px;
-                font-size: 0.9em;
+                background: #f5f5f5;
+                padding: 0.1rem 0.3rem;
+                border-radius: 2px;
+                font-size: 0.8rem;
             }
 
             .markdown-body pre {
-                background: #f9f9f9;
-                padding: 24px;
-                border-radius: 8px;
+                background: #f5f5f5;
+                padding: 1rem;
+                border-radius: 4px;
                 overflow-x: auto;
-                margin-bottom: 24px;
+                margin-bottom: 1rem;
                 border: 1px solid var(--border);
                 position: relative;
             }
@@ -277,18 +274,11 @@
 
             .markdown-body blockquote {
                 border-left: 2px solid var(--text);
-                padding-left: 20px;
+                padding-left: 0.75rem;
                 margin-left: 0;
+                margin-bottom: 0.75rem;
                 font-style: italic;
                 color: var(--text-secondary);
-            }
-
-            .markdown-body a {
-                color: var(--text);
-                text-decoration: underline;
-                text-underline-offset: 4px;
-                text-decoration-color: var(--border);
-                transition: text-decoration-color 0.2s ease;
             }
 
             .markdown-body a:hover {
@@ -298,34 +288,34 @@
             .markdown-body img {
                 max-width: 100%;
                 height: auto;
-                border-radius: 8px;
-                margin: 32px 0;
+                border-radius: 4px;
+                margin: 1rem 0;
             }
 
             .markdown-body hr {
                 border: none;
                 border-top: 1px solid var(--border);
-                margin: 48px 0;
+                margin: 1.5rem 0;
             }
 
             /* Table Styling */
             .markdown-body table {
                 width: 100%;
                 border-collapse: collapse;
-                margin: 32px 0;
-                font-size: 0.95rem;
+                margin: 1rem 0;
+                font-size: 0.8rem;
             }
 
             .markdown-body th {
                 text-align: left;
                 font-weight: 600;
-                padding: 12px 16px;
+                padding: 0.5rem 0.75rem;
                 border-bottom: 2px solid var(--text);
                 color: var(--text);
             }
 
             .markdown-body td {
-                padding: 16px;
+                padding: 0.5rem 0.75rem;
                 border-bottom: 1px solid var(--border);
                 color: var(--text-secondary);
             }
@@ -348,12 +338,12 @@
 
             .mermaid-wrapper {
                 position: relative;
-                margin: 40px 0;
+                margin: 1.5rem 0;
                 border: 1px solid var(--border);
-                border-radius: 8px;
+                border-radius: 4px;
                 overflow: hidden;
                 background: var(--bg);
-                height: 500px; /* Fixed height for pan-zoom context */
+                height: 400px; /* Reduced height */
             }
 
             .mermaid {
@@ -427,8 +417,8 @@
             .markdown-body video {
                 max-width: 100%;
                 height: auto;
-                border-radius: 8px;
-                margin: 32px 0;
+                border-radius: 4px;
+                margin: 1rem 0;
                 border: 1px solid var(--border);
             }
 
@@ -604,13 +594,13 @@
 
             @media (max-width: 600px) {
                 body {
-                    padding: 60px 24px;
+                    padding: 2rem 1rem;
                 }
                 header {
-                    margin-bottom: 60px;
+                    margin-bottom: 1.5rem;
                 }
                 h1 {
-                    font-size: 1.25rem;
+                    font-size: 1.2rem;
                 }
             }
         </style>
@@ -645,10 +635,9 @@
                 <p
                     class="description"
                     style="
-                        margin-top: 16px;
+                        margin-top: 1rem;
                         font-weight: 300;
                         color: var(--text-secondary);
-                        max-width: 650px;
                     "
                 >
                     Mobile-native LLM serving engine research in Rust. Paged KV
@@ -658,7 +647,7 @@
                 <p
                     class="description"
                     style="
-                        margin-top: 8px;
+                        margin-top: 0.5rem;
                         font-size: 0.8rem;
                         letter-spacing: 0.02em;
                         color: var(--text-secondary);
@@ -668,7 +657,7 @@
                     <strong>CellmFFI.xcframework:</strong> 33MB total (11MB per
                     platform: iOS, Simulator, macOS)<br/><strong>cellm-sdk.aar:</strong> 157KB + ~4.5MB .so<br/><strong>cellm-wasm:</strong> 2.6MB .wasm + WebGPU support + 21KB JS glue <a href="wasm/index.html" target="_blank" style="color: #0969da; text-decoration: none; margin-left: 8px; border-bottom: 1px solid rgba(9, 105, 218, 0.3); transition: border-color 0.2s ease;" onmouseover="this.style.borderColor='#0969da'" onmouseout="this.style.borderColor='rgba(9, 105, 218, 0.3)'">[Launch Demo]</a>
                 </p>
-                <div id="gh-commits-wrapper" class="gh-commits-wrapper" style="margin-top: 24px;">
+                <div id="gh-commits-wrapper" class="gh-commits-wrapper" style="margin-top: 1.5rem;">
                     <div id="gh-first-commit" class="gh-first-commit">
                         Loading latest commit...
                     </div>

@@ -22,7 +22,7 @@ Not a wrapper around `llama.cpp`. Not a port of `vLLM`. A new runtime designed f
 | **iOS Demo App** | [`bindings/ios/CellmDemo`](bindings/ios/CellmDemo) |
 | **Android Bindings** | [`bindings/kotlin`](bindings/kotlin) |
 | **WASM & WebGPU** | [`docs/wasm-backend.md`](docs/wasm-backend.md) |
-| **Live WASM Demo** | [cellm.ai/wasm](https://cellm.ai/wasm) (Research Preview) |
+| **Live WASM Demo** | [cellm-wasm (](https://jeffasante.github.io/cellm/wasm/index.html) (Research Preview) |
 
 ## Quick Start
 

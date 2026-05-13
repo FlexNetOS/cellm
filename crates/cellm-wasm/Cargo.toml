@@ -13,7 +13,7 @@ cellm-cache = { path = "../cellm-cache" }
 cellm-model = { path = "../cellm-model" }
 cellm-scheduler = { path = "../cellm-scheduler" }
 cellm-kernels = { path = "../cellm-kernels", features = ["webgpu"] }
-cellm-sdk = { path = "../cellm-sdk" }
+cellm-sdk = { path = "../cellm-sdk", features = ["webgpu"] }
 anyhow = { workspace = true }
 rayon = { workspace = true }
 half = { workspace = true }

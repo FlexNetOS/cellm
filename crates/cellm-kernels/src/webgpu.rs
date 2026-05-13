@@ -254,6 +254,119 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// Batch matrix-vector multiply: out[r, o] = sum_k weight[o, k] * x[r, k]
+/// weight is [M × K] row-major, x is [R × K] row-major, out is [R × M] row-major.
+/// Each workgroup handles one output row (one row in x maps to one row in out).
+const WGSL_MATMUL_BATCH_F32: &str = r#"
+@group(0) @binding(0) var<storage, read> weight: array<f32>;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+
+struct Uniforms {
+    M: u32,   // output cols (weight rows)
+    K: u32,   // input cols  (weight cols)
+    R: u32,   // number of input rows
+};
+
+@group(0) @binding(3) var<uniform> params: Uniforms;
+
+@compute @workgroup_size(64)
+fn batch_matmul_f32(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let col = gid.x;      // output column (0..M)
+    let row = gid.y;      // input row (0..R)
+    if col >= params.M || row >= params.R { return; }
+    var sum: f32 = 0.0;
+    for (var k: u32 = 0u; k < params.K; k += 1u) {
+        sum += weight[col * params.K + k] * x[row * params.K + k];
+    }
+    out[row * params.M + col] = sum;
+}
+"#;
+
+/// Batch Layer Normalization: for each row, compute mean/variance, then normalize.
+/// out[r, i] = (x[r, i] - mean(r)) * rsqrt(var(r) + eps) * weight[i] + bias[i]
+const WGSL_LAYER_NORM_BATCH: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> weight: array<f32>;
+@group(0) @binding(2) var<storage, read> bias: array<f32>;
+@group(0) @binding(3) var<storage, read_write> out: array<f32>;
+
+struct Uniforms {
+    cols: u32,
+    rows: u32,
+    eps: f32,
+};
+
+@group(0) @binding(4) var<uniform> params: Uniforms;
+
+var<workgroup> wg_mean: f32;
+var<workgroup> wg_var: f32;
+
+@compute @workgroup_size(64)
+fn batch_layer_norm(@builtin(global_invocation_id) gid: vec3<u32>,
+                    @builtin(local_invocation_id) lid: vec3<u32>) {
+    let col = gid.x;
+    let row = gid.y;
+    if col >= params.cols || row >= params.rows { return; }
+
+    let base = row * params.cols;
+
+    // Compute mean (single-thread per row is fine for small cols via loop)
+    // Use workgroup reduction when cols <= 64 for the first lane per row
+    var mean: f32 = 0.0;
+    var var_sum: f32 = 0.0;
+    for (var c: u32 = 0u; c < params.cols; c += 1u) {
+        let v = x[base + c];
+        mean += v;
+    }
+    mean = mean / f32(params.cols);
+
+    for (var c2: u32 = 0u; c2 < params.cols; c2 += 1u) {
+        let d = x[base + c2] - mean;
+        var_sum += d * d;
+    }
+    let inv = 1.0 / sqrt(var_sum / f32(params.cols) + params.eps);
+
+    let v = x[base + col];
+    out[base + col] = (v - mean) * inv * weight[col] + bias[col];
+}
+"#;
+
+/// Batch RMS Normalization (per row).
+/// out[r, i] = x[r, i] * rsqrt(mean(x[r]²) + eps) * weight[i]
+const WGSL_RMS_NORM_BATCH: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> weight: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+
+struct Uniforms {
+    cols: u32,
+    rows: u32,
+    eps: f32,
+};
+
+@group(0) @binding(3) var<uniform> params: Uniforms;
+
+@compute @workgroup_size(64)
+fn batch_rms_norm(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let col = gid.x;
+    let row = gid.y;
+    if col >= params.cols || row >= params.rows { return; }
+
+    let base = row * params.cols;
+
+    var ms: f32 = 0.0;
+    for (var c: u32 = 0u; c < params.cols; c += 1u) {
+        let v = x[base + c];
+        ms += v * v;
+    }
+    ms = ms / f32(params.cols);
+    let inv = 1.0 / sqrt(ms + params.eps);
+
+    out[base + col] = x[base + col] * inv * weight[col];
+}
+"#;
+
 // ---------------------------------------------------------------------------
 // WebGPU backend state
 // ---------------------------------------------------------------------------
@@ -269,7 +382,10 @@ pub struct WebGpuBackend {
 struct WebGpuPipelines {
     matmul_f32: wgpu::ComputePipeline,
     matmul_f16: wgpu::ComputePipeline,
+    matmul_batch_f32: wgpu::ComputePipeline,
     rms_norm: wgpu::ComputePipeline,
+    rms_norm_batch: wgpu::ComputePipeline,
+    layer_norm_batch: wgpu::ComputePipeline,
     rope_half: wgpu::ComputePipeline,
     softmax: wgpu::ComputePipeline,
     silu_mul: wgpu::ComputePipeline,
@@ -341,7 +457,10 @@ impl WebGpuBackend {
         WebGpuPipelines {
             matmul_f32: make("matmul_f32"),
             matmul_f16: make("matmul_f16"),
+            matmul_batch_f32: make("batch_matmul_f32"),
             rms_norm: make("rms_norm"),
+            rms_norm_batch: make("batch_rms_norm"),
+            layer_norm_batch: make("batch_layer_norm"),
             rope_half: make("rope_half"),
             softmax: make("softmax"),
             silu_mul: make("silu_mul"),
@@ -716,6 +835,320 @@ impl WebGpuBackend {
 
         self.download_f32(&gate_buf, n as usize, gate);
     }
+
+    // -----------------------------------------------------------------------
+    // Batch kernels for vision encoder (multiple input rows per dispatch)
+    // -----------------------------------------------------------------------
+
+    /// Batch matmul: out[r, o] = sum_k weight[o, k] * x[r, k]
+    /// weight is [out_dim × in_dim] row-major (cached on GPU in w_buf).
+    /// x is [rows × in_dim] row-major, out is [rows × out_dim] row-major.
+    pub fn matmul_batch_f32(
+        &self,
+        w_buf: &wgpu::Buffer,
+        rows: u32,
+        out_dim: u32,
+        in_dim: u32,
+        x: &[f32],
+        out: &mut [f32],
+    ) {
+        let total = rows * out_dim;
+        let x_buf = self.upload_f32(x);
+        let out_buf = self.create_f32_output(total as usize);
+
+        let uniforms = [out_dim, in_dim, rows, 0u32];
+        let u_buf = self.upload_f32(bytemuck::cast_slice(&uniforms));
+
+        let bind_group = self
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("matmul_batch_f32"),
+                layout: &self.pipelines.matmul_batch_f32.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: w_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: x_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: out_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: u_buf.as_entire_binding(),
+                    },
+                ],
+            });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            pass.set_pipeline(&self.pipelines.matmul_batch_f32);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let wg_x = (out_dim + 63) / 64;
+            pass.dispatch_workgroups(wg_x, rows, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+
+        self.download_f32(&out_buf, total as usize, out);
+    }
+
+    /// Batch layer norm: out[r,i] = (x[r,i]-mean)*rsqrt(var+eps)*w[i]+b[i]
+    pub fn layer_norm_batch(
+        &self,
+        w_buf: &wgpu::Buffer,
+        b_buf: &wgpu::Buffer,
+        rows: u32,
+        cols: u32,
+        eps: f32,
+        x: &[f32],
+        out: &mut [f32],
+    ) {
+        let x_buf = self.upload_f32(x);
+        let out_buf = self.create_f32_output((rows * cols) as usize);
+
+        let uniforms = [cols, rows, eps.to_bits(), 0u32];
+        let u_buf = self.upload_f32(bytemuck::cast_slice(&uniforms));
+
+        let bind_group = self
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("layer_norm_batch"),
+                layout: &self.pipelines.layer_norm_batch.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: x_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: w_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: b_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: out_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: u_buf.as_entire_binding(),
+                    },
+                ],
+            });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            pass.set_pipeline(&self.pipelines.layer_norm_batch);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let wg_x = (cols + 63) / 64;
+            pass.dispatch_workgroups(wg_x, rows, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+
+        self.download_f32(&out_buf, (rows * cols) as usize, out);
+    }
+
+    /// Batch RMS norm: out[r,i] = x[r,i] * rsqrt(mean(x[r]²)+eps) * w[i]
+    pub fn rms_norm_batch(
+        &self,
+        w_buf: &wgpu::Buffer,
+        rows: u32,
+        cols: u32,
+        eps: f32,
+        x: &[f32],
+        out: &mut [f32],
+    ) {
+        let x_buf = self.upload_f32(x);
+        let out_buf = self.create_f32_output((rows * cols) as usize);
+
+        let uniforms = [cols, rows, eps.to_bits(), 0u32];
+        let u_buf = self.upload_f32(bytemuck::cast_slice(&uniforms));
+
+        let bind_group = self
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("rms_norm_batch"),
+                layout: &self.pipelines.rms_norm_batch.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: x_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: w_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: out_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: u_buf.as_entire_binding(),
+                    },
+                ],
+            });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            pass.set_pipeline(&self.pipelines.rms_norm_batch);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let wg_x = (cols + 63) / 64;
+            pass.dispatch_workgroups(wg_x, rows, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+
+        self.download_f32(&out_buf, (rows * cols) as usize, out);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VisionWebGpu: high-level wrapper for vision-encoder GPU acceleration
+// ---------------------------------------------------------------------------
+
+/// Manages WebGPU weight caching and dispatch for vision-encoder linear
+/// projections and normalizations.  Created from a `WebGpuBackend` and
+/// passed into `vlm::run_vision_cellm` via `LinearBackend::WebGpu`.
+///
+/// Call `into_gpu()` after use to recover the `WebGpuBackend` for text inference.
+pub struct VisionWebGpu {
+    pub gpu: WebGpuBackend,
+    weight_cache: std::collections::HashMap<(usize, usize, usize), wgpu::Buffer>,
+}
+
+impl VisionWebGpu {
+    pub fn new(gpu: WebGpuBackend) -> Self {
+        Self {
+            gpu,
+            weight_cache: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Recover the WebGpuBackend after vision processing is complete.
+    pub fn into_gpu(self) -> WebGpuBackend {
+        self.gpu
+    }
+
+    /// Upload a weight matrix (or retrieve cached) and run batch matmul.
+    /// weight is [out_dim × in_dim] row-major; x is [rows × in_dim]; out is [rows × out_dim].
+    pub fn linear_batch(
+        &mut self,
+        x: &[f32],
+        rows: usize,
+        in_dim: usize,
+        weight: &[f32],
+        out_dim: usize,
+        bias: Option<&[f32]>,
+        out: &mut [f32],
+    ) {
+        if weight.is_empty() || rows == 0 || in_dim == 0 || out_dim == 0 {
+            return;
+        }
+
+        let key = (weight.as_ptr() as usize, in_dim, out_dim);
+        let w_buf = self.weight_cache.entry(key).or_insert_with(|| {
+            // Store weight transposed: WGSL reads weight[col * K + k]
+            // where weight is [M × K] with M=out_dim, K=in_dim.
+            // Our input weight is [out_dim × in_dim] row-major, which
+            // matches exactly — weight[col * in_dim + k] is correct.
+            self.gpu.upload_f32(weight)
+        });
+
+        self.gpu.matmul_batch_f32(
+            w_buf,
+            rows as u32,
+            out_dim as u32,
+            in_dim as u32,
+            x,
+            out,
+        );
+
+        if let Some(b) = bias {
+            for r in 0..rows {
+                let row = &mut out[r * out_dim..(r + 1) * out_dim];
+                for c in 0..out_dim {
+                    row[c] += b[c];
+                }
+            }
+        }
+    }
+
+    /// Upload weight+bias (or retrieve cached) and run batch layer norm.
+    pub fn layer_norm_batch(
+        &mut self,
+        x: &[f32],
+        rows: usize,
+        cols: usize,
+        weight: &[f32],
+        bias: &[f32],
+        eps: f32,
+        out: &mut [f32],
+    ) {
+        if cols == 0 || rows == 0 {
+            return;
+        }
+
+        let w_key = (weight.as_ptr() as usize, cols, 0);
+        let b_key = (bias.as_ptr() as usize, cols, 1);
+
+        // Avoid double mutable borrow by checking existence first
+        if !self.weight_cache.contains_key(&w_key) {
+            self.weight_cache.insert(w_key, self.gpu.upload_f32(weight));
+        }
+        if !self.weight_cache.contains_key(&b_key) {
+            self.weight_cache.insert(b_key, self.gpu.upload_f32(bias));
+        }
+
+        let w_buf = &self.weight_cache[&w_key];
+        let b_buf = &self.weight_cache[&b_key];
+
+        self.gpu.layer_norm_batch(
+            w_buf, b_buf,
+            rows as u32, cols as u32,
+            eps, x, out,
+        );
+    }
+
+    /// Upload weight (or retrieve cached) and run batch RMS norm.
+    pub fn rms_norm_batch(
+        &mut self,
+        x: &[f32],
+        rows: usize,
+        cols: usize,
+        weight: &[f32],
+        eps: f32,
+        out: &mut [f32],
+    ) {
+        if cols == 0 || rows == 0 {
+            return;
+        }
+
+        let w_key = (weight.as_ptr() as usize, cols, 2);
+        let w_buf = self.weight_cache.entry(w_key).or_insert_with(|| {
+            self.gpu.upload_f32(weight)
+        });
+
+        self.gpu.rms_norm_batch(
+            w_buf,
+            rows as u32, cols as u32,
+            eps, x, out,
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -724,13 +1157,17 @@ impl WebGpuBackend {
 
 fn wgsl_source() -> String {
     let mut s = String::with_capacity(
-        WGSL_MATMUL_F32.len() + WGSL_MATMUL_F16.len() + WGSL_RMS_NORM.len()
+        WGSL_MATMUL_F32.len() + WGSL_MATMUL_F16.len() + WGSL_MATMUL_BATCH_F32.len()
+        + WGSL_RMS_NORM.len() + WGSL_RMS_NORM_BATCH.len() + WGSL_LAYER_NORM_BATCH.len()
         + WGSL_ROPE_HALF.len() + WGSL_SOFTMAX.len() + WGSL_SILU_MUL.len()
-        + 32
+        + 64
     );
     s.push_str(WGSL_MATMUL_F32); s.push('\n');
     s.push_str(WGSL_MATMUL_F16); s.push('\n');
+    s.push_str(WGSL_MATMUL_BATCH_F32); s.push('\n');
     s.push_str(WGSL_RMS_NORM); s.push('\n');
+    s.push_str(WGSL_RMS_NORM_BATCH); s.push('\n');
+    s.push_str(WGSL_LAYER_NORM_BATCH); s.push('\n');
     s.push_str(WGSL_ROPE_HALF); s.push('\n');
     s.push_str(WGSL_SOFTMAX); s.push('\n');
     s.push_str(WGSL_SILU_MUL);

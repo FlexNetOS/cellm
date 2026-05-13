@@ -51,6 +51,10 @@ use tokenizers::Tokenizer;
 
 #[cfg(target_arch = "wasm32")]
 use cellm_kernels::WebGpuBackend;
+#[cfg(target_arch = "wasm32")]
+use cellm_kernels::VisionWebGpu;
+#[cfg(target_arch = "wasm32")]
+use cellm_sdk::vlm::VlmRunConfig;
 
 // ---------------------------------------------------------------------------
 // Panic hook
@@ -76,7 +80,11 @@ pub struct CellmEngine {
     engine: Mutex<Engine>,
     tokenizer: RefCell<Option<Tokenizer>>,
     #[cfg(target_arch = "wasm32")]
-    gpu: Option<WebGpuBackend>,
+    model_bytes: Vec<u8>,
+    #[cfg(target_arch = "wasm32")]
+    tokenizer_bytes: RefCell<Option<Vec<u8>>>,
+    #[cfg(target_arch = "wasm32")]
+    gpu: RefCell<Option<WebGpuBackend>>,
 }
 
 #[wasm_bindgen]
@@ -100,22 +108,29 @@ impl CellmEngine {
     #[wasm_bindgen(constructor)]
     pub fn new(model_bytes: Vec<u8>, config_json: &str) -> Result<CellmEngine, JsValue> {
         let cfg: EngineConfig = deserialize_config(config_json)?;
+        // Clone model bytes for later VLM use (WASM only).
+        // For non-WASM targets this clone is optimized away by cfg.
+        #[cfg(target_arch = "wasm32")]
+        let vlm_model_bytes = model_bytes.clone();
         let engine = Engine::from_vec(model_bytes, cfg)
             .map_err(|e| JsValue::from_str(&format!("CellmEngine::new: {e}")))?;
         Ok(CellmEngine {
             engine: Mutex::new(engine),
             tokenizer: RefCell::new(None),
             #[cfg(target_arch = "wasm32")]
-            gpu: None,
+            model_bytes: vlm_model_bytes,
+            tokenizer_bytes: RefCell::new(None),
+            #[cfg(target_arch = "wasm32")]
+            gpu: RefCell::new(None),
         })
     }
 
     /// Try to initialize WebGPU acceleration. Returns true if GPU is available.
     /// Call with `await engine.try_init_webgpu()` from JavaScript.
     #[cfg(target_arch = "wasm32")]
-    pub async fn try_init_webgpu(&mut self) -> bool {
+    pub async fn try_init_webgpu(&self) -> bool {
         if let Some(gpu) = WebGpuBackend::create().await {
-            self.gpu = Some(gpu);
+            *self.gpu.borrow_mut() = Some(gpu);
             true
         } else {
             false
@@ -124,7 +139,7 @@ impl CellmEngine {
 
     /// Check whether WebGPU acceleration is active.
     pub fn has_gpu(&self) -> bool {
-        #[cfg(target_arch = "wasm32")] { self.gpu.is_some() }
+        #[cfg(target_arch = "wasm32")] { self.gpu.borrow().is_some() }
         #[cfg(not(target_arch = "wasm32"))] false
     }
 
@@ -154,7 +169,59 @@ impl CellmEngine {
                 ))
             })?;
         *self.tokenizer.borrow_mut() = Some(tokenizer);
+        #[cfg(target_arch = "wasm32")]
+        { *self.tokenizer_bytes.borrow_mut() = Some(sanitized.into_bytes()); }
         Ok(())
+    }
+
+    /// Describe an image using the VLM (Vision-Language Model) pipeline.
+    /// Requires WebGPU to be initialized via `try_init_webgpu()` first.
+    /// Returns the generated text description, or falls back to a text-only
+    /// response if WebGPU is not available.
+    ///
+    /// - `image_bytes`: raw image file (JPEG/PNG) as a `Uint8Array`
+    /// - `prompt`: text prompt to guide the description
+    /// - `max_tokens`: maximum number of output tokens
+    #[cfg(target_arch = "wasm32")]
+    pub fn describe_image(
+        &self,
+        image_bytes: Vec<u8>,
+        prompt: &str,
+        max_tokens: u32,
+    ) -> Result<String, JsValue> {
+        let gpu = self.gpu.borrow_mut().take()
+            .ok_or_else(|| JsValue::from_str("WebGPU not initialized. Call try_init_webgpu() first."))?;
+        let tokenizer_bytes = self.tokenizer_bytes.borrow().clone()
+            .ok_or_else(|| JsValue::from_str("Tokenizer not set. Call set_tokenizer() first."))?;
+        let vision = VisionWebGpu::new(gpu);
+        let cfg = VlmRunConfig {
+            backend: BackendKind::Cpu,
+            tokens_per_block: 16,
+            top_k: 40,
+            temperature: 0.8,
+            seed: 1,
+            repeat_penalty: 1.05,
+            repeat_window: 64,
+            max_new_tokens: max_tokens.max(16) as usize,
+            min_new_tokens: 1,
+        };
+        let result = cellm_sdk::vlm::describe_image_with_cellm_webgpu_from_bytes(
+            &self.model_bytes,
+            &tokenizer_bytes,
+            &image_bytes,
+            prompt,
+            cfg,
+            vision,
+        );
+        match result {
+            Ok((text, _timing, vision)) => {
+                *self.gpu.borrow_mut() = Some(vision.into_gpu());
+                Ok(text)
+            }
+            Err(e) => {
+                Err(JsValue::from_str(&format!("describe_image failed: {e}")))
+            }
+        }
     }
 
     /// Check whether a tokenizer has been set.
@@ -468,7 +535,7 @@ fn pre_tokenizer_has_unicode_props(pt: Option<&serde_json::Value>) -> bool {
             }
         }
         Some("Split") => {
-            // Check if the regex pattern contains \p{ 
+            // Check if the regex pattern contains \p{
             if let Some(pattern_obj) = pt.get("pattern") {
                 if let Some(regex_str) = pattern_obj.get("Regex").and_then(|r| r.as_str()) {
                     return regex_str.contains("\\p{");
