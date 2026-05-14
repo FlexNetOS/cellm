@@ -81,7 +81,7 @@ pub struct VlmRunConfig {
 impl Default for VlmRunConfig {
     fn default() -> Self {
         Self {
-            backend: BackendKind::Cpu,
+            backend: BackendKind::WebGpu,
             tokens_per_block: 16,
             top_k: 40,
             temperature: 0.7,
@@ -237,6 +237,7 @@ pub fn describe_image_with_cellm_timed(
             }
         }
         BackendKind::Cpu => LinearBackend::Cpu,
+        BackendKind::WebGpu => LinearBackend::Cpu, // Vision encoder still on CPU for now
     };
     let (mut image_features, image_seq_len, patch_ms, encoder_ms, encoder_layer_ms) =
         pollster::block_on(run_vision_cellm(
@@ -612,17 +613,20 @@ pub async fn describe_image_with_cellm_webgpu_from_bytes(
         }
     }
 
-    let (generated, decode_ms) = run_decode_cellm_from_bytes(
+    let (generated, decode_ms, vision_back) = run_decode_cellm_from_bytes(
         model_bytes,
         image_token_id,
         eos_token_id,
         end_of_utt,
-        cfg,
+        cfg.clone(),
         input_ids,
         &image_features,
         false,
         &banned_token_ids,
+        Some(vision),
     ).await?;
+    let vision = vision_back.expect("Vision context lost in decode");
+
     let text = tok
         .decode(&generated.into_iter().map(|t| t as u32).collect::<Vec<u32>>(), true)
         .map_err(|e| anyhow::anyhow!("decode failed: {e}"))?;
@@ -793,7 +797,8 @@ async fn run_decode_cellm_inner(
     image_features: &Array2<f32>,
     prefix_image_features: bool,
     banned_token_ids: &[i64],
-) -> Result<(Vec<i64>, f64)> {
+    vision_webgpu: Option<cellm_kernels::webgpu::VisionWebGpu>,
+) -> Result<(Vec<i64>, f64, Option<cellm_kernels::webgpu::VisionWebGpu>)> {
     let decode_start = stats_instant_now();
     enum DecodeRunner {
         Llama(LlamaRunner),
@@ -825,6 +830,13 @@ async fn run_decode_cellm_inner(
         match &mut runner {
             DecodeRunner::Llama(r) => { r.enable_metal_full_backend(); }
             DecodeRunner::Gemma(r) => { r.enable_metal_full_backend(); }
+        }
+    }
+    #[cfg(feature = "webgpu")]
+    if let Some(vw) = vision_webgpu {
+        match &mut runner {
+            DecodeRunner::Llama(r) => { r.enable_webgpu_backend(vw.gpu); }
+            _ => {}
         }
     }
 
@@ -924,7 +936,7 @@ async fn run_decode_cellm_inner(
                 }
                 if let DecodeRunner::Llama(r) = &mut runner {
                     let maybe_logits = r
-                        .prefill_fused_hidden(&x_all, 0, &mut page_table, &mut kv_cache, true)
+                        .prefill_fused_hidden(&x_all, 0, &mut page_table, &mut kv_cache, true).await?
                         .map_err(|e| anyhow::anyhow!("{e}"))?;
                     if let Some(logits) = maybe_logits {
                         let cand = r
@@ -1173,11 +1185,11 @@ async fn run_decode_cellm_inner(
                     anyhow::bail!("image token count mismatch: prompt has more <image> tokens than vision features");
                 }
 
-                let use_metal_batch = cfg.backend == BackendKind::Metal
+                let use_gpu_batch = (cfg.backend == BackendKind::Metal || cfg.backend == BackendKind::WebGpu)
                     && matches!(&runner, DecodeRunner::Llama(_))
                     && run_len > 1;
 
-                if use_metal_batch {
+                if use_gpu_batch {
                     // Batch process all image tokens in one command buffer
                     let mut x_all = Vec::with_capacity(run_len * hidden);
                     for j in 0..run_len {
@@ -1189,8 +1201,7 @@ async fn run_decode_cellm_inner(
                         }
                     }
                     if let DecodeRunner::Llama(r) = &mut runner {
-                        r.prefill_fused_hidden(&x_all, pos, &mut page_table, &mut kv_cache, false)
-                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        r.prefill_fused_hidden(&x_all, pos, &mut page_table, &mut kv_cache, false).await?;
                     }
                     // Update x to last image token's hidden state for the caller
                     let last_src = image_features.index_axis(Axis(0), image_idx + run_len - 1);
@@ -1199,7 +1210,25 @@ async fn run_decode_cellm_inner(
                     image_idx += run_len;
                 } else {
                     // Fallback: process one by one
-                    for _ in 0..run_len {
+                    for p_step in 0..run_len {
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            if p_step > 0 && p_step % 8 == 0 {
+                                let promise = js_sys::Promise::new(&mut |resolve, _| {
+                                    if let Some(window) = web_sys::window() {
+                                        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0);
+                                    } else {
+                                        let _ = resolve.call0(&wasm_bindgen::JsValue::undefined());
+                                    }
+                                });
+                                let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+                                // Log progress so user knows it hasn't crashed
+                                if p_step % 64 == 0 {
+                                    eprintln!("VLM: Prefilling image tokens {} / {}...", p_step, run_len);
+                                }
+                            }
+                        }
+
                         if std::env::var("CELLM_VLM_ZERO_IMAGE_FEATURES").is_ok() {
                             x.fill(0.0);
                         } else {
@@ -1221,6 +1250,19 @@ async fn run_decode_cellm_inner(
                     }
                 }
             } else {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    if i > 0 && i % 8 == 0 {
+                        let promise = js_sys::Promise::new(&mut |resolve, _| {
+                            if let Some(window) = web_sys::window() {
+                                let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0);
+                            } else {
+                                let _ = resolve.call0(&wasm_bindgen::JsValue::undefined());
+                            }
+                        });
+                        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+                    }
+                }
                 match &runner {
                     DecodeRunner::Llama(r) => r
                         .embed_token_hidden(tok_id as u32, &mut x)
@@ -1349,7 +1391,11 @@ async fn run_decode_cellm_inner(
         }
     }
 
-    Ok((generated, stats_elapsed_ms(&decode_start)))
+    let vw = match runner {
+        DecodeRunner::Llama(mut r) => r.take_webgpu_backend().map(|gpu| cellm_kernels::webgpu::VisionWebGpu::new(gpu)),
+        _ => None,
+    };
+    Ok((generated, stats_elapsed_ms(&decode_start), vw))
 }
 
 /// Load from a filesystem path (wraps run_decode_cellm_inner).
@@ -1365,10 +1411,11 @@ async fn run_decode_cellm(
     banned_token_ids: &[i64],
 ) -> Result<(Vec<i64>, f64)> {
     let file = CellmFile::load(model_path).map_err(|e| anyhow::anyhow!("{e}"))?;
-    run_decode_cellm_inner(
+    let (gen, ms, _) = run_decode_cellm_inner(
         file, image_token_id, eos_token_id, end_of_utterance_id,
-        cfg, input_ids, image_features, prefix_image_features, banned_token_ids,
-    ).await
+        cfg, input_ids, image_features, prefix_image_features, banned_token_ids, None,
+    ).await?;
+    Ok((gen, ms))
 }
 
 /// Load from model bytes (WASM-friendly, wraps run_decode_cellm_inner).
@@ -1382,12 +1429,13 @@ async fn run_decode_cellm_from_bytes(
     image_features: &Array2<f32>,
     prefix_image_features: bool,
     banned_token_ids: &[i64],
-) -> Result<(Vec<i64>, f64)> {
+    vision_webgpu: Option<cellm_kernels::webgpu::VisionWebGpu>,
+) -> Result<(Vec<i64>, f64, Option<cellm_kernels::webgpu::VisionWebGpu>)> {
     let file = CellmFile::load_from_bytes(model_bytes)
         .map_err(|e| anyhow::anyhow!("CellmFile::load_from_bytes: {e}"))?;
     run_decode_cellm_inner(
         file, image_token_id, eos_token_id, end_of_utterance_id,
-        cfg, input_ids, image_features, prefix_image_features, banned_token_ids,
+        cfg, input_ids, image_features, prefix_image_features, banned_token_ids, vision_webgpu,
     ).await
 }
 

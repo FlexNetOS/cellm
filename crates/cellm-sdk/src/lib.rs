@@ -60,6 +60,8 @@ pub struct EngineConfig {
 pub enum BackendKind {
     Cpu,
     Metal,
+    #[cfg(feature = "webgpu")]
+    WebGpu,
 }
 
 impl Default for EngineConfig {
@@ -259,6 +261,7 @@ impl Engine {
         let storage_kind = match selected_backend {
             BackendKind::Cpu => KvStorageKind::Cpu,
             BackendKind::Metal => KvStorageKind::Metal,
+            BackendKind::WebGpu => KvStorageKind::Cpu, // Use CPU for KV cache on WebGPU for now
         };
         let kv_cache = KVCache::new_with_kind_and_encoding(layout, storage_kind, engine_cfg.kv_encoding)?;
 
@@ -296,6 +299,7 @@ impl Engine {
         match self.backend {
             BackendKind::Cpu => "cpu",
             BackendKind::Metal => "metal",
+            BackendKind::WebGpu => "webgpu",
         }
     }
 
@@ -805,6 +809,7 @@ impl Engine {
         };
         let backend_cap = match self.backend {
             BackendKind::Metal => 4usize,
+            BackendKind::WebGpu => 4usize,
             BackendKind::Cpu => 2usize,
         };
         session_cap.min(backend_cap).max(1)

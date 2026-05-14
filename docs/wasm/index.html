@@ -931,7 +931,7 @@
                 try {
                     log("VLM: running describe_image...");
                     status.textContent = "Processing image with vision encoder...";
-                    const description = engine.describe_image(
+                    const description = await engine.describe_image(
                         imageBytes,
                         vlmPrompt.value,
                         max
@@ -1112,7 +1112,7 @@
                         // VLM path: describe_image gives full response at once
                         status.textContent = "Vision encoder processing...";
                         try {
-                            const description = engine.describe_image(
+                            const description = await engine.describe_image(
                                 savedImageBytes, text, 128
                             );
                             assistantSpan.textContent = description || "(no response)";

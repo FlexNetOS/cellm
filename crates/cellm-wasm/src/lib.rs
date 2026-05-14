@@ -195,7 +195,7 @@ impl CellmEngine {
             .ok_or_else(|| JsValue::from_str("Tokenizer not set. Call set_tokenizer() first."))?;
         let vision = VisionWebGpu::new(gpu);
         let cfg = VlmRunConfig {
-            backend: BackendKind::Cpu,
+            backend: BackendKind::WebGpu,
             tokens_per_block: 16,
             top_k: 40,
             temperature: 0.8,

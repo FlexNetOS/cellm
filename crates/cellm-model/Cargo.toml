@@ -15,6 +15,11 @@ half = { workspace = true }
 bytemuck = { workspace = true }
 rayon = { workspace = true }
 libc = "0.2"
+wgpu = { version = "24", optional = true }
+
+[features]
+default = []
+webgpu = ["cellm-kernels/webgpu", "dep:wgpu"]
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 metal = "0.27.0"

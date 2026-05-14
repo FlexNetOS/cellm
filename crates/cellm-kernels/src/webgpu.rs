@@ -83,18 +83,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if row >= params.M { return; }
     var sum: f32 = 0.0;
 
-    // Two u16 per u32 word; stride in u32 words = K / 2
-    let stride = (params.K + 1u) / 2u;
-    var k_even: u32 = 0u;
-    for (var k: u32 = 0u; k < params.K; k += 2u) {
-        let word = A[row * stride + k_even];
-        let val0 = unpack16(word, 0u);
-        sum += val0 * x[k];
-        if k + 1u < params.K {
-            let val1 = unpack16(word, 1u);
-            sum += val1 * x[k + 1u];
-        }
-        k_even += 1u;
+    var flat_idx = row * params.K;
+    for (var k: u32 = 0u; k < params.K; k += 1u) {
+        let word = A[flat_idx >> 1u];
+        sum += unpack16(word, flat_idx) * x[k];
+        flat_idx += 1u;
     }
     out[row] = sum;
 }
@@ -311,6 +304,53 @@ fn batch_matmul_f32(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// Batch matrix-vector multiply with f16 weights.
+const WGSL_MATMUL_BATCH_F16: &str = r#"
+@group(0) @binding(0) var<storage, read> A: array<u32>;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+
+struct Uniforms {
+    M: u32,   // output cols
+    K: u32,   // input cols
+    R: u32,   // number of input rows
+};
+
+@group(0) @binding(3) var<uniform> params: Uniforms;
+
+fn f16_bits_to_f32(bits: u32) -> f32 {
+    let sign = (bits & 0x8000u) << 16u;
+    let exp = (bits >> 10u) & 0x1Fu;
+    let mant = bits & 0x03FFu;
+    if exp == 0u {
+        if mant == 0u { return bitcast<f32>(sign); }
+        return select(f32(mant) * 5.960464477539063e-8, -f32(mant) * 5.960464477539063e-8, sign != 0u);
+    }
+    if exp == 31u { return bitcast<f32>(sign | 0x7F800000u | (mant << 13u)); }
+    return bitcast<f32>(sign | ((exp + 112u) << 23u) | (mant << 13u));
+}
+
+fn unpack16(word: u32, idx: u32) -> f32 {
+    let bits = select(word & 0xFFFFu, word >> 16u, (idx & 1u) == 1u);
+    return f16_bits_to_f32(bits);
+}
+
+@compute @workgroup_size(64)
+fn batch_matmul_f16(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let col = gid.x;      // output column
+    let row = gid.y;      // input row
+    if col >= params.M || row >= params.R { return; }
+    var sum: f32 = 0.0;
+    let base_a = col * params.K;
+    let base_x = row * params.K;
+    for (var k: u32 = 0u; k < params.K; k += 1u) {
+        let word = A[(base_a + k) >> 1u];
+        sum += unpack16(word, base_a + k) * x[base_x + k];
+    }
+    out[row * params.M + col] = sum;
+}
+"#;
+
 /// Batch Layer Normalization: for each row, compute mean/variance, then normalize.
 /// out[r, i] = (x[r, i] - mean(r)) * rsqrt(var(r) + eps) * weight[i] + bias[i]
 const WGSL_LAYER_NORM_BATCH: &str = r#"
@@ -411,6 +451,7 @@ struct WebGpuPipelines {
     matmul_f32: wgpu::ComputePipeline,
     matmul_f16: wgpu::ComputePipeline,
     matmul_batch_f32: wgpu::ComputePipeline,
+    matmul_batch_f16: wgpu::ComputePipeline,
     rms_norm: wgpu::ComputePipeline,
     rms_norm_batch: wgpu::ComputePipeline,
     layer_norm_batch: wgpu::ComputePipeline,
@@ -485,6 +526,7 @@ impl WebGpuBackend {
             matmul_f32: make("matmul_f32", WGSL_MATMUL_F32, "main"),
             matmul_f16: make("matmul_f16", WGSL_MATMUL_F16, "main"),
             matmul_batch_f32: make("matmul_batch_f32", WGSL_MATMUL_BATCH_F32, "batch_matmul_f32"),
+            matmul_batch_f16: make("matmul_batch_f16", WGSL_MATMUL_BATCH_F16, "batch_matmul_f16"),
             rms_norm: make("rms_norm", WGSL_RMS_NORM, "main"),
             rms_norm_batch: make("rms_norm_batch", WGSL_RMS_NORM_BATCH, "batch_rms_norm"),
             layer_norm_batch: make("layer_norm_batch", WGSL_LAYER_NORM_BATCH, "batch_layer_norm"),
@@ -941,6 +983,62 @@ impl WebGpuBackend {
         self.download_f32(&out_buf, total as usize, out).await;
     }
 
+    pub async fn matmul_batch_f16(
+        &self,
+        w_buf: &wgpu::Buffer,
+        rows: u32,
+        out_dim: u32,
+        in_dim: u32,
+        x: &[f32],
+        out: &mut [f32],
+    ) {
+        let total = rows * out_dim;
+        let x_buf = self.upload_f32(x);
+        let out_buf = self.create_f32_output(total as usize);
+
+        let uniforms = [out_dim, in_dim, rows, 0u32];
+        let u_buf = self.upload_uniform_u32(&uniforms);
+
+        let bind_group = self
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("matmul_batch_f16"),
+                layout: &self.pipelines.matmul_batch_f16.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: w_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: x_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: out_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: u_buf.as_entire_binding(),
+                    },
+                ],
+            });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            pass.set_pipeline(&self.pipelines.matmul_batch_f16);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let wg_x = (out_dim + 63) / 64;
+            pass.dispatch_workgroups(wg_x, rows, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+
+        self.download_f32(&out_buf, total as usize, out).await;
+    }
+
     /// Batch layer norm: out[r,i] = (x[r,i]-mean)*rsqrt(var+eps)*w[i]+b[i]
     pub async fn layer_norm_batch(
         &self,
@@ -1113,6 +1211,45 @@ impl VisionWebGpu {
         });
 
         self.gpu.matmul_batch_f32(
+            w_buf,
+            rows as u32,
+            out_dim as u32,
+            in_dim as u32,
+            x,
+            out,
+        ).await;
+
+        if let Some(b) = bias {
+            for r in 0..rows {
+                let row = &mut out[r * out_dim..(r + 1) * out_dim];
+                for c in 0..out_dim {
+                    row[c] += b[c];
+                }
+            }
+        }
+    }
+
+    /// Upload weight_f16 (or retrieve cached) and run batch matmul with f16 weights.
+    pub async fn linear_batch_f16(
+        &mut self,
+        x: &[f32],
+        rows: usize,
+        in_dim: usize,
+        weight_f16: &[u16],
+        out_dim: usize,
+        bias: Option<&[f32]>,
+        out: &mut [f32],
+    ) {
+        if weight_f16.is_empty() || rows == 0 || in_dim == 0 || out_dim == 0 {
+            return;
+        }
+
+        let key = (weight_f16.as_ptr() as usize, in_dim, out_dim);
+        let w_buf = self.weight_cache.entry(key).or_insert_with(|| {
+            self.gpu.upload_f16(weight_f16)
+        });
+
+        self.gpu.matmul_batch_f16(
             w_buf,
             rows as u32,
             out_dim as u32,

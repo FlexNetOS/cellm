@@ -9,6 +9,8 @@ use cellm_kernels::cpu_kernels::{rms_norm_f32, rope_interleaved_inplace_f32, rop
 use cellm_kernels::metal::MetalMatmul;
 use cellm_kernels::{MetalKernels, MetalOps};
 use half::f16;
+#[cfg(feature = "webgpu")]
+use wgpu::Buffer;
 
 use crate::{CellmFile, ModelConfig};
 
@@ -44,11 +46,15 @@ pub struct LlamaRunner {
     /// Cached dequantized f32 weights for cblas_sgemm on macOS/iOS
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     f32_weight_cache: HashMap<String, Vec<f32>>,
+    #[cfg(feature = "webgpu")]
+    pub webgpu_weight_cache: HashMap<String, Buffer>,
 }
 
 enum LlamaLinearBackend {
     Cpu,
     Metal { ctx: MetalMatmul },
+    #[cfg(feature = "webgpu")]
+    WebGpu { ctx: cellm_kernels::webgpu::WebGpuBackend },
 }
 
 impl LlamaRunner {
@@ -106,6 +112,8 @@ impl LlamaRunner {
             graph_state: None,
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             f32_weight_cache: HashMap::new(),
+            #[cfg(feature = "webgpu")]
+            webgpu_weight_cache: HashMap::new(),
         })
     }
 
@@ -146,6 +154,22 @@ impl LlamaRunner {
                 self.metal_strict = false;
                 false
             }
+        }
+    }
+
+    #[cfg(feature = "webgpu")]
+    pub fn enable_webgpu_backend(&mut self, ctx: cellm_kernels::webgpu::WebGpuBackend) {
+        self.linear_backend = LlamaLinearBackend::WebGpu { ctx };
+    }
+
+    pub fn take_webgpu_backend(&mut self) -> Option<cellm_kernels::webgpu::WebGpuBackend> {
+        let mut old = LlamaLinearBackend::Cpu;
+        std::mem::swap(&mut self.linear_backend, &mut old);
+        if let LlamaLinearBackend::WebGpu { ctx } = old {
+            Some(ctx)
+        } else {
+            self.linear_backend = old;
+            None
         }
     }
 
@@ -326,7 +350,7 @@ impl LlamaRunner {
     /// sequence in a single Metal command buffer.  This eliminates the
     /// per-token `cb.commit/wait` overhead that makes Llama prefill ~10x
     /// slower than it should be on Apple Silicon.
-    pub fn prefill_fused(
+    pub async fn prefill_fused(
         &mut self,
         tokens: &[u32],
         start_pos: usize,
@@ -339,12 +363,12 @@ impl LlamaRunner {
         for (i, &tok) in tokens.iter().enumerate() {
             self.embed_token(tok, &mut x_all[i * h..(i + 1) * h])?;
         }
-        self.prefill_fused_hidden(&x_all, start_pos, page_table, kv_cache, return_logits)
+        self.prefill_fused_hidden(&x_all, start_pos, page_table, kv_cache, return_logits).await
     }
 
     /// Like `prefill_fused` but the caller has already embedded the tokens
     /// (e.g. VLM image features mixed with text embeddings).
-    pub fn prefill_fused_hidden(
+    pub async fn prefill_fused_hidden(
         &mut self,
         x_all: &[f32],
         start_pos: usize,
@@ -352,6 +376,7 @@ impl LlamaRunner {
         kv_cache: &mut KVCache,
         return_logits: bool,
     ) -> Result<Option<Vec<f32>>, CoreError> {
+        // Ensure pagetable covers all tokens
         let num_tokens = x_all.len() / self.cfg.hidden_size;
         for i in 0..num_tokens {
             let pos = start_pos + i;
@@ -361,7 +386,225 @@ impl LlamaRunner {
                 })?;
             }
         }
-        // Use batched GPU prefill when available (eliminates N-1 command buffers).
+
+        // Use batched GPU prefill when available.
+        #[cfg(feature = "webgpu")]
+        {
+            let mut gpu_last_x = None;
+            {
+                let LlamaRunner {
+                    file,
+                    cfg,
+                    max_layers,
+                    tensor_prefix,
+                    linear_backend,
+                    webgpu_weight_cache,
+                    rope_interleaved,
+                    ..
+                } = &mut *self;
+
+                if let LlamaLinearBackend::WebGpu { ctx } = linear_backend {
+                    let hidden = cfg.hidden_size;
+                    let n_heads = cfg.num_attention_heads;
+                    let n_kv_heads = cfg.num_key_value_heads;
+                    let head_dim = cfg.head_dim;
+                    let kv_dim = n_kv_heads * head_dim;
+                    let num_tokens = x_all.len() / hidden;
+
+                    let mut x = x_all.to_vec();
+                    let mut x_norm = vec![0.0f32; x.len()];
+                    let mut qkv = vec![0.0f32; num_tokens * (hidden + 2 * kv_dim)];
+                    let mut attn_out = vec![0.0f32; num_tokens * hidden];
+                    let mut gate_up = vec![0.0f32; num_tokens * 2 * cfg.intermediate_size];
+                    let mut gather_bases = Vec::with_capacity(num_tokens + start_pos);
+                    let rms_norm_eps = cfg.rms_norm_eps;
+                    let rope_theta = cfg.rope_theta;
+                    let rope_interleaved = *rope_interleaved;
+                    let inter = cfg.intermediate_size;
+
+                    for layer in 0..*max_layers {
+                        // Attn Norm
+                        let ln_w_buf = {
+                            let name = format!("l{layer}.attn_norm");
+                            if !webgpu_weight_cache.contains_key(&name) {
+                                let tensor_name = if tensor_prefix.is_empty() { format!("model.layers.{layer}.input_layernorm.weight") } else { format!("{tensor_prefix}.model.layers.{layer}.input_layernorm.weight") };
+                                let bytes = file.tensor_bytes(&tensor_name)?;
+                                let w: &[f32] = bytemuck::cast_slice(bytes);
+                                webgpu_weight_cache.insert(name.clone(), ctx.upload_f32(w));
+                            }
+                            webgpu_weight_cache.get(&name).unwrap().clone()
+                        };
+                        ctx.rms_norm_batch(&ln_w_buf, num_tokens as u32, hidden as u32, rms_norm_eps, &x, &mut x_norm).await;
+
+                        // QKV Projections
+                        let q_w_buf = {
+                            let name = format!("l{layer}.q");
+                            if !webgpu_weight_cache.contains_key(&name) {
+                                let tensor_name = if tensor_prefix.is_empty() { format!("model.layers.{layer}.self_attn.q_proj.weight") } else { format!("{tensor_prefix}.model.layers.{layer}.self_attn.q_proj.weight") };
+                                let bytes = file.tensor_bytes(&tensor_name)?;
+                                let w: &[u16] = bytemuck::cast_slice(bytes);
+                                webgpu_weight_cache.insert(name.clone(), ctx.upload_f16(w));
+                            }
+                            webgpu_weight_cache.get(&name).unwrap().clone()
+                        };
+                        let k_w_buf = {
+                            let name = format!("l{layer}.k");
+                            if !webgpu_weight_cache.contains_key(&name) {
+                                let tensor_name = if tensor_prefix.is_empty() { format!("model.layers.{layer}.self_attn.k_proj.weight") } else { format!("{tensor_prefix}.model.layers.{layer}.self_attn.k_proj.weight") };
+                                let bytes = file.tensor_bytes(&tensor_name)?;
+                                let w: &[u16] = bytemuck::cast_slice(bytes);
+                                webgpu_weight_cache.insert(name.clone(), ctx.upload_f16(w));
+                            }
+                            webgpu_weight_cache.get(&name).unwrap().clone()
+                        };
+                        let v_w_buf = {
+                            let name = format!("l{layer}.v");
+                            if !webgpu_weight_cache.contains_key(&name) {
+                                let tensor_name = if tensor_prefix.is_empty() { format!("model.layers.{layer}.self_attn.v_proj.weight") } else { format!("{tensor_prefix}.model.layers.{layer}.self_attn.v_proj.weight") };
+                                let bytes = file.tensor_bytes(&tensor_name)?;
+                                let w: &[u16] = bytemuck::cast_slice(bytes);
+                                webgpu_weight_cache.insert(name.clone(), ctx.upload_f16(w));
+                            }
+                            webgpu_weight_cache.get(&name).unwrap().clone()
+                        };
+                        
+                        let (q_out, rest) = qkv.split_at_mut(num_tokens * hidden);
+                        let (k_out, v_out) = rest.split_at_mut(num_tokens * kv_dim);
+
+                        ctx.matmul_batch_f16(&q_w_buf, num_tokens as u32, hidden as u32, hidden as u32, &x_norm, q_out).await;
+                        ctx.matmul_batch_f16(&k_w_buf, num_tokens as u32, kv_dim as u32, hidden as u32, &x_norm, k_out).await;
+                        ctx.matmul_batch_f16(&v_w_buf, num_tokens as u32, kv_dim as u32, hidden as u32, &x_norm, v_out).await;
+
+                        // RoPE + KV Cache + Attention (CPU fallback for now)
+                        for i in 0..num_tokens {
+                            let pos = start_pos + i;
+                            let q_i = &mut q_out[i * hidden..(i + 1) * hidden];
+                            let k_i = &mut k_out[i * kv_dim..(i + 1) * kv_dim];
+                            let v_i = &mut v_out[i * kv_dim..(i + 1) * kv_dim];
+
+                            if rope_interleaved {
+                                rope_interleaved_inplace_f32(q_i, n_heads, head_dim, pos, rope_theta);
+                                rope_interleaved_inplace_f32(k_i, n_kv_heads, head_dim, pos, rope_theta);
+                            } else {
+                                rope_non_interleaved_inplace_f32(q_i, n_heads, head_dim, head_dim, pos, rope_theta);
+                                rope_non_interleaved_inplace_f32(k_i, n_kv_heads, head_dim, head_dim, pos, rope_theta);
+                            }
+                            
+                            let block_id = page_table.block_for_token(pos).map_err(|e| CoreError::Backend(e.to_string()))?;
+                            let token_off = page_table.offset_in_block(pos).map_err(|e| CoreError::Backend(e.to_string()))?;
+                            kv_cache.view_mut().write_token(block_id, layer, token_off, k_i, v_i).map_err(|e| CoreError::Backend(e.to_string()))?;
+                        }
+
+                        // Full Attention (CPU)
+                        {
+                            let cr = kv_cache.view();
+                            for i in 0..num_tokens {
+                                let pos = start_pos + i;
+                                let q_i = &q_out[i * hidden..(i + 1) * hidden];
+                                let out_i = &mut attn_out[i * hidden..(i + 1) * hidden];
+                                
+                                let seq = pos + 1;
+                                gather_bases.clear();
+                                for tpos in 0..seq {
+                                    let b = page_table.block_for_token(tpos).map_err(|e| CoreError::Backend(e.to_string()))?;
+                                    let o = page_table.offset_in_block(tpos).map_err(|e| CoreError::Backend(e.to_string()))?;
+                                    gather_bases.push(cr.layout.token_base_elem(b, layer, o).map_err(|e| CoreError::Backend(e.to_string()))?);
+                                }
+                                cr.attention_single_token_gqa_from_bases(
+                                    &gather_bases,
+                                    q_i,
+                                    n_heads,
+                                    n_kv_heads,
+                                    head_dim,
+                                    None,
+                                    None,
+                                    out_i,
+                                ).map_err(|e| CoreError::Backend(e.to_string()))?;
+                            }
+                        }
+
+                        // O Proj
+                        let o_w_buf = {
+                            let name = format!("l{layer}.o");
+                            if !webgpu_weight_cache.contains_key(&name) {
+                                let tensor_name = if tensor_prefix.is_empty() { format!("model.layers.{layer}.self_attn.o_proj.weight") } else { format!("{tensor_prefix}.model.layers.{layer}.self_attn.o_proj.weight") };
+                                let bytes = file.tensor_bytes(&tensor_name)?;
+                                let w: &[u16] = bytemuck::cast_slice(bytes);
+                                webgpu_weight_cache.insert(name.clone(), ctx.upload_f16(w));
+                            }
+                            webgpu_weight_cache.get(&name).unwrap().clone()
+                        };
+                        ctx.matmul_batch_f16(&o_w_buf, num_tokens as u32, hidden as u32, hidden as u32, &attn_out, &mut x_norm).await;
+                        for i in 0..x.len() { x[i] += x_norm[i]; }
+
+                        // FFN Norm
+                        let ffn_ln_w_buf = {
+                            let name = format!("l{layer}.ffn_norm");
+                            if !webgpu_weight_cache.contains_key(&name) {
+                                let tensor_name = if tensor_prefix.is_empty() { format!("model.layers.{layer}.post_attention_layernorm.weight") } else { format!("{tensor_prefix}.model.layers.{layer}.post_attention_layernorm.weight") };
+                                let bytes = file.tensor_bytes(&tensor_name)?;
+                                let w: &[f32] = bytemuck::cast_slice(bytes);
+                                webgpu_weight_cache.insert(name.clone(), ctx.upload_f32(w));
+                            }
+                            webgpu_weight_cache.get(&name).unwrap().clone()
+                        };
+                        ctx.rms_norm_batch(&ffn_ln_w_buf, num_tokens as u32, hidden as u32, rms_norm_eps, &x, &mut x_norm).await;
+
+                        // Gate + Up Projs
+                        let gate_w_buf = {
+                            let name = format!("l{layer}.gate");
+                            if !webgpu_weight_cache.contains_key(&name) {
+                                let tensor_name = if tensor_prefix.is_empty() { format!("model.layers.{layer}.mlp.gate_proj.weight") } else { format!("{tensor_prefix}.model.layers.{layer}.mlp.gate_proj.weight") };
+                                let bytes = file.tensor_bytes(&tensor_name)?;
+                                let w: &[u16] = bytemuck::cast_slice(bytes);
+                                webgpu_weight_cache.insert(name.clone(), ctx.upload_f16(w));
+                            }
+                            webgpu_weight_cache.get(&name).unwrap().clone()
+                        };
+                        let up_w_buf = {
+                            let name = format!("l{layer}.up");
+                            if !webgpu_weight_cache.contains_key(&name) {
+                                let tensor_name = if tensor_prefix.is_empty() { format!("model.layers.{layer}.mlp.up_proj.weight") } else { format!("{tensor_prefix}.model.layers.{layer}.mlp.up_proj.weight") };
+                                let bytes = file.tensor_bytes(&tensor_name)?;
+                                let w: &[u16] = bytemuck::cast_slice(bytes);
+                                webgpu_weight_cache.insert(name.clone(), ctx.upload_f16(w));
+                            }
+                            webgpu_weight_cache.get(&name).unwrap().clone()
+                        };
+                        let (gate, up) = gate_up.split_at_mut(num_tokens * inter);
+                        ctx.matmul_batch_f16(&gate_w_buf, num_tokens as u32, inter as u32, hidden as u32, &x_norm, gate).await;
+                        ctx.matmul_batch_f16(&up_w_buf, num_tokens as u32, inter as u32, hidden as u32, &x_norm, up).await;
+                        ctx.silu_mul(gate, up).await;
+                        
+                        // Down Proj
+                        let down_w_buf = {
+                            let name = format!("l{layer}.down");
+                            if !webgpu_weight_cache.contains_key(&name) {
+                                let tensor_name = if tensor_prefix.is_empty() { format!("model.layers.{layer}.mlp.down_proj.weight") } else { format!("{tensor_prefix}.model.layers.{layer}.mlp.down_proj.weight") };
+                                let bytes = file.tensor_bytes(&tensor_name)?;
+                                let w: &[u16] = bytemuck::cast_slice(bytes);
+                                webgpu_weight_cache.insert(name.clone(), ctx.upload_f16(w));
+                            }
+                            webgpu_weight_cache.get(&name).unwrap().clone()
+                        };
+                        ctx.matmul_batch_f16(&down_w_buf, num_tokens as u32, hidden as u32, inter as u32, gate, &mut x_norm).await;
+                        for i in 0..x.len() { x[i] += x_norm[i]; }
+                    }
+
+                    if return_logits {
+                        gpu_last_x = Some(x[(num_tokens - 1) * hidden..].to_vec());
+                    }
+                }
+            }
+            if let Some(last_x) = gpu_last_x {
+                return Ok(Some(self.compute_logits(&last_x)?));
+            }
+            if let LlamaLinearBackend::WebGpu { .. } = &self.linear_backend {
+                return Ok(None);
+            }
+        }
+
+        // Metal path (fused graph)
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             if let Some(gs) = &mut self.graph_state {
@@ -373,21 +616,22 @@ impl LlamaRunner {
                 }
             }
         }
-        // Fallback to per-token path (non-Metal or TurboQuant KV cache).
+
+        // Fallback to per-token path (non-Metal/non-WebGPU or TurboQuant KV cache).
+        let hidden = self.cfg.hidden_size;
+        let num_tokens = x_all.len() / hidden;
+        let mut last_logits = None;
         for i in 0..num_tokens {
             let pos = start_pos + i;
-            let mut x = vec![0.0f32; self.cfg.hidden_size];
-            x.copy_from_slice(&x_all[i * self.cfg.hidden_size..(i + 1) * self.cfg.hidden_size]);
-            self.step_inner(&x, pos, page_table, kv_cache, false)?;
+            let mut x = vec![0.0f32; hidden];
+            x.copy_from_slice(&x_all[i * hidden..(i + 1) * hidden]);
+            let is_last = i == num_tokens - 1;
+            let logits = self.step_inner(&x, pos, page_table, kv_cache, return_logits && is_last)?;
+            if is_last && return_logits {
+                last_logits = Some(logits);
+            }
         }
-        if return_logits {
-            let pos = start_pos + num_tokens - 1;
-            let mut x = vec![0.0f32; self.cfg.hidden_size];
-            x.copy_from_slice(&x_all[(num_tokens - 1) * self.cfg.hidden_size..]);
-            let logits = self.step_inner(&x, pos, page_table, kv_cache, true)?;
-            return Ok(Some(logits));
-        }
-        Ok(None)
+        Ok(last_logits)
     }
 
     fn step_inner(
@@ -816,10 +1060,18 @@ impl LlamaRunner {
                 total as f64 / 1e6,
             );
         }
+        if !return_logits {
+            return Ok(vec![]);
+        }
+        self.compute_logits(&x)
+    }
+
+    fn compute_logits(&self, x: &[f32]) -> Result<Vec<f32>, CoreError> {
+        let hidden = self.cfg.hidden_size;
+        let cfg = &self.cfg;
 
         // Final norm.
         let use_metal_norm = self.metal_ops.is_some() && self.use_metal_norm;
-        // Note: use_metal_logits is checked after we know the lm dtype; i4/i2 must use CPU path
         let mut x_final = vec![0.0f32; hidden];
         if use_metal_norm {
             let w = self.tensor_f16("model.norm.weight")?;
@@ -827,16 +1079,12 @@ impl LlamaRunner {
             let w_len = w.len();
             let w = unsafe { std::slice::from_raw_parts(w_ptr, w_len) };
             self.metal_ops.as_ref().unwrap()
-                .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, false, "llama.norm", &mut x_final)
+                .rms_norm_f16w(x, &w, cfg.rms_norm_eps, false, "llama.norm", &mut x_final)
                 .map_err(|e| CoreError::Backend(e.to_string()))?;
         } else {
             let mut norm_w = vec![0.0f32; hidden];
             self.rmsnorm_weight("model.norm.weight", &mut norm_w)?;
-            rms_norm_f32(&x, &norm_w, cfg.rms_norm_eps, &mut x_final);
-        }
-
-        if !return_logits {
-            return Ok(vec![]);
+            rms_norm_f32(x, &norm_w, cfg.rms_norm_eps, &mut x_final);
         }
 
         // Logits via tied embeddings: logits[v] = dot(x_final, embed[v])
@@ -858,7 +1106,6 @@ impl LlamaRunner {
 
         let lm_dtype_raw = lm_meta.dtype.clone();
         let lm_dtype = lm_dtype_raw.trim().to_ascii_lowercase();
-        // Metal logits only supports f16 and i8; i4/i2 must use CPU path
         let use_metal_logits = self.metal_ops.is_some()
             && lm_dtype != "i4" && lm_dtype != "i2";
 
@@ -866,9 +1113,6 @@ impl LlamaRunner {
             match lm_dtype.as_str() {
                 "f16" => {
                     let w = self.tensor_f16_by_exact_name(&lm_src_resolved)?;
-                    let w_ptr = w.as_ptr();
-                    let w_len = w.len();
-                    let w = unsafe { std::slice::from_raw_parts(w_ptr, w_len) };
                     self.metal_ops.as_ref().unwrap()
                         .logits_f16(&x_final, &w, vocab, hidden, &lm_src_resolved, &mut buf)
                         .map_err(|e| CoreError::Backend(e.to_string()))?;
@@ -876,12 +1120,6 @@ impl LlamaRunner {
                 "i8" => {
                     let w = self.tensor_i8_by_exact_name(&lm_src_resolved)?;
                     let s = self.tensor_f16_by_exact_name(&format!("{lm_src_resolved}.qscale"))?;
-                    let w_ptr = w.as_ptr();
-                    let w_len = w.len();
-                    let s_ptr = s.as_ptr();
-                    let s_len = s.len();
-                    let w = unsafe { std::slice::from_raw_parts(w_ptr, w_len) };
-                    let s = unsafe { std::slice::from_raw_parts(s_ptr, s_len) };
                     self.metal_ops.as_ref().unwrap()
                         .logits_i8(&x_final, &w, &s, vocab, hidden, &lm_src_resolved, &mut buf)
                         .map_err(|e| CoreError::Backend(e.to_string()))?;
@@ -979,6 +1217,20 @@ impl LlamaRunner {
             return Err(CoreError::Backend(format!("tensor {resolved} nbytes not even")));
         }
         Ok(cast_slice(bytes))
+    }
+
+    fn tensor_f32(&self, name: &str) -> Result<Vec<f32>, CoreError> {
+        let resolved = self.resolve_name(name)?;
+        let bytes = self.file.tensor_bytes(&resolved)?;
+        let dtype = self.tensor_meta_by_exact_name(&resolved).map(|t| t.dtype.as_str()).unwrap_or("f16");
+        if dtype == "f32" {
+            Ok(cast_slice(bytes).to_vec())
+        } else if dtype == "f16" {
+            let u: &[u16] = cast_slice(bytes);
+            Ok(u.iter().map(|&v| f16::from_bits(v).to_f32()).collect())
+        } else {
+            Err(CoreError::Backend(format!("tensor {name} unsupported dtype {dtype} for f32 conversion")))
+        }
     }
 
     fn tensor_i8_by_exact_name(&self, resolved: &str) -> Result<&[i8], CoreError> {
