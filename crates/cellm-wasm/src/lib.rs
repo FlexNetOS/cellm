@@ -183,7 +183,7 @@ impl CellmEngine {
     /// - `prompt`: text prompt to guide the description
     /// - `max_tokens`: maximum number of output tokens
     #[cfg(target_arch = "wasm32")]
-    pub fn describe_image(
+    pub async fn describe_image(
         &self,
         image_bytes: Vec<u8>,
         prompt: &str,
@@ -212,15 +212,13 @@ impl CellmEngine {
             prompt,
             cfg,
             vision,
-        );
+        ).await;
         match result {
             Ok((text, _timing, vision)) => {
                 *self.gpu.borrow_mut() = Some(vision.into_gpu());
                 Ok(text)
             }
-            Err(e) => {
-                Err(JsValue::from_str(&format!("describe_image failed: {e}")))
-            }
+            Err(e) => Err(JsValue::from_str(&format!("describe_image failed: {e}"))),
         }
     }
 

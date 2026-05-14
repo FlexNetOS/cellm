@@ -343,7 +343,7 @@
                 padding: 0.3rem 0.8rem;
             }
 
-        }
+        
         </style>
     </head>
     <body>
@@ -372,6 +372,7 @@
             </div>
             <div class="row" style="margin-top: 0.5rem">
                 <button id="devLoadBtn" type="button">Load Qwen Debug Model</button>
+                <button id="vlmDevLoadBtn" type="button" style="background: #f0f4ff; color: #1a3a6b; border: 1px solid #b8cce8;">Load SmolVLM Debug Model</button>
                 <div style="margin-left: 1rem; display: flex; align-items: center; gap: 0.5rem;">
                     <span style="font-size: 0.7rem; color: #888; text-transform: uppercase; letter-spacing: 0.05em;">Backend:</span>
                     <select id="backendSelect" style="font-size: 0.8rem; padding: 2px 4px;">
@@ -463,6 +464,11 @@
                         data-tok="https://huggingface.co/jeffasante/cellm-models/resolve/main/smolvlm-500m-v1/tokenizer.json?download=true"
                         data-is-vlm="true"
                         style="background:#f0f4ff;color:#1a3a6b;border:1px solid #b8cce8;">SmolVLM-500M (Vision)</button>
+                    <button class="preset-btn vlm-preset"
+                        data-model="/models/to-huggingface/smolvlm-256m-instruct-f16-full/smolvlm-256m-instruct-f16-full.cellm"
+                        data-tok="/models/to-huggingface/smolvlm-256m-instruct-f16-full/tokenizer.json"
+                        data-is-vlm="true"
+                        style="background:#f0f4ff;color:#1a3a6b;border:1px solid #b8cce8;">SmolVLM-256M (Debug Full)</button>
                 </div>
             </div>
         </div>
@@ -539,7 +545,8 @@
             <div class="row" style="margin-top: 0.5rem">
                 <span style="font-size: 0.8rem; color: #888">Max tokens:</span>
                 <input type="number" id="vlmMaxTokens" value="64" min="16" max="256" style="width: 70px" />
-                <button id="vlmBtn" disabled>Describe Image</button>
+                <button id="vlmBtn" disabled>Describe</button>
+                <button id="loadDebugImageBtn" type="button" style="margin-left: 0.5rem; font-size: 0.7rem;">Sample Image</button>
                 <button id="vlmStopBtn" disabled style="display:none;">Stop</button>
             </div>
             <div id="vlmOutput" style="color: #999; font-style: italic;">Upload an image and click Describe to generate a description...</div>
@@ -582,7 +589,8 @@
             const modelFile = $("modelFile"),
                 tokenizerFile = $("tokenizerFile"),
                 loadBtn = $("loadBtn"),
-                devLoadBtn = $("devLoadBtn");
+                devLoadBtn = $("devLoadBtn"),
+                vlmDevLoadBtn = $("vlmDevLoadBtn");
             const status = $("status"),
                 inferCard = $("inferCard"),
                 prompt = $("prompt");
@@ -602,6 +610,10 @@
             const devModelUrl =
                 `${devModelBase}/qwen2.5-0.5b-int8-v1.cellm`;
             const devTokenizerUrl = `${devModelBase}/tokenizer.json`;
+            const vlmDevModelBase = "/models/to-huggingface/smolvlm-256m-instruct-f16-full";
+            const vlmDevModelUrl = `${vlmDevModelBase}/smolvlm-256m-instruct-f16-full.cellm`;
+            const vlmDevTokenizerUrl = `${vlmDevModelBase}/tokenizer.json`;
+            const debugImageUrl = "/models/test_images/bird.jpg";
 
             warmupWasm();
 
@@ -659,6 +671,37 @@
                     status.textContent = `Error: ${err}`;
                     status.classList.add("error");
                 } finally {
+                    devLoadBtn.disabled = false;
+                }
+            }
+
+            async function loadLocalVlmDebugModel() {
+                vlmDevLoadBtn.disabled = true;
+                devLoadBtn.disabled = true;
+                loadBtn.disabled = true;
+                status.classList.remove("error");
+                log("Loading local VLM debug model...");
+                try {
+                    // Switch to WebGPU for VLM by default if possible
+                    backendSelect.value = "webgpu";
+
+                    status.textContent = `Fetching model...`;
+                    log(`Fetching model from ${vlmDevModelUrl}`);
+                    modelBytes = await fetchBytes(vlmDevModelUrl);
+                    log(`Model fetched (${(modelBytes.length / 1e6).toFixed(1)} MB)`);
+
+                    status.textContent = `Fetching tokenizer...`;
+                    log(`Fetching tokenizer from ${vlmDevTokenizerUrl}`);
+                    tokenizerJson = await fetchText(vlmDevTokenizerUrl);
+                    log("Tokenizer fetched");
+
+                    await loadEngine();
+                } catch (err) {
+                    log(`VLM Debug load error: ${err}`, "red");
+                    status.textContent = `Error: ${err}`;
+                    status.classList.add("error");
+                } finally {
+                    vlmDevLoadBtn.disabled = false;
                     devLoadBtn.disabled = false;
                 }
             }
@@ -737,6 +780,7 @@
                     }
                     // Update chat image button visibility
                     updateChatImageBtn();
+                    updateVlmVisibility();
                     status.textContent =
                         `Engine ready. EOS token: ${engine.eos_token_id()}. Enter a prompt and click Generate.`;
                     updateStats();
@@ -801,9 +845,19 @@
                 });
             });
 
+            vlmDevLoadBtn.addEventListener("click", () => {
+                loadLocalVlmDebugModel().catch((err) => {
+                    status.textContent = `Error: ${err}`;
+                    status.classList.add("error");
+                    vlmDevLoadBtn.disabled = false;
+                    checkReady();
+                });
+            });
+
             // ---- VLM (Vision-Language Model) ----
             const vlmCard = $("vlmCard"),
                 imageFile = $("imageFile"),
+                loadDebugImageBtn = $("loadDebugImageBtn"),
                 imagePreview = $("imagePreview"),
                 vlmPrompt = $("vlmPrompt"),
                 vlmMaxTokens = $("vlmMaxTokens"),
@@ -844,8 +898,25 @@
                 log(`Image loaded: ${file.name} (${(imageBytes.length / 1e3).toFixed(1)} KB)`);
             });
 
+            loadDebugImageBtn.addEventListener("click", async () => {
+                try {
+                    log(`Loading debug image from ${debugImageUrl}...`);
+                    const bytes = await fetchBytes(debugImageUrl);
+                    imageBytes = bytes;
+                    vlmBtn.disabled = false;
+                    log(`Debug image loaded (${(bytes.length / 1024).toFixed(1)} KB)`);
+                    
+                    const blob = new Blob([imageBytes], { type: "image/jpeg" });
+                    const url = URL.createObjectURL(blob);
+                    imagePreview.style.display = "block";
+                    imagePreview.src = url;
+                } catch (err) {
+                    log(`Failed to load debug image: ${err}`, "red");
+                }
+            });
+
             vlmBtn.addEventListener("click", async () => {
-                if (!engine || !imageBytes || vlmRunning) return;
+                if (!engine || imageBytes === null || vlmRunning) return;
                 vlmRunning = true;
                 vlmBtn.disabled = true;
                 vlmStopBtn.style.display = "inline-block";
@@ -860,7 +931,7 @@
                 try {
                     log("VLM: running describe_image...");
                     status.textContent = "Processing image with vision encoder...";
-                    const description = engine.describe_image(
+                    const description = await engine.describe_image(
                         imageBytes,
                         vlmPrompt.value,
                         max
@@ -1041,7 +1112,7 @@
                         // VLM path: describe_image gives full response at once
                         status.textContent = "Vision encoder processing...";
                         try {
-                            const description = engine.describe_image(
+                            const description = await engine.describe_image(
                                 savedImageBytes, text, 128
                             );
                             assistantSpan.textContent = description || "(no response)";

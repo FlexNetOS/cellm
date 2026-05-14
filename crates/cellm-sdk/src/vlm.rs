@@ -239,12 +239,12 @@ pub fn describe_image_with_cellm_timed(
         BackendKind::Cpu => LinearBackend::Cpu,
     };
     let (mut image_features, image_seq_len, patch_ms, encoder_ms, encoder_layer_ms) =
-        run_vision_cellm(
+        pollster::block_on(run_vision_cellm(
             &file,
             &image_input,
             &mut vision_backend,
             processor_hints.image_seq_len,
-        )?;
+        ))?;
     if std::env::var("CELLM_VLM_DEBUG_FEATURE_STATS").is_ok() {
         let mut min_v = f32::INFINITY;
         let mut max_v = f32::NEG_INFINITY;
@@ -328,7 +328,8 @@ pub fn describe_image_with_cellm_timed(
             tok.token_to_id("<|turn>").is_some() && tok.token_to_id("<turn|>").is_some(),
         )
     };
-    let enc_ids = encode_with_explicit_added_tokens(&tok, &tokenizer_path, &prompt)?;
+    let added = load_added_token_ids(&tokenizer_path).unwrap_or_default();
+    let enc_ids = encode_with_explicit_added_tokens(&tok, &added, &prompt)?;
     let mut input_ids: Vec<i64> = enc_ids.into_iter().map(|x| x as i64).collect();
     if gemma4_prefix_image {
         if let Some(bos) = file.header.bos_token_id.map(|v| v as i64) {
@@ -338,7 +339,7 @@ pub fn describe_image_with_cellm_timed(
         }
     }
 
-    let (generated, decode_ms) = run_decode_cellm(
+    let (generated, decode_ms) = pollster::block_on(run_decode_cellm(
         model_path,
         image_token_id,
         eos_token_id,
@@ -348,7 +349,7 @@ pub fn describe_image_with_cellm_timed(
         &image_features,
         gemma4_prefix_image,
         &banned_token_ids,
-    )?;
+    ))?;
     let text = tok
         .decode(
             &generated.into_iter().map(|t| t as u32).collect::<Vec<u32>>(),
@@ -369,7 +370,7 @@ pub fn describe_image_with_cellm_timed(
 /// for WebGPU-accelerated vision encoding. Returns the `VisionWebGpu` back
 /// so the caller can use it for text inference after vision processing.
 #[cfg(feature = "webgpu")]
-pub fn describe_image_with_cellm_webgpu(
+pub async fn describe_image_with_cellm_webgpu(
     model_path: &Path,
     image_bytes: &[u8],
     user_prompt: &str,
@@ -419,7 +420,7 @@ pub fn describe_image_with_cellm_webgpu(
             &image_input,
             &mut linear_backend,
             processor_hints.image_seq_len,
-        )?;
+        ).await?;
 
     // Recover the VisionWebGpu
     let vision = match linear_backend {
@@ -481,7 +482,8 @@ pub fn describe_image_with_cellm_webgpu(
             tok.token_to_id("<|turn>").is_some() && tok.token_to_id("<turn|>").is_some(),
         )
     };
-    let enc_ids = encode_with_explicit_added_tokens(&tok, &tokenizer_path, &prompt)?;
+    let added = load_added_token_ids(&tokenizer_path).unwrap_or_default();
+    let enc_ids = encode_with_explicit_added_tokens(&tok, &added, &prompt)?;
     let mut input_ids: Vec<i64> = enc_ids.into_iter().map(|x| x as i64).collect();
     if gemma4_prefix_image {
         if let Some(bos) = file.header.bos_token_id.map(|v| v as i64) {
@@ -491,7 +493,7 @@ pub fn describe_image_with_cellm_webgpu(
         }
     }
 
-    let (generated, decode_ms) = run_decode_cellm(
+    let (generated, decode_ms) = pollster::block_on(run_decode_cellm(
         model_path,
         image_token_id,
         eos_token_id,
@@ -501,7 +503,7 @@ pub fn describe_image_with_cellm_webgpu(
         &image_features,
         gemma4_prefix_image,
         &banned_token_ids,
-    )?;
+    ))?;
     let text = tok
         .decode(
             &generated.into_iter().map(|t| t as u32).collect::<Vec<u32>>(),
@@ -521,7 +523,7 @@ pub fn describe_image_with_cellm_webgpu(
 /// WASM-friendly variant: takes model bytes + tokenizer bytes instead of paths.
 /// Model bytes are the complete `.cellm` file. Tokenizer bytes are the JSON content.
 #[cfg(feature = "webgpu")]
-pub fn describe_image_with_cellm_webgpu_from_bytes(
+pub async fn describe_image_with_cellm_webgpu_from_bytes(
     model_bytes: &[u8],
     tokenizer_bytes: &[u8],
     image_bytes: &[u8],
@@ -573,7 +575,7 @@ pub fn describe_image_with_cellm_webgpu_from_bytes(
             &image_input,
             &mut linear_backend,
             None,
-        )?;
+        ).await?;
 
     let vision = match linear_backend {
         LinearBackend::WebGpu(v) => v,
@@ -601,7 +603,8 @@ pub fn describe_image_with_cellm_webgpu_from_bytes(
         &image_block,
         tok.token_to_id("<|turn>").is_some() && tok.token_to_id("<turn|>").is_some(),
     );
-    let enc_ids = encode_with_explicit_added_tokens(&tok, &PathBuf::from("."), &prompt)?;
+    let added = parse_added_token_ids(tokenizer_bytes).unwrap_or_default();
+    let enc_ids = encode_with_explicit_added_tokens(&tok, &added, &prompt)?;
     let mut input_ids: Vec<i64> = enc_ids.into_iter().map(|x| x as i64).collect();
     if let Some(bos) = file.header.bos_token_id.map(|v| v as i64) {
         if input_ids.first().copied() != Some(bos) {
@@ -619,7 +622,7 @@ pub fn describe_image_with_cellm_webgpu_from_bytes(
         &image_features,
         false,
         &banned_token_ids,
-    )?;
+    ).await?;
     let text = tok
         .decode(&generated.into_iter().map(|t| t as u32).collect::<Vec<u32>>(), true)
         .map_err(|e| anyhow::anyhow!("decode failed: {e}"))?;
@@ -679,7 +682,7 @@ pub fn describe_audio_with_cellm_timed(
 
     // Run the audio conformer encoder
     let t_enc = stats_instant_now();
-    let audio_features = run_audio_cellm_gemma4(&file, &mel_features, t_frames, 128)?;
+    let audio_features = pollster::block_on(run_audio_cellm_gemma4(&file, &mel_features, t_frames, 128))?;
     let encoder_ms = stats_elapsed_ms(&t_enc);
     let n_audio_tokens = audio_features.shape()[0];
 
@@ -719,7 +722,8 @@ pub fn describe_audio_with_cellm_timed(
         build_single_turn_prompt(user_prompt, &audio_block, false)
     };
 
-    let enc_ids = encode_with_explicit_added_tokens(&tok, &tokenizer_path, &prompt)?;
+    let added = load_added_token_ids(&tokenizer_path).unwrap_or_default();
+    let enc_ids = encode_with_explicit_added_tokens(&tok, &added, &prompt)?;
     let input_ids: Vec<i64> = enc_ids.into_iter().map(|x| x as i64).collect();
 
     if std::env::var("CELLM_AUDIO_DEBUG").is_ok() {
@@ -751,7 +755,7 @@ pub fn describe_audio_with_cellm_timed(
         .or_else(|| tok.token_to_id("<end_of_utterance>").map(|v| v as i64));
     let banned = banned_token_ids(&tok);
 
-    let (generated, decode_ms) = run_decode_cellm(
+    let (generated, decode_ms) = pollster::block_on(run_decode_cellm(
         model_path,
         audio_token_id,
         eos_token_id,
@@ -761,7 +765,7 @@ pub fn describe_audio_with_cellm_timed(
         &audio_features,
         false, // never prefix; always bidir
         &banned,
-    )?;
+    ))?;
     let text = tok
         .decode(
             &generated.into_iter().map(|t| t as u32).collect::<Vec<u32>>(),
@@ -779,7 +783,7 @@ pub fn describe_audio_with_cellm_timed(
     Ok((text.trim().to_string(), timing))
 }
 
-fn run_decode_cellm_inner(
+async fn run_decode_cellm_inner(
     file: CellmFile,
     image_token_id: i64,
     eos_token_id: i64,
@@ -1276,6 +1280,20 @@ fn run_decode_cellm_inner(
     let mut last_token: Option<i64> = None;
     for step in 0..cfg.max_new_tokens {
         generated.push(next);
+        
+        #[cfg(target_arch = "wasm32")]
+        {
+            // Yield every token to prevent freezing the browser UI loop
+            let promise = js_sys::Promise::new(&mut |resolve, _| {
+                if let Some(window) = web_sys::window() {
+                    let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0);
+                } else {
+                    let _ = resolve.call0(&wasm_bindgen::JsValue::undefined());
+                }
+            });
+            let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+        }
+
         if debug_gen { eprintln!("GEN_DEBUG[{}] = {}", step, next); }
         if Some(next) == last_token {
             same_token_run += 1;
@@ -1335,7 +1353,7 @@ fn run_decode_cellm_inner(
 }
 
 /// Load from a filesystem path (wraps run_decode_cellm_inner).
-fn run_decode_cellm(
+async fn run_decode_cellm(
     model_path: &Path,
     image_token_id: i64,
     eos_token_id: i64,
@@ -1350,11 +1368,11 @@ fn run_decode_cellm(
     run_decode_cellm_inner(
         file, image_token_id, eos_token_id, end_of_utterance_id,
         cfg, input_ids, image_features, prefix_image_features, banned_token_ids,
-    )
+    ).await
 }
 
 /// Load from model bytes (WASM-friendly, wraps run_decode_cellm_inner).
-fn run_decode_cellm_from_bytes(
+async fn run_decode_cellm_from_bytes(
     model_bytes: &[u8],
     image_token_id: i64,
     eos_token_id: i64,
@@ -1370,7 +1388,7 @@ fn run_decode_cellm_from_bytes(
     run_decode_cellm_inner(
         file, image_token_id, eos_token_id, end_of_utterance_id,
         cfg, input_ids, image_features, prefix_image_features, banned_token_ids,
-    )
+    ).await
 }
 
 fn effective_text_model_type(header: &cellm_model::CellmHeader) -> String {
@@ -1492,7 +1510,7 @@ fn sample_from_candidates(
     Ok(filtered.last().expect("filtered non-empty").0 as i64)
 }
 
-fn run_vision_cellm(
+async fn run_vision_cellm(
     file: &CellmFile,
     image_input: &PreparedImage,
     backend: &mut LinearBackend,
@@ -1505,7 +1523,7 @@ fn run_vision_cellm(
             .tensor_index("model.embed_vision.embedding_projection.weight")
             .is_some()
     {
-        return run_vision_cellm_gemma4(file, image_input, target_image_seq_len, backend);
+        return run_vision_cellm_gemma4(file, image_input, target_image_seq_len, backend).await;
     }
     let pixel_values = image_input.pixel_values.clone();
 
@@ -1714,7 +1732,7 @@ fn run_vision_cellm(
             &pos,
             &mut img_tokens,
             backend,
-        );
+        ).await;
         tokens[offset..offset + num_tokens * hidden].copy_from_slice(&img_tokens);
     }
     patch_ms += stats_elapsed_ms(&patch_start);
@@ -1727,13 +1745,13 @@ fn run_vision_cellm(
         );
         linear_rows(
             &norm1, batched_tokens, hidden, &layer.q_w, hidden, Some(&layer.q_b), &mut q, backend,
-        );
+        ).await;
         linear_rows(
             &norm1, batched_tokens, hidden, &layer.k_w, hidden, Some(&layer.k_b), &mut k, backend,
-        );
+        ).await;
         linear_rows(
             &norm1, batched_tokens, hidden, &layer.v_w, hidden, Some(&layer.v_b), &mut v, backend,
-        );
+        ).await;
 
         for img in 0..nimg {
             let offset = img * num_tokens * hidden;
@@ -1762,7 +1780,7 @@ fn run_vision_cellm(
             Some(&layer.o_b),
             &mut proj_out,
             backend,
-        );
+        ).await;
         add_inplace(&mut tokens, &proj_out);
 
         layer_norm_rows(
@@ -1777,7 +1795,7 @@ fn run_vision_cellm(
             Some(&layer.fc1_b),
             &mut mlp_up,
             backend,
-        );
+        ).await;
         gelu_pytorch_tanh_inplace(&mut mlp_up);
         linear_rows(
             &mlp_up,
@@ -1788,7 +1806,7 @@ fn run_vision_cellm(
             Some(&layer.fc2_b),
             &mut mlp_out,
             backend,
-        );
+        ).await;
         add_inplace(&mut tokens, &mlp_out);
         encoder_layer_ms[layer_idx] += stats_elapsed_ms(&layer_start);
     }
@@ -1839,7 +1857,7 @@ fn run_vision_cellm(
         None,
         &mut flat_out,
         backend,
-    );
+    ).await;
 
     for r in 0..total_out_rows {
         for c in 0..text_hidden {
@@ -1858,7 +1876,7 @@ fn run_vision_cellm(
     Ok((out, out_tokens_per_image, patch_ms, encoder_ms, encoder_layer_ms))
 }
 
-fn run_vision_cellm_gemma4(
+async fn run_vision_cellm_gemma4(
     file: &CellmFile,
     image_input: &PreparedImage,
     target_image_seq_len: Option<usize>,
@@ -2058,7 +2076,7 @@ fn run_vision_cellm_gemma4(
             None,
             &mut tokens,
             backend,
-        );
+        ).await;
         let pos_axis = &pos_table[..pos_rows * hidden];
         valid_mask.fill(false);
         for t in 0..num_tokens {
@@ -2109,7 +2127,7 @@ fn run_vision_cellm_gemma4(
                 layer.q_clip_in,
                 layer.q_clip_out,
                 backend,
-            );
+            ).await;
             linear_rows_clipped(
                 &norm0,
                 num_tokens,
@@ -2121,7 +2139,7 @@ fn run_vision_cellm_gemma4(
                 layer.k_clip_in,
                 layer.k_clip_out,
                 backend,
-            );
+            ).await;
             linear_rows_clipped(
                 &norm0,
                 num_tokens,
@@ -2133,7 +2151,7 @@ fn run_vision_cellm_gemma4(
                 layer.v_clip_in,
                 layer.v_clip_out,
                 backend,
-            );
+            ).await;
 
             for t in 0..num_tokens {
                 let q_row = &mut q[t * hidden..(t + 1) * hidden];
@@ -2178,7 +2196,7 @@ fn run_vision_cellm_gemma4(
                 layer.o_clip_in,
                 layer.o_clip_out,
                 backend,
-            );
+            ).await;
             rms_norm_rows(
                 &proj_out,
                 num_tokens,
@@ -2208,7 +2226,7 @@ fn run_vision_cellm_gemma4(
                 layer.gate_clip_in,
                 layer.gate_clip_out,
                 backend,
-            );
+            ).await;
             linear_rows_clipped(
                 &norm1,
                 num_tokens,
@@ -2220,7 +2238,7 @@ fn run_vision_cellm_gemma4(
                 layer.up_clip_in,
                 layer.up_clip_out,
                 backend,
-            );
+            ).await;
             gelu_pytorch_tanh_inplace(&mut gate);
             mul_inplace(&mut gate, &up);
             linear_rows_clipped(
@@ -2234,7 +2252,7 @@ fn run_vision_cellm_gemma4(
                 layer.down_clip_in,
                 layer.down_clip_out,
                 backend,
-            );
+            ).await;
             rms_norm_rows(
                 &mlp_out,
                 num_tokens,
@@ -2632,7 +2650,7 @@ fn audio_stats(tag: &str, buf: &[f32]) {
     }
 }
 
-fn run_audio_cellm_gemma4(
+async fn run_audio_cellm_gemma4(
     file: &CellmFile,
     mel_features: &[f32],   // [T_frames, 128] row-major
     t_frames: usize,
@@ -2767,7 +2785,7 @@ fn run_audio_cellm_gemma4(
     // input_proj_linear: [1024, 1024]
     let proj_w = load_audio_weight_f32(file, "model.audio_tower.subsample_conv_projection.input_proj_linear.weight")?;
     let mut hidden_states = vec![0.0f32; t_sub * hidden];
-    linear_rows(&sub_out, t_sub, proj_in_dim, &proj_w, hidden, None, &mut hidden_states, &mut backend);
+    linear_rows(&sub_out, t_sub, proj_in_dim, &proj_w, hidden, None, &mut hidden_states, &mut backend).await;
     audio_stats("hidden_states_init", &hidden_states);
     let t_subsample_done = stats_instant_now();
     eprintln!("[audio_timing] t_sub={t_sub} subsample_done");
@@ -2812,11 +2830,11 @@ fn run_audio_cellm_gemma4(
             let residual = hidden_states.clone();
             rms_norm_rows(&hidden_states, t_sub, hidden, &pre_w, eps, &mut norm_buf);
             if let Some((mn, mx)) = ff1_in_clip { for v in &mut norm_buf[..t_sub*hidden] { *v = v.clamp(mn, mx); } }
-            linear_rows(&norm_buf, t_sub, hidden, &ff1_w, ffw_intermediate, None, &mut ffw1_buf, &mut backend);
+            linear_rows(&norm_buf, t_sub, hidden, &ff1_w, ffw_intermediate, None, &mut ffw1_buf, &mut backend).await;
             if let Some((mn, mx)) = ff1_out_clip { for v in &mut ffw1_buf[..t_sub*ffw_intermediate] { *v = v.clamp(mn, mx); } }
             silu_inplace(&mut ffw1_buf);
             if let Some((mn, mx)) = ff2_in_clip { for v in &mut ffw1_buf[..t_sub*ffw_intermediate] { *v = v.clamp(mn, mx); } }
-            linear_rows(&ffw1_buf, t_sub, ffw_intermediate, &ff2_w, hidden, None, &mut ffw2_buf, &mut backend);
+            linear_rows(&ffw1_buf, t_sub, ffw_intermediate, &ff2_w, hidden, None, &mut ffw2_buf, &mut backend).await;
             if let Some((mn, mx)) = ff2_out_clip { for v in &mut ffw2_buf[..t_sub*hidden] { *v = v.clamp(mn, mx); } }
             rms_norm_rows(&ffw2_buf, t_sub, hidden, &post_w, eps, &mut norm_buf);
             for i in 0..t_sub * hidden {
@@ -2850,9 +2868,9 @@ fn run_audio_cellm_gemma4(
             rms_norm_rows(&hidden_states, t_sub, hidden, &norm_pre_w, eps, &mut norm_buf);
             if let Some((mn, mx)) = qkv_in_clip { for v in &mut norm_buf[..t_sub*hidden] { *v = v.clamp(mn, mx); } }
 
-            linear_rows(&norm_buf, t_sub, hidden, &q_w, hidden, None, &mut q_buf, &mut backend);
-            linear_rows(&norm_buf, t_sub, hidden, &k_w, hidden, None, &mut k_buf, &mut backend);
-            linear_rows(&norm_buf, t_sub, hidden, &v_w, hidden, None, &mut v_buf, &mut backend);
+            linear_rows(&norm_buf, t_sub, hidden, &q_w, hidden, None, &mut q_buf, &mut backend).await;
+            linear_rows(&norm_buf, t_sub, hidden, &k_w, hidden, None, &mut k_buf, &mut backend).await;
+            linear_rows(&norm_buf, t_sub, hidden, &v_w, hidden, None, &mut v_buf, &mut backend).await;
             if let Some((mn, mx)) = qkv_out_clip {
                 for v in &mut q_buf[..t_sub*hidden] { *v = v.clamp(mn, mx); }
                 for v in &mut k_buf[..t_sub*hidden] { *v = v.clamp(mn, mx); }
@@ -2880,7 +2898,7 @@ fn run_audio_cellm_gemma4(
             }
 
             // rel_k_proj on pos embeddings: [n_rel_pos, hidden] → [n_rel_pos, hidden]
-            linear_rows(&rel_pos_embed, n_rel_pos, hidden, &rel_k_w, hidden, None, &mut rel_k_buf, &mut backend);
+            linear_rows(&rel_pos_embed, n_rel_pos, hidden, &rel_k_w, hidden, None, &mut rel_k_buf, &mut backend).await;
 
             // Chunked local attention with relative position bias
             let n_blocks = (t_sub + chunk_size - 1) / chunk_size;
@@ -2985,7 +3003,7 @@ fn run_audio_cellm_gemma4(
 
             // post projection
             if let Some((mn, mx)) = post_in_clip { for v in &mut attn_out[..t_sub*hidden] { *v = v.clamp(mn, mx); } }
-            linear_rows(&attn_out, t_sub, hidden, &post_w, hidden, None, &mut norm_buf, &mut backend);
+            linear_rows(&attn_out, t_sub, hidden, &post_w, hidden, None, &mut norm_buf, &mut backend).await;
             if let Some((mn, mx)) = post_out_clip { for v in &mut norm_buf[..t_sub*hidden] { *v = v.clamp(mn, mx); } }
             // norm_post_attn + add residual
             rms_norm_rows(&norm_buf, t_sub, hidden, &norm_post_w, eps, &mut norm2_buf);
@@ -3013,7 +3031,7 @@ fn run_audio_cellm_gemma4(
 
             // linear_start: [hidden, hidden*2]
             lconv_lin_buf.resize(t_sub * hidden * 2, 0.0);
-            linear_rows(&norm_buf, t_sub, hidden, &lin_start_w, hidden * 2, None, &mut lconv_lin_buf, &mut backend);
+            linear_rows(&norm_buf, t_sub, hidden, &lin_start_w, hidden * 2, None, &mut lconv_lin_buf, &mut backend).await;
             if let Some((mn, mx)) = ls_out_clip { for v in &mut lconv_lin_buf[..t_sub*hidden*2] { *v = v.clamp(mn, mx); } }
 
             // GLU: split into two halves, output = first_half * sigmoid(second_half)
@@ -3052,7 +3070,7 @@ fn run_audio_cellm_gemma4(
             silu_inplace(&mut norm_buf[..t_sub * hidden]);
             // linear_end: [hidden, hidden]
             if let Some((mn, mx)) = le_in_clip { for v in &mut norm_buf[..t_sub*hidden] { *v = v.clamp(mn, mx); } }
-            linear_rows(&norm_buf, t_sub, hidden, &lin_end_w, hidden, None, &mut lconv_out, &mut backend);
+            linear_rows(&norm_buf, t_sub, hidden, &lin_end_w, hidden, None, &mut lconv_out, &mut backend).await;
             if let Some((mn, mx)) = le_out_clip { for v in &mut lconv_out[..t_sub*hidden] { *v = v.clamp(mn, mx); } }
             for i in 0..t_sub * hidden {
                 hidden_states[i] = residual[i] + lconv_out[i];
@@ -3074,11 +3092,11 @@ fn run_audio_cellm_gemma4(
             let residual = hidden_states.clone();
             rms_norm_rows(&hidden_states, t_sub, hidden, &pre_w, eps, &mut norm_buf);
             if let Some((mn, mx)) = ff1_in_clip { for v in &mut norm_buf[..t_sub*hidden] { *v = v.clamp(mn, mx); } }
-            linear_rows(&norm_buf, t_sub, hidden, &ff1_w, ffw_intermediate, None, &mut ffw1_buf, &mut backend);
+            linear_rows(&norm_buf, t_sub, hidden, &ff1_w, ffw_intermediate, None, &mut ffw1_buf, &mut backend).await;
             if let Some((mn, mx)) = ff1_out_clip { for v in &mut ffw1_buf[..t_sub*ffw_intermediate] { *v = v.clamp(mn, mx); } }
             silu_inplace(&mut ffw1_buf);
             if let Some((mn, mx)) = ff2_in_clip { for v in &mut ffw1_buf[..t_sub*ffw_intermediate] { *v = v.clamp(mn, mx); } }
-            linear_rows(&ffw1_buf, t_sub, ffw_intermediate, &ff2_w, hidden, None, &mut ffw2_buf, &mut backend);
+            linear_rows(&ffw1_buf, t_sub, ffw_intermediate, &ff2_w, hidden, None, &mut ffw2_buf, &mut backend).await;
             if let Some((mn, mx)) = ff2_out_clip { for v in &mut ffw2_buf[..t_sub*hidden] { *v = v.clamp(mn, mx); } }
             rms_norm_rows(&ffw2_buf, t_sub, hidden, &post_w, eps, &mut norm_buf);
             for i in 0..t_sub * hidden {
@@ -3105,7 +3123,7 @@ fn run_audio_cellm_gemma4(
     let out_proj_w = load_audio_weight_f32(file, "model.audio_tower.output_proj.weight")?;
     let out_proj_b = load_audio_weight_f32(file, "model.audio_tower.output_proj.bias")?;
     let mut proj_out = vec![0.0f32; t_sub * text_hidden];
-    linear_rows(&hidden_states, t_sub, hidden, &out_proj_w, text_hidden, Some(&out_proj_b), &mut proj_out, &mut backend);
+    linear_rows(&hidden_states, t_sub, hidden, &out_proj_w, text_hidden, Some(&out_proj_b), &mut proj_out, &mut backend).await;
     audio_stats("D_out_proj", &proj_out[..t_sub * text_hidden]);
 
     eprintln!("[audio_timing] output_proj done in {:.1}ms", stats_elapsed_ms(&t_outproj_start));
@@ -3124,7 +3142,7 @@ fn run_audio_cellm_gemma4(
     }
     audio_stats("E_after_rmsnorm", &embed_norm[..t_sub * text_hidden]);
     let mut embed_out = vec![0.0f32; t_sub * text_hidden];
-    linear_rows(&embed_norm, t_sub, text_hidden, &embed_proj_w, text_hidden, None, &mut embed_out, &mut backend);
+    linear_rows(&embed_norm, t_sub, text_hidden, &embed_proj_w, text_hidden, None, &mut embed_out, &mut backend).await;
     audio_stats("E_embed_out", &embed_out[..t_sub * text_hidden]);
 
     let out = Array2::from_shape_vec((t_sub, text_hidden), embed_out)
@@ -3434,7 +3452,7 @@ fn apply_multidim_rope_inplace(x: &mut [f32], cos_xy: &[f32], sin_xy: &[f32]) {
     apply_rope_1d_inplace(y_part, cos_y, sin_y);
 }
 
-fn patch_embed_rows(
+async fn patch_embed_rows(
     pixel_values: &Array5<f32>,
     img: usize,
     grid: usize,
@@ -3475,7 +3493,7 @@ fn patch_embed_rows(
         Some(patch_b),
         tokens_out,
         backend,
-    );
+    ).await;
     for t in 0..rows {
         let row = &mut tokens_out[t * hidden..(t + 1) * hidden];
         let p = &pos[t * hidden..(t + 1) * hidden];
@@ -3485,7 +3503,7 @@ fn patch_embed_rows(
     }
 }
 
-fn patch_embed_rows_linear(
+async fn patch_embed_rows_linear(
     pixel_values: &Array5<f32>,
     img: usize,
     grid: usize,
@@ -3525,7 +3543,7 @@ fn patch_embed_rows_linear(
         None,
         tokens_out,
         backend,
-    );
+    ).await;
     for t in 0..rows {
         let row = &mut tokens_out[t * hidden..(t + 1) * hidden];
         let p = &pos[t * hidden..(t + 1) * hidden];
@@ -3535,7 +3553,7 @@ fn patch_embed_rows_linear(
     }
 }
 
-fn linear_rows(
+async fn linear_rows(
     input: &[f32],
     rows: usize,
     in_dim: usize,
@@ -3545,12 +3563,11 @@ fn linear_rows(
     out: &mut [f32],
     backend: &mut LinearBackend,
 ) {
-    // WebGPU fast path: delegate batch matmul to GPU when the op is large enough.
     #[cfg(feature = "webgpu")]
     if let LinearBackend::WebGpu(ref mut vision) = backend {
         let total_ops = rows * in_dim * out_dim;
         if total_ops >= 1 << 16 {
-            vision.linear_batch(input, rows, in_dim, weight, out_dim, bias, out);
+            vision.linear_batch(input, rows, in_dim, weight, out_dim, bias, out).await;
             return;
         }
         // Small ops: fall through to CPU scalar loop below.
@@ -3674,7 +3691,7 @@ fn linear_rows(
     }
 }
 
-fn linear_rows_clipped(
+async fn linear_rows_clipped(
     input: &[f32],
     rows: usize,
     in_dim: usize,
@@ -3691,9 +3708,9 @@ fn linear_rows_clipped(
         for (d, &s) in clipped.iter_mut().zip(input.iter()) {
             *d = s.clamp(mn, mx);
         }
-        linear_rows(&clipped, rows, in_dim, weight, out_dim, bias, out, backend);
+        linear_rows(&clipped, rows, in_dim, weight, out_dim, bias, out, backend).await;
     } else {
-        linear_rows(input, rows, in_dim, weight, out_dim, bias, out, backend);
+        linear_rows(input, rows, in_dim, weight, out_dim, bias, out, backend).await;
     }
     if let Some((mn, mx)) = output_clip {
         for v in out.iter_mut() {
@@ -4495,10 +4512,9 @@ fn load_vlm_processor_hints(model_path: &Path, tokenizer_path: &Path, tok: &Toke
 
 fn encode_with_explicit_added_tokens(
     tok: &Tokenizer,
-    tokenizer_json_path: &Path,
+    added: &HashMap<String, u32>,
     text: &str,
 ) -> Result<Vec<u32>> {
-    let added = load_added_token_ids(tokenizer_json_path)?;
     if added.is_empty() {
         let enc = tok
             .encode(text, false)
@@ -4555,12 +4571,9 @@ fn encode_with_explicit_added_tokens(
     Ok(out)
 }
 
-fn load_added_token_ids(tokenizer_json_path: &Path) -> Result<HashMap<String, u32>> {
-    let bytes = std::fs::read(tokenizer_json_path).map_err(|e| {
-        anyhow::anyhow!("read tokenizer {:?} failed: {e}", tokenizer_json_path)
-    })?;
-    let v: Value = serde_json::from_slice(&bytes).map_err(|e| {
-        anyhow::anyhow!("parse tokenizer {:?} failed: {e}", tokenizer_json_path)
+fn parse_added_token_ids(bytes: &[u8]) -> Result<HashMap<String, u32>> {
+    let v: Value = serde_json::from_slice(bytes).map_err(|e| {
+        anyhow::anyhow!("parse tokenizer failed: {e}")
     })?;
 
     let mut out = HashMap::new();
@@ -4576,6 +4589,15 @@ fn load_added_token_ids(tokenizer_json_path: &Path) -> Result<HashMap<String, u3
         }
     }
     Ok(out)
+}
+
+fn load_added_token_ids(tokenizer_json_path: &Path) -> Result<HashMap<String, u32>> {
+    let bytes = std::fs::read(tokenizer_json_path).map_err(|e| {
+        anyhow::anyhow!("read tokenizer {:?} failed: {e}", tokenizer_json_path)
+    })?;
+    parse_added_token_ids(&bytes).map_err(|e| {
+        anyhow::anyhow!("parse tokenizer {:?} failed: {e}", tokenizer_json_path)
+    })
 }
 
 fn banned_token_ids(tok: &Tokenizer) -> Vec<i64> {

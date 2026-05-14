@@ -10,6 +10,7 @@ anyhow = { workspace = true }
 rayon = { workspace = true }
 half = { workspace = true }
 bytemuck = { workspace = true, features = ["derive"] }
+futures-channel = "0.3"
 wgpu = { version = "24", features = ["webgpu"], optional = true }
 ash = { version = "0.38", optional = true }
 
@@ -24,3 +25,4 @@ objc = "0.2"
 
 [dev-dependencies]
 half = { workspace = true }
+pollster = "0.3"
