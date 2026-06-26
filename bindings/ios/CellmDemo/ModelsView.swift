@@ -17,11 +17,12 @@ struct ModelsView: View {
     @State private var fileSizes: [String: String] = [:]
     @State private var isDownloading: [String: Bool] = [:]
     @State private var errorMessage: String?
-    
+
     let availableModels: [ModelAssetCard] = [
         ModelAssetCard(
             name: "Gemma 4 (LiteRT)",
-            description: "Google's Experimental 2B parameter model formatted for LiteRT. Fast and extremely efficient.",
+            description:
+                "Google's Experimental 2B parameter model formatted for LiteRT. Fast and extremely efficient.",
             fileName: DemoAssetLinks.gemma42p3bFileName,
             url: DemoAssetLinks.gemma42p3bLiteRt,
             tokenizerName: DemoAssetLinks.gemma42p3bTokenizerFileName,
@@ -41,7 +42,8 @@ struct ModelsView: View {
         ),
         ModelAssetCard(
             name: "Qwen 2.5 (0.5B int8 v1)",
-            description: "Compact native Qwen preset using the matching Hugging Face tokenizer assets.",
+            description:
+                "Compact native Qwen preset using the matching Hugging Face tokenizer assets.",
             fileName: DemoAssetLinks.qwen25FileName,
             url: DemoAssetLinks.qwen25Int8,
             tokenizerName: DemoAssetLinks.qwen25TokenizerFileName,
@@ -71,7 +73,8 @@ struct ModelsView: View {
         ),
         ModelAssetCard(
             name: "Bonsai 1.7B (1-Bit)",
-            description: "Ultra-low memory 1-bit model (1.125 bpw). Experimental quantization for extreme efficiency.",
+            description:
+                "Ultra-low memory 1-bit model (1.125 bpw). Experimental quantization for extreme efficiency.",
             fileName: DemoAssetLinks.bonsai1B1BitFileName,
             url: DemoAssetLinks.bonsai1B1Bit,
             tokenizerName: DemoAssetLinks.bonsai1B1BitTokenizerFileName,
@@ -90,6 +93,28 @@ struct ModelsView: View {
             tokenizerConfigUrl: nil
         ),
         ModelAssetCard(
+            name: "LFM 2.5 (230M f16)",
+            description:
+                "Liquid AI's most compact hybrid model. 230M params, 32K context, ideal for edge deployment.",
+            fileName: DemoAssetLinks.lfm25230MFileName,
+            url: DemoAssetLinks.lfm25230M,
+            tokenizerName: DemoAssetLinks.lfm25230MTokenizerFileName,
+            tokenizerUrl: DemoAssetLinks.lfm25230MTokenizer,
+            tokenizerConfigName: DemoAssetLinks.lfm25230MTokenizerConfigFileName,
+            tokenizerConfigUrl: DemoAssetLinks.lfm25230MTokenizerConfig
+        ),
+        ModelAssetCard(
+            name: "LFM 2.5 (230M int4)",
+            description:
+                "LFM2.5-230M quantized to int4 (225 MB). Hybrid LIV conv + GQA architecture.",
+            fileName: DemoAssetLinks.lfm25230MInt4FileName,
+            url: DemoAssetLinks.lfm25230MInt4,
+            tokenizerName: DemoAssetLinks.lfm25230MTokenizerFileName,
+            tokenizerUrl: DemoAssetLinks.lfm25230MTokenizer,
+            tokenizerConfigName: DemoAssetLinks.lfm25230MTokenizerConfigFileName,
+            tokenizerConfigUrl: DemoAssetLinks.lfm25230MTokenizerConfig
+        ),
+        ModelAssetCard(
             name: "Qwen 3.5 (0.8B int4)",
             description: "Latest Qwen 3.5 research model with hybrid attention support.",
             fileName: DemoAssetLinks.qwen35FileName,
@@ -101,16 +126,17 @@ struct ModelsView: View {
         ),
         ModelAssetCard(
             name: "NanoWhale (100M MLA+MoE)",
-            description: "Tiny DeepSeek-V4 based model with Multi-head Latent Attention and Mixture of Experts.",
+            description:
+                "Tiny DeepSeek-V4 based model with Multi-head Latent Attention and Mixture of Experts.",
             fileName: DemoAssetLinks.nanowhaleFileName,
             url: DemoAssetLinks.nanowhale,
             tokenizerName: DemoAssetLinks.nanowhaleTokenizerFileName,
             tokenizerUrl: DemoAssetLinks.nanowhaleTokenizer,
             tokenizerConfigName: DemoAssetLinks.nanowhaleTokenizerConfigFileName,
             tokenizerConfigUrl: DemoAssetLinks.nanowhaleTokenizerConfig
-        )
+        ),
     ]
-    
+
     var body: some View {
         NavigationView {
             List(availableModels) { model in
@@ -120,7 +146,7 @@ struct ModelsView: View {
                     Text(model.description)
                         .font(.caption)
                         .foregroundColor(.secondary)
-                    
+
                     HStack {
                         if let size = fileSizes[model.name] {
                             Text("Downloaded (\(size))")
@@ -163,7 +189,7 @@ struct ModelsView: View {
             }
         }
     }
-    
+
     private func refreshSizes() {
         for model in availableModels {
             let url = RemoteAssets.existingDocumentsFile(fileName: model.fileName)
@@ -171,7 +197,7 @@ struct ModelsView: View {
             fileSizes[model.name] = size
         }
     }
-    
+
     private func deleteModel(_ model: ModelAssetCard) {
         RemoteAssets.removeDocumentsFile(fileName: model.fileName)
         if let t = model.tokenizerName {
@@ -182,30 +208,32 @@ struct ModelsView: View {
         }
         refreshSizes()
     }
-    
+
     @MainActor
     private func downloadModel(_ model: ModelAssetCard) async {
         isDownloading[model.name] = true
         downloadProgress[model.name] = 0.0
-        
+
         do {
-            _ = try await RemoteAssets.downloadToDocuments(from: model.url, fileName: model.fileName) { p in
+            _ = try await RemoteAssets.downloadToDocuments(
+                from: model.url, fileName: model.fileName
+            ) { p in
                 DispatchQueue.main.async {
                     self.downloadProgress[model.name] = p.fraction
                 }
             }
-            
+
             if let tUrl = model.tokenizerUrl, let tName = model.tokenizerName {
                 _ = try await RemoteAssets.downloadToDocuments(from: tUrl, fileName: tName)
             }
             if let cfgUrl = model.tokenizerConfigUrl, let cfgName = model.tokenizerConfigName {
                 _ = try await RemoteAssets.downloadToDocuments(from: cfgUrl, fileName: cfgName)
             }
-            
+
         } catch {
             errorMessage = error.localizedDescription
         }
-        
+
         isDownloading[model.name] = false
         refreshSizes()
     }

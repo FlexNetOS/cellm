@@ -162,6 +162,7 @@ impl LlamaRunner {
         self.linear_backend = LlamaLinearBackend::WebGpu { ctx };
     }
 
+    #[cfg(feature = "webgpu")]
     pub fn take_webgpu_backend(&mut self) -> Option<cellm_kernels::webgpu::WebGpuBackend> {
         let mut old = LlamaLinearBackend::Cpu;
         std::mem::swap(&mut self.linear_backend, &mut old);
@@ -467,7 +468,7 @@ impl LlamaRunner {
                             }
                             webgpu_weight_cache.get(&name).unwrap().clone()
                         };
-                        
+
                         let (q_out, rest) = qkv.split_at_mut(num_tokens * hidden);
                         let (k_out, v_out) = rest.split_at_mut(num_tokens * kv_dim);
 
@@ -489,7 +490,7 @@ impl LlamaRunner {
                                 rope_non_interleaved_inplace_f32(q_i, n_heads, head_dim, head_dim, pos, rope_theta);
                                 rope_non_interleaved_inplace_f32(k_i, n_kv_heads, head_dim, head_dim, pos, rope_theta);
                             }
-                            
+
                             let block_id = page_table.block_for_token(pos).map_err(|e| CoreError::Backend(e.to_string()))?;
                             let token_off = page_table.offset_in_block(pos).map_err(|e| CoreError::Backend(e.to_string()))?;
                             kv_cache.view_mut().write_token(block_id, layer, token_off, k_i, v_i).map_err(|e| CoreError::Backend(e.to_string()))?;
@@ -502,7 +503,7 @@ impl LlamaRunner {
                                 let pos = start_pos + i;
                                 let q_i = &q_out[i * hidden..(i + 1) * hidden];
                                 let out_i = &mut attn_out[i * hidden..(i + 1) * hidden];
-                                
+
                                 let seq = pos + 1;
                                 gather_bases.clear();
                                 for tpos in 0..seq {
@@ -575,7 +576,7 @@ impl LlamaRunner {
                         ctx.matmul_batch_f16(&gate_w_buf, num_tokens as u32, inter as u32, hidden as u32, &x_norm, gate).await;
                         ctx.matmul_batch_f16(&up_w_buf, num_tokens as u32, inter as u32, hidden as u32, &x_norm, up).await;
                         ctx.silu_mul(gate, up).await;
-                        
+
                         // Down Proj
                         let down_w_buf = {
                             let name = format!("l{layer}.down");

@@ -1,38 +1,55 @@
 import Foundation
 
 enum DemoAssetLinks {
-    static let qwen25Int8 = "https://huggingface.co/jeffasante/cellm-models/resolve/main/qwen2.5-0.5b-int8-v1/qwen2.5-0.5b-int8-v1.cellm?download=true"
-    static let qwen25Tokenizer = "https://huggingface.co/jeffasante/cellm-models/resolve/main/qwen2.5-0.5b-int8-v1/tokenizer.json?download=true"
-    static let qwen25TokenizerConfig = "https://huggingface.co/jeffasante/cellm-models/resolve/main/qwen2.5-0.5b-int8-v1/tokenizer_config.json?download=true"
+    static let qwen25Int8 =
+        "https://huggingface.co/jeffasante/cellm-models/resolve/main/qwen2.5-0.5b-int8-v1/qwen2.5-0.5b-int8-v1.cellm?download=true"
+    static let qwen25Tokenizer =
+        "https://huggingface.co/jeffasante/cellm-models/resolve/main/qwen2.5-0.5b-int8-v1/tokenizer.json?download=true"
+    static let qwen25TokenizerConfig =
+        "https://huggingface.co/jeffasante/cellm-models/resolve/main/qwen2.5-0.5b-int8-v1/tokenizer_config.json?download=true"
     static let qwen25Dir = "samples/qwen2.5-0.5b-int8-v1"
     static let qwen25FileName = "\(qwen25Dir)/qwen2.5-0.5b-int8-v1.cellm"
     static let qwen25TokenizerFileName = "\(qwen25Dir)/tokenizer.json"
     static let qwen25TokenizerConfigFileName = "\(qwen25Dir)/tokenizer_config.json"
 
-    static let smollm2Int8 = "https://huggingface.co/jeffasante/cellm-models/resolve/main/smollm2-360m-int8-v1/smollm2-360m-int8-v1.cellm?download=true"
-    static let smolvlmInt8 = "https://huggingface.co/jeffasante/cellm-models/resolve/main/smolvlm-256m-instruct-int8-v1/smolvlm-256m-instruct-int8-v1.cellm?download=true"
-    static let rococoImage = "https://raw.githubusercontent.com/jeffasante/cellm/main/models/test_images/rococo_1.jpg"
-    static let smollm2Tokenizer = "https://huggingface.co/jeffasante/cellm-models/resolve/main/smollm2-360m-int8-v1/tokenizer.json?download=true"
-    static let smollm2TokenizerConfig = "https://huggingface.co/jeffasante/cellm-models/resolve/main/smollm2-360m-int8-v1/tokenizer_config.json?download=true"
-    static let smolvlmTokenizer = "https://huggingface.co/jeffasante/cellm-models/resolve/main/smolvlm-256m-instruct-int8-v1/tokenizer.json?download=true"
-    static let smolvlmProcessorConfig = "https://huggingface.co/HuggingFaceTB/SmolVLM-256M-Instruct/resolve/main/processor_config.json"
-    static let smolvlmPreprocessorConfig = "https://huggingface.co/HuggingFaceTB/SmolVLM-256M-Instruct/resolve/main/preprocessor_config.json"
+    static let smollm2Int8 =
+        "https://huggingface.co/jeffasante/cellm-models/resolve/main/smollm2-360m-int8-v1/smollm2-360m-int8-v1.cellm?download=true"
+    static let smolvlmInt8 =
+        "https://huggingface.co/jeffasante/cellm-models/resolve/main/smolvlm-256m-instruct-int8-v1/smolvlm-256m-instruct-int8-v1.cellm?download=true"
+    static let rococoImage =
+        "https://raw.githubusercontent.com/jeffasante/cellm/main/models/test_images/rococo_1.jpg"
+    static let smollm2Tokenizer =
+        "https://huggingface.co/jeffasante/cellm-models/resolve/main/smollm2-360m-int8-v1/tokenizer.json?download=true"
+    static let smollm2TokenizerConfig =
+        "https://huggingface.co/jeffasante/cellm-models/resolve/main/smollm2-360m-int8-v1/tokenizer_config.json?download=true"
+    static let smolvlmTokenizer =
+        "https://huggingface.co/jeffasante/cellm-models/resolve/main/smolvlm-256m-instruct-int8-v1/tokenizer.json?download=true"
+    static let smolvlmProcessorConfig =
+        "https://huggingface.co/HuggingFaceTB/SmolVLM-256M-Instruct/resolve/main/processor_config.json"
+    static let smolvlmPreprocessorConfig =
+        "https://huggingface.co/HuggingFaceTB/SmolVLM-256M-Instruct/resolve/main/preprocessor_config.json"
     static let smollm2Dir = "samples/smollm2-360m-int8"
     static let smollm2FileName = "\(smollm2Dir)/smollm2-360m-int8-v1.cellm"
     static let smollm2TokenizerFileName = "\(smollm2Dir)/tokenizer.json"
     static let smollm2TokenizerConfigFileName = "\(smollm2Dir)/tokenizer_config.json"
 
-    static let gemma4E2B = "https://huggingface.co/jeffasante/cellm-models/resolve/main/gemma-4-E2B-it-int4-aggr-v5/gemma-4-E2B-it-int4-aggr-v5.cellmd?download=true"
-    static let gemma4E2BTokenizer = "https://huggingface.co/jeffasante/cellm-models/resolve/main/gemma-4-E2B-it-int4-aggr-v5/tokenizer.json?download=true"
-    static let gemma4E2BTokenizerConfig = "https://huggingface.co/jeffasante/cellm-models/resolve/main/gemma-4-E2B-it-int4-aggr-v5/tokenizer_config.json?download=true"
+    static let gemma4E2B =
+        "https://huggingface.co/jeffasante/cellm-models/resolve/main/gemma-4-E2B-it-int4-aggr-v5/gemma-4-E2B-it-int4-aggr-v5.cellmd?download=true"
+    static let gemma4E2BTokenizer =
+        "https://huggingface.co/jeffasante/cellm-models/resolve/main/gemma-4-E2B-it-int4-aggr-v5/tokenizer.json?download=true"
+    static let gemma4E2BTokenizerConfig =
+        "https://huggingface.co/jeffasante/cellm-models/resolve/main/gemma-4-E2B-it-int4-aggr-v5/tokenizer_config.json?download=true"
     static let gemma4E2BDir = "samples/gemma-4-E2B-it-int4-aggr-v5"
     static let gemma4E2BFileName = "\(gemma4E2BDir)/gemma-4-E2B-it-int4-aggr-v5.cellmd"
     static let gemma4E2BTokenizerFileName = "\(gemma4E2BDir)/tokenizer.json"
     static let gemma4E2BTokenizerConfigFileName = "\(gemma4E2BDir)/tokenizer_config.json"
 
-    static let gemma42p3bLiteRt = "https://huggingface.co/jeffasante/cellm-models/resolve/main/gemma-4-2p3b-it-litert/gemma-4-2p3b-it-litert.cellm"
-    static let gemma42p3bTokenizer = "https://huggingface.co/jeffasante/cellm-models/resolve/main/gemma-4-2p3b-it-litert/tokenizer.json"
-    static let gemma42p3bTokenizerConfig = "https://huggingface.co/onnx-community/gemma-4-E2B-it-ONNX/resolve/main/tokenizer_config.json"
+    static let gemma42p3bLiteRt =
+        "https://huggingface.co/jeffasante/cellm-models/resolve/main/gemma-4-2p3b-it-litert/gemma-4-2p3b-it-litert.cellm"
+    static let gemma42p3bTokenizer =
+        "https://huggingface.co/jeffasante/cellm-models/resolve/main/gemma-4-2p3b-it-litert/tokenizer.json"
+    static let gemma42p3bTokenizerConfig =
+        "https://huggingface.co/onnx-community/gemma-4-E2B-it-ONNX/resolve/main/tokenizer_config.json"
     static let gemma42p3bDir = "samples/gemma-4-2p3b-it"
     static let gemma42p3bFileName = "\(gemma42p3bDir)/gemma-4-2p3b-it-litert.cellm"
     static let gemma42p3bTokenizerFileName = "\(gemma42p3bDir)/tokenizer-gemma-4-2p3b-it.json"
@@ -44,30 +61,54 @@ enum DemoAssetLinks {
     static let smolvlmPreprocessorConfigFileName = "preprocessor_config-smolvlm-256m.json"
     static let rococoFileName = "rococo_1.jpg"
 
-    static let bonsai1B1Bit = "https://huggingface.co/jeffasante/cellm-models/resolve/main/Bonsai-1.7B_v2/Bonsai-1.7B_v2.cellm?download=true"
-    static let bonsai1B1BitTokenizer = "https://huggingface.co/jeffasante/cellm-models/resolve/main/Bonsai-1.7B_v2/tokenizer.json?download=true"
-    static let bonsai1B1BitTokenizerConfig = "https://huggingface.co/jeffasante/cellm-models/resolve/main/Bonsai-1.7B_v2/tokenizer_config.json?download=true"
+    static let bonsai1B1Bit =
+        "https://huggingface.co/jeffasante/cellm-models/resolve/main/Bonsai-1.7B_v2/Bonsai-1.7B_v2.cellm?download=true"
+    static let bonsai1B1BitTokenizer =
+        "https://huggingface.co/jeffasante/cellm-models/resolve/main/Bonsai-1.7B_v2/tokenizer.json?download=true"
+    static let bonsai1B1BitTokenizerConfig =
+        "https://huggingface.co/jeffasante/cellm-models/resolve/main/Bonsai-1.7B_v2/tokenizer_config.json?download=true"
     static let bonsai1B1BitDir = "samples/bonsai-1.7b-1bit"
     static let bonsai1B1BitFileName = "\(bonsai1B1BitDir)/Bonsai-1.7B_v2.cellm"
     static let bonsai1B1BitTokenizerFileName = "\(bonsai1B1BitDir)/tokenizer.json"
     static let bonsai1B1BitTokenizerConfigFileName = "\(bonsai1B1BitDir)/tokenizer_config.json"
 
-    static let lfm25 = "https://huggingface.co/jeffasante/cellm-models/resolve/main/lfm2.5-350m-v1/lfm2.5-350m-v1.cellm?download=true"
-    static let lfm25Tokenizer = "https://huggingface.co/jeffasante/cellm-models/blob/main/lfm2.5-350m-v1/tokenizer.json"
+    static let lfm25 =
+        "https://huggingface.co/jeffasante/cellm-models/resolve/main/lfm2.5-350m-v1/lfm2.5-350m-v1.cellm?download=true"
+    static let lfm25Tokenizer =
+        "https://huggingface.co/jeffasante/cellm-models/blob/main/lfm2.5-350m-v1/tokenizer.json"
     static let lfm25Dir = "samples/lfm2.5-350m"
     static let lfm25FileName = "\(lfm25Dir)/lfm2.5-350m-v1.cellm"
     static let lfm25TokenizerFileName = "\(lfm25Dir)/tokenizer.json"
 
-    static let nanowhale = "https://huggingface.co/jeffasante/cellm-models/resolve/main/nanowhale-100m-v1/nanowhale-100m-v1.cellm?download=true"
-    static let nanowhaleTokenizer = "https://huggingface.co/jeffasante/cellm-models/resolve/main/nanowhale-100m-v1/tokenizer.json?download=true"
-    static let nanowhaleTokenizerConfig = "https://huggingface.co/jeffasante/cellm-models/resolve/main/nanowhale-100m-v1/tokenizer_config.json?download=true"
+    static let lfm25230M =
+        "https://huggingface.co/jeffasante/cellm-models/resolve/main/LFM2.5-230M/LFM2.5-230M.cellm?download=true"
+    static let lfm25230MInt4 =
+        "https://huggingface.co/jeffasante/cellm-models/resolve/main/LFM2.5-230M/LFM2.5-230M-int4.cellm?download=true"
+    static let lfm25230MTokenizer =
+        "https://huggingface.co/jeffasante/cellm-models/resolve/main/LFM2.5-230M/tokenizer.json?download=true"
+    static let lfm25230MTokenizerConfig =
+        "https://huggingface.co/jeffasante/cellm-models/resolve/main/LFM2.5-230M/tokenizer_config.json?download=true"
+    static let lfm25230MDir = "samples/lfm2.5-230m"
+    static let lfm25230MFileName = "\(lfm25230MDir)/LFM2.5-230M.cellm"
+    static let lfm25230MInt4FileName = "\(lfm25230MDir)/LFM2.5-230M-int4.cellm"
+    static let lfm25230MTokenizerFileName = "\(lfm25230MDir)/tokenizer.json"
+    static let lfm25230MTokenizerConfigFileName = "\(lfm25230MDir)/tokenizer_config.json"
+
+    static let nanowhale =
+        "https://huggingface.co/jeffasante/cellm-models/resolve/main/nanowhale-100m-v1/nanowhale-100m-v1.cellm?download=true"
+    static let nanowhaleTokenizer =
+        "https://huggingface.co/jeffasante/cellm-models/resolve/main/nanowhale-100m-v1/tokenizer.json?download=true"
+    static let nanowhaleTokenizerConfig =
+        "https://huggingface.co/jeffasante/cellm-models/resolve/main/nanowhale-100m-v1/tokenizer_config.json?download=true"
     static let nanowhaleDir = "samples/nanowhale-100m"
     static let nanowhaleFileName = "\(nanowhaleDir)/nanowhale-100m-v1.cellm"
     static let nanowhaleTokenizerFileName = "\(nanowhaleDir)/tokenizer.json"
     static let nanowhaleTokenizerConfigFileName = "\(nanowhaleDir)/tokenizer_config.json"
 
-    static let qwen35 = "https://huggingface.co/jeffasante/cellm-models/resolve/main/qwen3.5-0.8b-v1/qwen3.5-0.8b-i4.cellm?download=true"
-    static let qwen35Tokenizer = "https://huggingface.co/jeffasante/cellm-models/resolve/main/qwen3.5-0.8b-v1/tokenizer.json?download=true"
+    static let qwen35 =
+        "https://huggingface.co/jeffasante/cellm-models/resolve/main/qwen3.5-0.8b-v1/qwen3.5-0.8b-i4.cellm?download=true"
+    static let qwen35Tokenizer =
+        "https://huggingface.co/jeffasante/cellm-models/resolve/main/qwen3.5-0.8b-v1/tokenizer.json?download=true"
     static let qwen35Dir = "samples/qwen3.5-0.8b"
     static let qwen35FileName = "\(qwen35Dir)/qwen3.5-0.8b-i4.cellm"
     static let qwen35TokenizerFileName = "\(qwen35Dir)/tokenizer.json"
@@ -107,7 +148,8 @@ enum RemoteAssets {
     static func fileSizeString(url: URL?) -> String? {
         guard let url else { return nil }
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
-              let bytes = attrs[.size] as? NSNumber else { return nil }
+            let bytes = attrs[.size] as? NSNumber
+        else { return nil }
         let formatter = ByteCountFormatter()
         formatter.allowedUnits = [.useMB, .useGB]
         formatter.countStyle = .file
@@ -131,7 +173,10 @@ enum RemoteAssets {
         let repo = parts[1]
         let ref = parts[3]
         let rest = parts.dropFirst(4).joined(separator: "/")
-        guard let rawURL = URL(string: "https://raw.githubusercontent.com/\(owner)/\(repo)/\(ref)/\(rest)") else {
+        guard
+            let rawURL = URL(
+                string: "https://raw.githubusercontent.com/\(owner)/\(repo)/\(ref)/\(rest)")
+        else {
             throw CellmError.message("Failed to convert GitHub URL to raw URL")
         }
         return rawURL
@@ -144,7 +189,9 @@ enum RemoteAssets {
 
         if url.host == "huggingface.co" {
             let parts = url.pathComponents.filter { $0 != "/" }
-            if let blobIndex = parts.firstIndex(of: "blob"), blobIndex >= 2, parts.count > blobIndex + 2 {
+            if let blobIndex = parts.firstIndex(of: "blob"), blobIndex >= 2,
+                parts.count > blobIndex + 2
+            {
                 let repo = parts[1]
                 let ref = parts[blobIndex + 1]
                 let rest = parts[(blobIndex + 2)...].joined(separator: "/")
@@ -169,8 +216,11 @@ enum RemoteAssets {
                 let repo = parts[1]
                 let ref = parts[3]
                 let rest = parts.dropFirst(4).joined(separator: "/")
-                let rawURL = URL(string: "https://raw.githubusercontent.com/\(owner)/\(repo)/\(ref)/\(rest)")!
-                let mediaURL = URL(string: "https://media.githubusercontent.com/media/\(owner)/\(repo)/\(ref)/\(rest)")!
+                let rawURL = URL(
+                    string: "https://raw.githubusercontent.com/\(owner)/\(repo)/\(ref)/\(rest)")!
+                let mediaURL = URL(
+                    string:
+                        "https://media.githubusercontent.com/media/\(owner)/\(repo)/\(ref)/\(rest)")!
                 return [rawURL, mediaURL]
             }
         }
@@ -178,7 +228,9 @@ enum RemoteAssets {
         return [url]
     }
 
-    static func downloadToDocuments(from rawURL: String, fileName: String? = nil, progress: ((DownloadProgress) -> Void)? = nil) async throws -> URL {
+    static func downloadToDocuments(
+        from rawURL: String, fileName: String? = nil, progress: ((DownloadProgress) -> Void)? = nil
+    ) async throws -> URL {
         let urls = try candidateURLs(from: rawURL)
         let targetName = fileName ?? urls[0].lastPathComponent
 
@@ -224,11 +276,12 @@ enum RemoteAssets {
                         if (received - lastReportedBytes) >= 256 * 1024 || received == expected {
                             lastReportedBytes = received
                             let fraction = min(1.0, Double(received) / Double(expected))
-                            progress?(DownloadProgress(
-                                fraction: fraction,
-                                bytesReceived: received,
-                                bytesExpected: expected
-                            ))
+                            progress?(
+                                DownloadProgress(
+                                    fraction: fraction,
+                                    bytesReceived: received,
+                                    bytesExpected: expected
+                                ))
                         }
                     }
                 }
@@ -236,11 +289,12 @@ enum RemoteAssets {
                     try handle.write(contentsOf: chunk)
                 }
                 if expected <= 0 {
-                    progress?(DownloadProgress(
-                        fraction: 1.0,
-                        bytesReceived: received,
-                        bytesExpected: expected
-                    ))
+                    progress?(
+                        DownloadProgress(
+                            fraction: 1.0,
+                            bytesReceived: received,
+                            bytesExpected: expected
+                        ))
                 }
 
                 if isLikelyHTML(prefix) {
@@ -261,7 +315,8 @@ enum RemoteAssets {
 
                 let destURL = documentsURL(fileName: targetName)
                 let dirURL = destURL.deletingLastPathComponent()
-                try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true, attributes: nil)
+                try FileManager.default.createDirectory(
+                    at: dirURL, withIntermediateDirectories: true, attributes: nil)
                 if FileManager.default.fileExists(atPath: destURL.path) {
                     try FileManager.default.removeItem(at: destURL)
                 }
@@ -302,7 +357,7 @@ enum RemoteAssets {
 
     private static func hasCellmMagic(_ data: Data) -> Bool {
         guard data.count >= 5 else { return false }
-        return Array(data.prefix(5)) == [0x43, 0x45, 0x4C, 0x4C, 0x4D] // CELLM
+        return Array(data.prefix(5)) == [0x43, 0x45, 0x4C, 0x4C, 0x4D]  // CELLM
     }
 
     private static func isLfsPointer(_ data: Data) -> Bool {
@@ -311,7 +366,9 @@ enum RemoteAssets {
     }
 
     private static func isLikelyHTML(_ data: Data) -> Bool {
-        guard let text = String(data: data.prefix(256), encoding: .utf8)?.lowercased() else { return false }
+        guard let text = String(data: data.prefix(256), encoding: .utf8)?.lowercased() else {
+            return false
+        }
         return text.contains("<!doctype html") || text.contains("<html")
     }
 }
